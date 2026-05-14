@@ -1,0 +1,508 @@
+/* Vektor Flow — minimal floating frame chrome (standalone). */
+
+html.vf-game-cursor-none,
+html.vf-game-cursor-none *,
+body.vf-game-cursor-none,
+body.vf-game-cursor-none * {
+  cursor: none !important;
+}
+
+/* When frame alpha < threshold (~0.05), nothing in the shell receives clicks. */
+.vf-frame--pass-through,
+.vf-frame--pass-through * {
+  pointer-events: none !important;
+}
+
+/* --vf-ui-alpha: spec.alpha, set on .vf-frame in JS. Shell chrome only; title/body text stay full strength. */
+.vf-frame {
+  --vf-ui-alpha: 1;
+  position: absolute;
+  left: 12px;
+  top: 48px;
+  min-width: 200px;
+  min-height: 120px;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  border-radius: 10px;
+  border: 1px solid rgba(120, 120, 140, calc(0.45 * var(--vf-ui-alpha)));
+  /* No full-box background: avoids a second full-rect layer that shows light corners over transparent host. */
+  background: transparent;
+  /* Rounded hit region; no filter: — WinForms WebView2 often shows a light/white rect around filter: drop-shadow(). */
+  clip-path: inset(0 round 10px);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, calc(0.35 * var(--vf-ui-alpha)));
+  color: #e8e8ee;
+  font-family: system-ui, Segoe UI, Roboto, sans-serif;
+  font-size: 13px;
+  overflow: hidden;
+  pointer-events: auto;
+}
+
+.vf-frame__header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px 6px 12px;
+  min-height: 34px;
+  cursor: grab;
+  user-select: none;
+  /* Avoid browser gesture handling eating pointer drags in embedded hosts (e.g. WebView2). */
+  touch-action: none;
+  border-radius: 10px 10px 0 0;
+  background: linear-gradient(
+    180deg,
+    rgba(55, 55, 65, calc(0.95 * var(--vf-ui-alpha, 1))),
+    rgba(40, 40, 48, calc(0.9 * var(--vf-ui-alpha, 1)))
+  );
+  border-bottom: 1px solid rgba(100, 100, 120, calc(0.35 * var(--vf-ui-alpha, 1)));
+}
+
+.vf-frame__header--title-left .vf-frame__title {
+  text-align: left;
+  justify-content: flex-start;
+}
+
+/* Title is inline-flex: text-align does not place flex children; use main-axis alignment. */
+.vf-frame__header--title-right .vf-frame__title {
+  flex: 1;
+  min-width: 0;
+  text-align: right;
+  justify-content: flex-end;
+}
+
+.vf-frame__header--title-center .vf-frame__title {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  max-width: calc(100% - 88px);
+  width: max-content;
+  max-height: 80vh;
+  flex: 0 1 auto;
+  justify-content: center;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.vf-frame__header--title-center .vf-frame__header-actions {
+  margin-left: auto;
+  z-index: 1;
+}
+
+.vf-frame__header:active {
+  cursor: grabbing;
+}
+
+.vf-frame__title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 1;
+  display: inline-flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.15em;
+}
+
+.vf-frame__title .vf-frame__title-math {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  vertical-align: middle;
+}
+
+.vf-frame__title .vf-frame__title-math .katex {
+  font-size: 1em;
+}
+
+.vf-frame__header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.vf-min-btn,
+.vf-close-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 26px;
+  overflow: visible;
+  margin: 0;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  line-height: 1;
+  font-size: 14px;
+}
+
+.vf-min-btn:hover,
+.vf-close-btn:hover {
+  background: rgba(255, 255, 255, calc(0.08 * var(--vf-ui-alpha, 1)));
+}
+
+/* Minimize: horizontal bar (—). Restore when docked: small square. */
+.vf-min-btn__bar {
+  display: block;
+  width: 10px;
+  height: 2px;
+  background: currentColor;
+  border-radius: 1px;
+  flex-shrink: 0;
+}
+
+.vf-min-btn__square {
+  display: block;
+  width: 10px;
+  height: 10px;
+  box-sizing: border-box;
+  border: 1.5px solid currentColor;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.vf-frame__body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  padding: 10px 12px 14px;
+  overflow: auto;
+  border-radius: 0 0 10px 10px;
+  background: rgba(28, 28, 34, calc(0.92 * var(--vf-ui-alpha, 1)));
+}
+
+/* Background layer for vektorflow ``d.draw_rect`` / vf-display.json (see vf-display.js). */
+.vf-frame__draw-canvas {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  pointer-events: none;
+  z-index: 0;
+  box-sizing: border-box;
+  border-radius: 0 0 8px 8px;
+}
+
+.vf-frame__body.vf-w-stack > *:not(.vf-frame__draw-canvas) {
+  position: relative;
+  z-index: 1;
+}
+
+/* Keep nested-frame overlay truly absolute even under generic stack child styling. */
+.vf-frame__body.vf-w-stack > .vf-frame__overlay {
+  position: absolute;
+  inset: 0;
+  padding: inherit;
+  box-sizing: border-box;
+  z-index: 2;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.vf-frame__body.vf-w-stack > .vf-frame__overlay > .vf-frame {
+  pointer-events: auto;
+}
+
+/* Absolute overlay plane for nested frames inside a frame body.
+ * Keeps child frames out of scroll-layout flow and provides a clipped drag area.
+ */
+.vf-frame__overlay {
+  position: absolute;
+  inset: 0;
+  padding: inherit;
+  box-sizing: border-box;
+  overflow: hidden;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.vf-frame__overlay > .vf-frame {
+  pointer-events: auto;
+}
+
+.vf-frame__overlay > .vf-frame.vf-frame--minimized {
+  position: absolute !important;
+}
+
+.vf-frame__minibar {
+  display: none;
+  align-items: center;
+  padding: 3px 6px 3px 10px;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.2;
+  flex-shrink: 0;
+  min-height: 30px;
+  box-sizing: border-box;
+  cursor: grab;
+  border: none;
+  background: linear-gradient(
+    180deg,
+    rgba(55, 55, 65, calc(0.98 * var(--vf-ui-alpha, 1))),
+    rgba(40, 40, 48, calc(0.95 * var(--vf-ui-alpha, 1)))
+  );
+  border-radius: 8px 8px 0 0;
+  border: 1px solid rgba(120, 120, 140, calc(0.45 * var(--vf-ui-alpha, 1)));
+  border-bottom: none;
+}
+
+.vf-frame__minibar:active {
+  cursor: grabbing;
+}
+
+.vf-frame__minibar-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 1;
+  font-weight: 500;
+}
+
+/* Minimized: one row — same banner chrome as the full frame, only narrower; all corners round. */
+.vf-frame--minimized {
+  min-width: 0;
+  min-height: 0 !important;
+  width: max-content !important;
+  max-width: min(100%, 200px) !important;
+  height: auto !important;
+  position: fixed;
+  z-index: 200000 !important; /* must beat inline z-index from bringToFront() */
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  overflow: hidden;
+  background: transparent;
+  border: 1px solid rgba(120, 120, 140, calc(0.45 * var(--vf-ui-alpha)));
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, calc(0.32 * var(--vf-ui-alpha)));
+  /* Rounded hit region; matches .vf-frame (no clip that leaves one corner “cut”). */
+  clip-path: none;
+}
+
+.vf-frame--minimized .vf-frame__minibar {
+  display: none !important;
+}
+
+.vf-frame--minimized .vf-frame__header {
+  display: flex !important;
+  flex-wrap: nowrap !important;
+  align-items: center;
+  min-height: 34px;
+  /* Inherit exact title-bar look from the large frame; no second tint layer. */
+  border-radius: 0;
+  border: none;
+  box-shadow: none;
+  background: linear-gradient(
+    180deg,
+    rgba(55, 55, 65, calc(0.95 * var(--vf-ui-alpha, 1))),
+    rgba(40, 40, 48, calc(0.9 * var(--vf-ui-alpha, 1)))
+  );
+  /* No line below the row — there is no body; avoids a “second strip” look. */
+  border-bottom: none;
+}
+
+/* One horizontal row: title + buttons (no wrapping to a second row at 200px). */
+.vf-frame--minimized .vf-frame__title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vf-frame--minimized .vf-frame__header--title-center .vf-frame__title {
+  position: static;
+  left: auto;
+  top: auto;
+  transform: none;
+  max-width: none;
+  max-height: none;
+  width: auto;
+  flex: 1 1 auto;
+  min-width: 0;
+  justify-content: center;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vf-frame--minimized .vf-frame__header--title-center .vf-frame__header-actions {
+  position: static;
+  margin-left: 0;
+}
+
+.vf-frame--minimized .vf-frame__header-actions {
+  flex-shrink: 0;
+}
+
+.vf-frame--minimized .vf-frame__body {
+  display: none !important;
+}
+
+.vf-frame__resize-grip {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 18px;
+  height: 18px;
+  cursor: default;
+  pointer-events: none;
+  display: none;
+  background: linear-gradient(
+    135deg,
+    transparent 0%,
+    transparent 50%,
+    rgba(200, 200, 220, calc(0.25 * var(--vf-ui-alpha, 1))) 50%,
+    rgba(200, 200, 220, calc(0.35 * var(--vf-ui-alpha, 1))) 100%
+  );
+  border-bottom-right-radius: 9px;
+}
+
+.vf-frame--resizable .vf-frame__resize-grip {
+  display: block;
+  cursor: nwse-resize;
+  pointer-events: auto;
+}
+
+/* --- vf-widgets.js: control column inside .vf-frame__body --- */
+.vf-frame__body.vf-w-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 10px 10px;
+  min-height: 0;
+  box-sizing: border-box;
+  background: rgba(28, 28, 35, 0.92);
+  border-radius: 0 0 8px 8px;
+}
+
+.vf-frame__body.vf-w-grid {
+  display: grid;
+  grid-template-columns: repeat(var(--vf-grid-cols, 1), minmax(0, 1fr));
+  grid-template-rows: repeat(var(--vf-grid-rows, 1), minmax(min-content, auto));
+  gap: 8px;
+  padding: 8px 10px 10px;
+  min-height: 0;
+  box-sizing: border-box;
+  align-content: start;
+  background: rgba(28, 28, 35, 0.92);
+  border-radius: 0 0 8px 8px;
+}
+
+.vf-frame__body.vf-w-grid > *:not(.vf-frame__draw-canvas):not(.vf-frame__overlay) {
+  position: relative;
+  z-index: 1;
+  min-width: 0;
+}
+
+.vf-frame__body.vf-w-grid > .vf-frame__overlay {
+  position: absolute;
+  inset: 0;
+  padding: inherit;
+  box-sizing: border-box;
+  z-index: 2;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.vf-w-label {
+  color: #e0e0ea;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.vf-w-btn {
+  font: inherit;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid rgba(120, 120, 150, 0.6);
+  background: linear-gradient(180deg, #4a4a58, #383844);
+  color: #f0f0f8;
+  cursor: pointer;
+  pointer-events: auto;
+  align-self: flex-start;
+}
+
+.vf-w-btn:hover {
+  background: linear-gradient(180deg, #565664, #404050);
+}
+
+.vf-w-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #e0e0ea;
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.vf-w-check input {
+  width: 16px;
+  height: 16px;
+  accent-color: #6a9cff;
+  cursor: pointer;
+}
+
+.vf-w-slider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  pointer-events: auto;
+}
+
+.vf-w-range {
+  flex: 1;
+  min-width: 80px;
+  accent-color: #6a9cff;
+  cursor: pointer;
+}
+
+.vf-w-slider-val {
+  flex: 0 0 3em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: #c8c8d8;
+  font-size: 12px;
+}
+
+.vf-w-input,
+.vf-w-textarea,
+.vf-w-select {
+  font: inherit;
+  color: #f0f0f8;
+  background: rgba(20, 20, 28, 0.95);
+  border: 1px solid rgba(100, 100, 130, 0.45);
+  border-radius: 6px;
+  padding: 6px 8px;
+  min-width: 0;
+  box-sizing: border-box;
+  pointer-events: auto;
+  cursor: text;
+}
+
+.vf-w-textarea {
+  resize: vertical;
+  min-height: 72px;
+}
+
+.vf-w-select {
+  cursor: pointer;
+  max-width: 100%;
+}

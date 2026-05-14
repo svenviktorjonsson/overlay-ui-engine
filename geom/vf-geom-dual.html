@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vektor Flow — vf-geom (cube + tetrahedron)</title>
+    <link rel="stylesheet" href="../vf-frame.css" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: transparent;
+        pointer-events: none;
+      }
+      #layer {
+        position: absolute;
+        inset: 0;
+        overflow: hidden;
+        pointer-events: none;
+        z-index: 1;
+      }
+      .vf-geom__body {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        padding: 6px 8px 10px;
+        box-sizing: border-box;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="layer"></div>
+    <script src="../vf-log.js"></script>
+    <script src="../vf-frame.js"></script>
+    <script src="vf-geom-math.js"></script>
+    <script src="vf-geom-core.js"></script>
+    <script src="vf-geom-wgpu.js"></script>
+    <script src="vf-geom-mount.js"></script>
+    <script>
+      (function () {
+        var layer = document.getElementById("layer");
+        if (!layer) return;
+
+        var specs = [
+          { id: "geom-dual-cube", title: "3D — cube", preset: "3d_cube" },
+          { id: "geom-dual-tet", title: "3D — tetrahedron", preset: "3d_tet" },
+        ];
+
+        function placeFrame(panel, col) {
+          var root = panel.root;
+          var left = 1 + col * 50;
+          root.classList.add("vf-frame--user-sized");
+          root.style.left = left + "%";
+          root.style.top = "6%";
+          root.style.width = "48%";
+          root.style.height = "80%";
+          root.style.right = "auto";
+        }
+
+        function postLayout() {
+          if (typeof VfFrame === "undefined" || !VfFrame.postNativeHostLayout) return;
+          VfFrame.postNativeHostLayout(layer, { stageAlpha: 1 });
+        }
+
+        for (var i = 0; i < specs.length; i++) {
+          (function (s, col) {
+            var geomHandle = null;
+            var panel = VfFrame.mount(layer, {
+              id: s.id,
+              title: s.title,
+              draggable: true,
+              dockable: true,
+              resizable: true,
+              closable: true,
+              alpha: 0.96,
+              exitWhenLastFrameClosed: true,
+              onBeforeDestroy: function () {
+                if (geomHandle) {
+                  geomHandle.destroy();
+                  geomHandle = null;
+                }
+              },
+              onFrameRemoved: postLayout,
+            });
+            placeFrame(panel, col);
+            geomHandle = VfGeom.mountInPanel(panel, s.preset, { minHeight: 280 });
+          })(specs[i], i);
+        }
+
+        window.addEventListener(
+          "resize",
+          function () {
+            requestAnimationFrame(postLayout);
+          },
+          false
+        );
+        requestAnimationFrame(postLayout);
+      })();
+    </script>
+  </body>
+</html>

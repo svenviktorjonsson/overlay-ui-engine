@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vektor Flow — VKF scene</title>
+    <link rel="stylesheet" href="vf-frame.css" />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css"
+      crossorigin="anonymous"
+    />
+    <style>
+      /* After katex, etc. UA can still look white; !important + host DefaultBackgroundColor (before init) both matter. */
+      html,
+      body,
+      #layer {
+        margin: 0;
+        overflow: hidden;
+        background-color: transparent !important;
+        background: transparent !important;
+        pointer-events: none;
+      }
+      html,
+      body {
+        height: 100%;
+        min-height: 100%;
+      }
+      #layer {
+        position: absolute;
+        inset: 0;
+        overflow: hidden;
+        min-height: 100%;
+        z-index: 1;
+        pointer-events: none;
+      }
+      /* Full-viewport, frameless, transparent; ``d.draw`` / ``d.draw_rect`` (``vf-display.json`` ``screen``). */
+      .vf-screen-canvas {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
+        z-index: 0;
+        pointer-events: none;
+        background: transparent;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="vf-screen-canvas" class="vf-screen-canvas" aria-hidden="true"></canvas>
+    <div id="layer"></div>
+    <script src="katex/katex.min.js"></script>
+    <script src="vf-frame.js?v=1777625449"></script>
+    <script src="vf-widgets.js?v=1777625449"></script>
+    <!-- 3-D WebGPU geometry pipeline (must load before vf-display.js) -->
+    <script src="geom/vf-geom-math.js?v=1777625449"></script>
+    <script src="geom/vf-geom-core.js?v=1777625449"></script>
+    <script src="geom/vf-geom-wgpu.js?v=1777625449"></script>
+    <script src="vf-game-camera.js?v=1777625449"></script>
+    <script src="vf-display.js?v=1777625449"></script>
+    <script src="vf-browser-transport.js?v=1777625449"></script>
+    <script>
+      // Scene: transparent. Frame chrome: --vf-ui-alpha (see vf-frame.css).
+      // ── Diagnostic logger (writes to C:\temp\vektor-flow-log.txt via vf-log.js channel) ──
+      function slog(level, text) {
+        var s = "[vkf-scene] " + String(text);
+        try {
+          if (typeof console !== "undefined") {
+            if (level === "error" && console.error) { console.error(s); }
+            else if (level === "warn" && console.warn) { console.warn(s); }
+            else if (console.log) { console.log(s); }
+          }
+        } catch (_) {}
+        try {
+          if (typeof chrome !== "undefined" && chrome.webview && chrome.webview.postMessage) {
+            chrome.webview.postMessage({ type: "vf_log", level: level, message: s, t: Date.now() });
+          }
+        } catch (_) {}
+      }
+      slog("info", "inline script start — VfFrame=" + (typeof VfFrame) + " VfDisplay=" + (typeof VfDisplay));
+      var vfDisplayRuntime = null;
+      var vfSceneRuntime = null;
+      var vfBrowserSession = null;
+
+      (function () {
+        var layer0 = document.getElementById("layer");
+        if (!layer0) return;
+        function syncHostAfterSceneLayout() {
+          if (typeof VfFrame === "undefined" || !VfFrame.postNativeHostLayout) return;
+          var el = document.getElementById("layer");
+          if (el) VfFrame.postNativeHostLayout(el, { stageAlpha: 0 });
+        }
+        /* After restore from dock, WebView2 client area can repaints black until layout/hit tests refresh. */
+        layer0.addEventListener(
+          "vf-frame-restore",
+          function () {
+            requestAnimationFrame(function () {
+              requestAnimationFrame(syncHostAfterSceneLayout);
+            });
+          },
+          true
+        );
+      })();
+      /** @param spec frame_upsert payload.spec (includes ``rect``: x,y,w,h in 0..1 relative to mount container). */
+      function applySpecRectToPanel(panel, spec) {
+        var r = spec && spec.rect;
+        var anch = spec && spec.anchor != null ? String(spec.anchor) : "tl";
+        var x = r && typeof r.x === "number" ? r.x : 0;
+        var y = r && typeof r.y === "number" ? r.y : 0;
+        var w = r && typeof r.w === "number" ? r.w : 1;
+        var h = r && typeof r.h === "number" ? r.h : 1;
+        function clamp01(v) {
+          return Math.max(0, Math.min(1, v));
+        }
+        x = clamp01(x);
+        y = clamp01(y);
+        w = clamp01(w);
+        h = clamp01(h);
+        var k = (typeof VfFrame !== "undefined" && VfFrame.normalizeDockLocationKey)
+          ? VfFrame.normalizeDockLocationKey(anch)
+          : "tl";
+        var parentEl = panel.root.offsetParent || panel.root.parentElement || panel.root;
+        var isNestedLayer = !!(parentEl && parentEl.classList && parentEl.classList.contains("vf-frame__overlay"));
+        var cs = window.getComputedStyle ? window.getComputedStyle(parentEl) : null;
+        var padL = isNestedLayer ? 0 : Math.max(0, Math.round(parseFloat(cs && cs.paddingLeft ? cs.paddingLeft : "0") || 0));
+        var padR = isNestedLayer ? 0 : Math.max(0, Math.round(parseFloat(cs && cs.paddingRight ? cs.paddingRight : "0") || 0));
+        var padT = isNestedLayer ? 0 : Math.max(0, Math.round(parseFloat(cs && cs.paddingTop ? cs.paddingTop : "0") || 0));
+        var padB = isNestedLayer ? 0 : Math.max(0, Math.round(parseFloat(cs && cs.paddingBottom ? cs.paddingBottom : "0") || 0));
+        var parentW = parentEl && parentEl.clientWidth ? parentEl.clientWidth : 1;
+        var parentH = parentEl && parentEl.clientHeight ? parentEl.clientHeight : 1;
+        var availW = Math.max(1, parentW - padL - padR);
+        var availH = Math.max(1, parentH - padT - padB);
+        var fw = Math.max(1, Math.round(w * availW));
+        var fh = Math.max(1, Math.round(h * availH));
+        var v = k.charAt(0);
+        var hz = k.charAt(1);
+        var ax = padL + x * availW;
+        var ay = padT + y * availH;
+        if (hz === "r") {
+          ax = padL + (1 - x) * availW;
+        }
+        if (v === "b") {
+          ay = padT + (1 - y) * availH;
+        }
+        var ox = hz === "r" ? fw : (hz === "c" ? fw * 0.5 : 0);
+        var oy = v === "b" ? fh : (v === "c" ? fh * 0.5 : 0);
+        var leftPx = Math.round(ax - ox);
+        var topPx = Math.round(ay - oy);
+        var minL = padL;
+        var minT = padT;
+        var maxL = Math.max(minL, parentW - padR - fw);
+        var maxT = Math.max(minT, parentH - padB - fh);
+        leftPx = Math.min(maxL, Math.max(minL, leftPx));
+        topPx = Math.min(maxT, Math.max(minT, topPx));
+        var root = panel.root;
+        root.dataset.vfAnchor = k;
+        root.style.left = leftPx + "px";
+        root.style.top = topPx + "px";
+        root.style.width = fw + "px";
+        root.style.height = fh + "px";
+        root.style.right = "auto";
+        root.style.bottom = "auto";
+        root.classList.add("vf-frame--user-sized");
+        if (typeof panel.syncPointerPassThrough === "function") {
+          panel.syncPointerPassThrough();
+        }
+        if (typeof panel.renderTitle === "function") {
+          panel.renderTitle();
+        }
+      }
+
+      function postExitToHost() {
+        var wv = window.chrome && window.chrome.webview;
+        if (wv && typeof wv.postMessage === "function") {
+          wv.postMessage({ type: "close" });
+        }
+      }
+
+      function ensureFrameOverlay(panel) {
+        if (!panel || !panel.body) return null;
+        var body = panel.body;
+        var ov = null;
+        for (var i = 0; i < body.children.length; i++) {
+          var ch = body.children[i];
+          if (ch && ch.classList && ch.classList.contains("vf-frame__overlay")) {
+            ov = ch;
+            break;
+          }
+        }
+        if (ov) return ov;
+        ov = document.createElement("div");
+        ov.className = "vf-frame__overlay";
+        body.appendChild(ov);
+        return ov;
+      }
+
+      /** Fetches ``vf-display.json`` and draws (Canvas2D on ``vf-screen-canvas`` + frame bodies). */
+      function displayRefresh() {
+        if (vfDisplayRuntime && vfDisplayRuntime.refresh) {
+          vfDisplayRuntime.refresh();
+        } else {
+          slog("warn", "displayRefresh: display transport not available");
+        }
+      }
+
+      function applySceneCommands(data) {
+        if (!Array.isArray(data)) {
+          slog("warn", "applySceneCommands: vkf-scene.json is not an array (got " + typeof data + ")");
+          displayRefresh();
+          return;
+        }
+        const upsertCount = data.filter(c => c && c.kind === "frame_upsert").length;
+        slog("info", "applySceneCommands: " + data.length + " commands, " + upsertCount + " frame_upserts");
+
+        const layer = document.getElementById("layer");
+        layer.innerHTML = "";
+
+        const upserts = data.filter(function (c) {
+          return c && c.kind === "frame_upsert" && c.payload && c.payload.spec;
+        });
+        var mounted = [];
+        function syncNative() {
+          if (typeof VfFrame !== "undefined" && VfFrame.postNativeHostLayout) {
+            VfFrame.postNativeHostLayout(layer, { stageAlpha: 0 });
+          }
+        }
+        var panelById = Object.create(null);
+        var pending = upserts.slice();
+        var pass = 0;
+        while (pending.length > 0) {
+          pass += 1;
+          var advanced = false;
+          var nextPending = [];
+          for (let i = 0; i < pending.length; i++) {
+            const spec = pending[i].payload.spec;
+            const flags = spec.flags || {};
+            const id = spec.id != null ? String(spec.id) : "frame-" + i;
+            const parentId = spec.parent_id != null ? String(spec.parent_id).trim() : "";
+            if (parentId && !panelById[parentId]) {
+              nextPending.push(pending[i]);
+              continue;
+            }
+            const parentPanel = parentId ? panelById[parentId] : null;
+            const mountLayer = parentPanel ? (ensureFrameOverlay(parentPanel) || layer) : layer;
+            const rawTitle = spec.title != null ? String(spec.title).trim() : "";
+            const rawName = spec.name != null ? String(spec.name).trim() : "";
+            const title = rawTitle || rawName;
+            const alpha = VfFrame._coerceAlpha(spec.alpha, 1);
+            const isMaster = spec.master === true;
+            var tAlign = spec.title_align;
+            var titleAlign =
+              tAlign === "center" || tAlign === "right" || tAlign === "left" ? tAlign : "left";
+            const rawDock =
+              spec.dock_loc != null
+                ? spec.dock_loc
+                : spec.dock_location != null
+                  ? spec.dock_location
+                  : spec.minimized_dock;
+            const dockLocation = VfFrame.normalizeDockLocationKey(
+              rawDock != null ? String(rawDock) : "bl"
+            );
+            const dockable =
+              (flags.dockable !== false) && (flags.minimizable !== false);
+            slog(
+              "info",
+              "applySceneCommands: mounting frame id=" + id +
+                " parent=" + (parentId || "<root>") +
+                " title=" + JSON.stringify(title) +
+                " alpha=" + alpha
+            );
+            const panel = VfFrame.mount(mountLayer, {
+              id: id,
+              title: title,
+              titleAlign: titleAlign,
+              inLayerDrag: true,
+              draggable: flags.draggable !== false,
+              dockable: dockable,
+              resizable: flags.resizable !== false,
+              closable: flags.closable !== false,
+              alpha: alpha,
+              master: isMaster,
+              dockLocation: dockLocation,
+              zIndexBase: 1000 + i * 2,
+              onBeforeDestroy: function () {
+                if (typeof VfWidgets !== "undefined" && VfWidgets.onFrameClose) {
+                  VfWidgets.onFrameClose(id);
+                }
+              },
+              onFrameRemoved: function () {
+                if (layer._vfMasterTeardown) return;
+                if (layer.querySelectorAll(".vf-frame").length === 0) {
+                  postExitToHost();
+                }
+              },
+            });
+            panelById[id] = panel;
+            applySpecRectToPanel(panel, spec);
+            mounted.push({ panel: panel, spec: spec });
+            if (spec.body && Array.isArray(spec.body) && spec.body.length) {
+              if (typeof VfWidgets !== "undefined" && VfWidgets.mount) {
+                VfWidgets.startStatePoll();
+                VfWidgets.mount(panel, id, spec.body, spec.body_layout);
+              }
+            }
+            advanced = true;
+          }
+          if (!advanced) {
+            for (let j = 0; j < nextPending.length; j++) {
+              const spec = nextPending[j].payload.spec || {};
+              const id = spec.id != null ? String(spec.id) : "frame?";
+              const parentId = spec.parent_id != null ? String(spec.parent_id) : "";
+              slog("warn", "applySceneCommands: unresolved parent_id for frame id=" + id + " parent=" + parentId + " (mounting at root)");
+              const fallback = VfFrame.mount(layer, {
+                id: id,
+                title: spec.title != null ? String(spec.title) : "",
+                titleAlign: "left",
+                inLayerDrag: true,
+                draggable: true,
+                dockable: true,
+                resizable: true,
+                closable: true,
+                alpha: VfFrame._coerceAlpha(spec.alpha, 1),
+                master: spec.master === true,
+                dockLocation: "bl",
+                zIndexBase: 1000 + j * 2,
+              });
+              panelById[id] = fallback;
+              applySpecRectToPanel(fallback, spec);
+              mounted.push({ panel: fallback, spec: spec });
+              if (spec.body && Array.isArray(spec.body) && spec.body.length) {
+                if (typeof VfWidgets !== "undefined" && VfWidgets.mount) {
+                  VfWidgets.startStatePoll();
+                  VfWidgets.mount(fallback, id, spec.body, spec.body_layout);
+                }
+              }
+            }
+            break;
+          }
+          pending = nextPending;
+          if (pass > upserts.length + 2) break;
+        }
+        /* Immediate layout so native g_hitRegions is populated (mouse forwarding) without 2+ frames' delay. */
+        syncNative();
+        displayRefresh();
+        // Re-apply rects after layout settles (important for nested containers whose client size
+        // can be 0 on first mount tick).
+        requestAnimationFrame(function () {
+          for (var m = 0; m < mounted.length; m++) {
+            try {
+              applySpecRectToPanel(mounted[m].panel, mounted[m].spec);
+            } catch (_) {}
+          }
+        });
+        requestAnimationFrame(function () {
+          requestAnimationFrame(function () {
+            for (var m = 0; m < mounted.length; m++) {
+              try {
+                applySpecRectToPanel(mounted[m].panel, mounted[m].spec);
+              } catch (_) {}
+            }
+            syncNative();
+            displayRefresh();
+          });
+        });
+      }
+
+      if (typeof VfBrowserTransport !== "undefined" && typeof VfDisplay !== "undefined") {
+        try {
+          vfBrowserSession = VfBrowserTransport.createBrowserSessionRuntime({
+            display: VfDisplay,
+            applyScene: applySceneCommands,
+            onSceneStale: function () {
+              displayRefresh();
+            }
+          });
+          vfSceneRuntime = vfBrowserSession.scene;
+          vfDisplayRuntime = vfBrowserSession.display;
+          window.__vfBrowserSession = vfBrowserSession;
+          window.__vfSceneRuntime = vfSceneRuntime;
+          window.__vfDisplayRuntime = vfDisplayRuntime;
+          window.__vfBrowserHooks = vfBrowserSession.hooks;
+          window.__vfSceneHooks = {
+            refresh: vfBrowserSession.hooks.refreshScene,
+            update: vfBrowserSession.hooks.updateScene
+          };
+          window.__vfDisplayHooks = {
+            refresh: vfBrowserSession.hooks.refreshDisplay,
+            update: vfBrowserSession.hooks.updateDisplay
+          };
+        } catch (transportErr) {
+          slog("error", "browser session attach failed: " + (transportErr && transportErr.message ? transportErr.message : String(transportErr)));
+        }
+      }
+
+      (function watchScreenCanvas() {
+        var c = document.getElementById("vf-screen-canvas");
+        if (!c || typeof ResizeObserver === "undefined") return;
+        var ro = new ResizeObserver(function () {
+          displayRefresh();
+        });
+        ro.observe(c);
+      })();
+
+      // Log geometry script availability after a short delay
+      setTimeout(function() {
+        slog("info", "geom deps: VfGeomCore=" + (typeof VfGeomCore !== "undefined") +
+          " VfGeomMath=" + (typeof VfGeomMath !== "undefined") +
+          " VfGeomWgpu=" + (typeof VfGeomWgpu !== "undefined") +
+          " VfDisplay=" + (typeof VfDisplay !== "undefined") +
+          " VfBrowserTransport=" + (typeof VfBrowserTransport !== "undefined") +
+          " VfFrame=" + (typeof VfFrame !== "undefined"));
+        slog("info", "navigator.gpu=" + (navigator && navigator.gpu ? "present" : "MISSING") +
+          " webview=" + (typeof chrome !== "undefined" && chrome.webview ? "present" : "missing"));
+      }, 300);
+
+      if (vfSceneRuntime && vfSceneRuntime.refresh) {
+        vfSceneRuntime.refresh(function () {
+          displayRefresh();
+        });
+        setInterval(function () {
+          vfSceneRuntime.refresh(function () {
+            displayRefresh();
+          });
+        }, 1500);
+      }
+      // Display JSON is polled via requestAnimationFrame for smooth ~60 fps rendering.
+      // The overlay WebView2 host drives rAF at vsync rate; the browser does the same.
+      // setInterval(displayRefresh, 500) would cap us at 2 fps — avoid it.
+      (function rafLoop() {
+        displayRefresh();
+        requestAnimationFrame(rafLoop);
+      })();
+      window.addEventListener("resize", function () {
+        var layer = document.getElementById("layer");
+        if (layer && typeof VfFrame !== "undefined" && VfFrame.layoutMinimizedDock) {
+          VfFrame.layoutMinimizedDock(layer);
+        }
+        if (layer && typeof VfFrame !== "undefined" && VfFrame.postNativeHostLayout) {
+          requestAnimationFrame(function () {
+            VfFrame.postNativeHostLayout(layer, { stageAlpha: 0 });
+          });
+        }
+        if (vfDisplayRuntime && vfDisplayRuntime.refresh) {
+          vfDisplayRuntime.refresh();
+        }
+      });
+      (function observeLayout() {
+        var layer = document.getElementById("layer");
+        if (!layer || typeof ResizeObserver === "undefined") return;
+        var t = 0;
+        var ro = new ResizeObserver(function () {
+          if (typeof VfFrame === "undefined" || !VfFrame.postNativeHostLayout) return;
+          var n = performance.now();
+          if (n - t < 32) return;
+          t = n;
+          requestAnimationFrame(function () {
+            VfFrame.postNativeHostLayout(layer, { stageAlpha: 0 });
+          });
+        });
+        ro.observe(layer);
+      })();
+      (function nativeLayoutOnMove() {
+        var t = 0;
+        document.addEventListener(
+          "pointermove",
+          function () {
+            var n = performance.now();
+            if (n - t < 48) return;
+            t = n;
+            var layer = document.getElementById("layer");
+            if (layer && typeof VfFrame !== "undefined" && VfFrame.postNativeHostLayout) {
+              VfFrame.postNativeHostLayout(layer, { stageAlpha: 0 });
+            }
+          },
+          true
+        );
+      })();
+    </script>
+  </body>
+</html>
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vektor Flow — vf-geom (3D cube)</title>
+    <link rel="stylesheet" href="../vf-frame.css" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: transparent;
+        pointer-events: none;
+      }
+      #layer {
+        position: absolute;
+        inset: 0;
+        overflow: hidden;
+        pointer-events: none;
+        z-index: 1;
+      }
+      .vf-geom__body {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        padding: 6px 8px 10px;
+        box-sizing: border-box;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="layer"></div>
+    <script src="../vf-log.js"></script>
+    <script src="../vf-frame.js"></script>
+    <script src="vf-geom-math.js"></script>
+    <script src="vf-geom-core.js"></script>
+    <script src="vf-geom-wgpu.js"></script>
+    <script src="vf-geom-mount.js"></script>
+    <script>
+      (function () {
+        var layer = document.getElementById("layer");
+        if (!layer) return;
+
+        var geomHandle = null;
+
+        function postLayout() {
+          if (typeof VfFrame === "undefined" || !VfFrame.postNativeHostLayout) return;
+          VfFrame.postNativeHostLayout(layer, { stageAlpha: 1 });
+        }
+
+        var panel = VfFrame.mount(layer, {
+          id: "geom-solo-cube",
+          title: "3D cube (WebGPU)",
+          draggable: true,
+          dockable: true,
+          resizable: true,
+          closable: true,
+          alpha: 0.96,
+          exitWhenLastFrameClosed: true,
+          onBeforeDestroy: function () {
+            if (geomHandle) {
+              geomHandle.destroy();
+              geomHandle = null;
+            }
+          },
+          onFrameRemoved: postLayout,
+        });
+
+        var root = panel.root;
+        root.classList.add("vf-frame--user-sized");
+        root.style.left = "6%";
+        root.style.top = "6%";
+        root.style.width = "88%";
+        root.style.height = "82%";
+        root.style.right = "auto";
+
+        geomHandle = VfGeom.mountInPanel(panel, "3d_cube", { minHeight: 360 });
+
+        window.addEventListener(
+          "resize",
+          function () {
+            requestAnimationFrame(postLayout);
+          },
+          false
+        );
+        requestAnimationFrame(postLayout);
+      })();
+    </script>
+  </body>
+</html>

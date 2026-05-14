@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vektor Flow — vf-geom smoke (one 2D rect)</title>
+    <link rel="stylesheet" href="../vf-frame.css" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: transparent;
+        pointer-events: none;
+      }
+      #layer {
+        position: absolute;
+        inset: 0;
+        overflow: hidden;
+        pointer-events: none;
+        z-index: 1;
+      }
+      .vf-smoke__body {
+        padding: 6px 8px 10px !important;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        overflow: hidden;
+      }
+      .vf-smoke-host {
+        position: relative;
+        z-index: 1;
+        flex: 1 1 auto;
+        min-height: 220px;
+        width: 100%;
+        box-sizing: border-box;
+      }
+      .vf-smoke-host canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+        background: #12141a;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="layer"></div>
+    <script src="../vf-frame.js"></script>
+    <script>
+      (function () {
+        var layer = document.getElementById("layer");
+        if (!layer) return;
+
+        var panel = VfFrame.mount(layer, {
+          id: "geom-smoke-rect",
+          title: "Smoke — 2D rect (Canvas2D, one frame)",
+          draggable: true,
+          dockable: true,
+          resizable: true,
+          closable: true,
+          alpha: 0.96,
+          exitWhenLastFrameClosed: true,
+        });
+
+        var root = panel.root;
+        root.classList.add("vf-frame--user-sized");
+        root.style.left = "8%";
+        root.style.top = "8%";
+        root.style.width = "55%";
+        root.style.height = "55%";
+        root.style.right = "auto";
+
+        try {
+          panel.body.classList.add("vf-smoke__body");
+        } catch (e) {}
+
+        var host = document.createElement("div");
+        host.className = "vf-smoke-host";
+        panel.body.appendChild(host);
+
+        var canvas = document.createElement("canvas");
+        host.appendChild(canvas);
+
+        var bufW = 0;
+        var bufH = 0;
+        var lastStableCcw = -1;
+        var lastStableCch = -1;
+        var winResizeT = 0;
+        var rafOnce = 0;
+
+        function draw() {
+          var cw0 = host.clientWidth | 0;
+          var ch0 = host.clientHeight | 0;
+          if (cw0 < 1 || ch0 < 1) {
+            return;
+          }
+          if (lastStableCcw > 0) {
+            if (Math.abs(cw0 - lastStableCcw) < 2 && Math.abs(ch0 - lastStableCch) < 2) {
+              return;
+            }
+          }
+          lastStableCcw = cw0;
+          lastStableCch = ch0;
+
+          var dpr = window.devicePixelRatio || 1;
+          var w = Math.max(2, Math.floor(cw0 * dpr));
+          var h = Math.max(2, Math.floor(ch0 * dpr));
+          if (w !== bufW || h !== bufH) {
+            bufW = w;
+            bufH = h;
+            canvas.width = w;
+            canvas.height = h;
+          }
+          var ctx = canvas.getContext("2d");
+          if (!ctx) return;
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.scale(dpr, dpr);
+          ctx.fillStyle = "#151820";
+          ctx.fillRect(0, 0, cw0, ch0);
+          ctx.fillStyle = "#3d9cff";
+          ctx.fillRect(24, 24, Math.min(280, cw0 - 48), Math.min(140, ch0 - 48));
+        }
+
+        function scheduleDrawDebounced() {
+          if (winResizeT) {
+            clearTimeout(winResizeT);
+          }
+          winResizeT = setTimeout(function () {
+            winResizeT = 0;
+            lastStableCcw = -1;
+            lastStableCch = -1;
+            rafOnce = requestAnimationFrame(function () {
+              rafOnce = 0;
+              draw();
+            });
+          }, 300);
+        }
+
+        rafOnce = requestAnimationFrame(function () {
+          rafOnce = requestAnimationFrame(function () {
+            rafOnce = 0;
+            draw();
+          });
+        });
+        /* No postNativeHostLayout: vf-frame posts hit tests; page-side duplicate layout caused
+         * feedback. ResizeObserver on the body fired often during in-layer drag; poll slowly instead. */
+        window.addEventListener("resize", scheduleDrawDebounced, false);
+        setInterval(function () {
+          lastStableCcw = -1;
+          lastStableCch = -1;
+          requestAnimationFrame(function () {
+            draw();
+          });
+        }, 400);
+      })();
+    </script>
+  </body>
+</html>

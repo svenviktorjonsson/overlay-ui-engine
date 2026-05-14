@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vektor Flow — vf-geom (2D/3D shapes in VfFrame)</title>
+    <link rel="stylesheet" href="../vf-frame.css" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: transparent;
+        pointer-events: none;
+      }
+      #layer {
+        position: absolute;
+        inset: 0;
+        overflow: hidden;
+        pointer-events: none;
+        z-index: 1;
+      }
+      /* Let the WebGPU host fill the frame body. */
+      .vf-geom__body {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        padding: 6px 8px 10px;
+        box-sizing: border-box;
+      }
+      .vf-geom__body .vf-frame__draw-canvas {
+        z-index: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="layer"></div>
+    <script src="../vf-log.js"></script>
+    <script src="../vf-frame.js"></script>
+    <script src="vf-geom-math.js"></script>
+    <script src="vf-geom-core.js"></script>
+    <script src="vf-geom-wgpu.js"></script>
+    <script src="vf-geom-mount.js"></script>
+    <script>
+      (function () {
+        const layer = document.getElementById("layer");
+        if (!layer) return;
+
+        const specs = [
+          { id: "geom-2d-tri", title: "2D — triangle", preset: "2d_tri" },
+          { id: "geom-2d-quad", title: "2D — quad (2 tris)", preset: "2d_quad" },
+          { id: "geom-2d-hex", title: "2D — hex (fan)", preset: "2d_hex" },
+          { id: "geom-3d-cube", title: "3D — solid cube", preset: "3d_cube" },
+          { id: "geom-3d-cube-w", title: "3D — wireframe cube", preset: "3d_cube_wire" },
+          { id: "geom-3d-tet", title: "3D — tetrahedron", preset: "3d_tet" },
+        ];
+
+        function placeFrameInGrid(panel, col, row) {
+          const root = panel.root;
+          const left = 1 + col * 33;
+          const top = 2 + row * 50;
+          root.classList.add("vf-frame--user-sized");
+          root.style.left = left + "%";
+          root.style.top = top + "%";
+          root.style.width = "32%";
+          root.style.height = "46%";
+          root.style.right = "auto";
+        }
+
+        function postLayout() {
+          if (typeof VfFrame === "undefined" || !VfFrame.postNativeHostLayout) return;
+          VfFrame.postNativeHostLayout(layer, { stageAlpha: 1 });
+        }
+
+        const handles = [];
+        for (let i = 0; i < specs.length; i++) {
+          const s = specs[i];
+          const col = i % 3;
+          const row = (i / 3) | 0;
+          let geomHandle = null;
+          const panel = VfFrame.mount(layer, {
+            id: s.id,
+            title: s.title,
+            draggable: true,
+            dockable: true,
+            resizable: true,
+            closable: true,
+            alpha: 0.96,
+            onBeforeDestroy: function () {
+              if (geomHandle) {
+                geomHandle.destroy();
+                geomHandle = null;
+              }
+            },
+            onFrameRemoved: postLayout,
+          });
+          placeFrameInGrid(panel, col, row);
+          geomHandle = VfGeom.mountInPanel(panel, s.preset, { minHeight: 180 });
+          handles.push(geomHandle);
+        }
+
+        window.addEventListener("resize", function () {
+          requestAnimationFrame(postLayout);
+        });
+        requestAnimationFrame(postLayout);
+      })();
+    </script>
+  </body>
+</html>

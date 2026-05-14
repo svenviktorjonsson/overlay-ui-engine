@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vektor Flow — small GUI example</title>
+    <link rel="stylesheet" href="vf-frame.css" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: transparent;
+        pointer-events: none;
+      }
+      #layer {
+        position: absolute;
+        inset: 0;
+        overflow: hidden;
+        background: transparent;
+        pointer-events: none;
+      }
+      .vf-example-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 10px;
+        flex-wrap: wrap;
+      }
+      .vf-example-row label {
+        min-width: 4.5rem;
+        opacity: 0.85;
+      }
+      .vf-example-row input[type="text"],
+      .vf-example-row select {
+        flex: 1;
+        min-width: 140px;
+        padding: 6px 8px;
+        border-radius: 6px;
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        background: rgba(0, 0, 0, 0.35);
+        color: #eee;
+      }
+      button.vf-btn {
+        padding: 6px 12px;
+        border-radius: 6px;
+        border: 1px solid rgba(120, 180, 255, 0.35);
+        background: rgba(60, 100, 200, 0.35);
+        color: #e8f0ff;
+        cursor: pointer;
+        font: inherit;
+      }
+      button.vf-btn:hover {
+        background: rgba(80, 120, 220, 0.45);
+      }
+      #out {
+        margin-top: 12px;
+        padding: 8px 10px;
+        border-radius: 6px;
+        background: rgba(0, 0, 0, 0.35);
+        font-family: ui-monospace, Consolas, monospace;
+        font-size: 12px;
+        min-height: 1.5em;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="layer"></div>
+    <script src="vf-frame.js"></script>
+    <script>
+      const layer = document.getElementById("layer");
+
+      const panel = VfFrame.mount(layer, {
+        id: "example-tools",
+        title: "Tools (demo)",
+        draggable: true,
+        dockable: true,
+        resizable: true,
+        closable: true,
+        alpha: 0.96,
+      });
+
+      function row(label, inner) {
+        const r = document.createElement("div");
+        r.className = "vf-example-row";
+        const lb = document.createElement("label");
+        lb.textContent = label;
+        r.appendChild(lb);
+        r.appendChild(inner);
+        return r;
+      }
+
+      panel.body.appendChild(row("Name", (() => {
+        const inp = document.createElement("input");
+        inp.type = "text";
+        inp.placeholder = "Ada";
+        inp.value = "";
+        return inp;
+      })()));
+
+      const sel = document.createElement("select");
+      ["one", "two", "three"].forEach((t) => {
+        const o = document.createElement("option");
+        o.value = t;
+        o.textContent = t;
+        sel.appendChild(o);
+      });
+      panel.body.appendChild(row("Pick", sel));
+
+      const chk = document.createElement("input");
+      chk.type = "checkbox";
+      chk.id = "chk-done";
+      const chkLabel = document.createElement("label");
+      chkLabel.htmlFor = "chk-done";
+      chkLabel.textContent = "Done";
+      const wrap = document.createElement("div");
+      wrap.className = "vf-example-row";
+      wrap.appendChild(chk);
+      wrap.appendChild(chkLabel);
+      panel.body.appendChild(wrap);
+
+      const out = document.createElement("div");
+      out.id = "out";
+      out.textContent = "—";
+      panel.body.appendChild(out);
+
+      const btnFit = document.createElement("button");
+      btnFit.type = "button";
+      btnFit.className = "vf-btn";
+      btnFit.textContent = "expandToFitContent()";
+      btnFit.addEventListener("click", () => panel.expandToFitContent());
+
+      const btnLog = document.createElement("button");
+      btnLog.type = "button";
+      btnLog.className = "vf-btn";
+      btnLog.textContent = "Log form";
+      btnLog.addEventListener("click", () => {
+        const name = panel.body.querySelector('input[type="text"]')?.value ?? "";
+        out.textContent = JSON.stringify({ name, pick: sel.value, done: chk.checked });
+      });
+
+      const rowBtn = document.createElement("div");
+      rowBtn.className = "vf-example-row";
+      rowBtn.appendChild(btnFit);
+      rowBtn.appendChild(btnLog);
+      panel.body.appendChild(rowBtn);
+
+      panel.expandToFitContent();
+
+      (function syncNativeLayoutRegions() {
+        const wv = window.chrome && window.chrome.webview;
+        if (!wv || typeof wv.postMessage !== "function") return;
+
+        function postHit() {
+          const r = panel.root.getBoundingClientRect();
+          wv.postMessage({
+            type: "layout",
+            stageAlpha: 0,
+            contentHidden: false,
+            toolbarPx: 160,
+            hitRegions: [
+              { left: r.left, top: r.top, right: r.right, bottom: r.bottom },
+            ],
+          });
+        }
+
+        const ro = new ResizeObserver(() => requestAnimationFrame(postHit));
+        ro.observe(panel.root);
+        document.addEventListener("pointerup", () => requestAnimationFrame(postHit), true);
+        let moveT = 0;
+        document.addEventListener(
+          "pointermove",
+          () => {
+            const n = performance.now();
+            if (n - moveT < 32) return;
+            moveT = n;
+            requestAnimationFrame(postHit);
+          },
+          true
+        );
+        window.addEventListener("resize", postHit);
+        requestAnimationFrame(postHit);
+      })();
+    </script>
+  </body>
+</html>

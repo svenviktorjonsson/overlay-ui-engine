@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vektor Flow — vf-geom (rect · polygon · cube · surface)</title>
+    <link rel="stylesheet" href="../vf-frame.css" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: transparent;
+        pointer-events: none;
+      }
+      #layer {
+        position: absolute;
+        inset: 0;
+        overflow: hidden;
+        pointer-events: none;
+        z-index: 1;
+      }
+      .vf-geom__body {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        padding: 6px 8px 10px;
+        box-sizing: border-box;
+      }
+      .vf-geom__body .vf-frame__draw-canvas {
+        z-index: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="layer"></div>
+    <script src="../vf-log.js"></script>
+    <script src="../vf-frame.js"></script>
+    <script src="vf-geom-math.js"></script>
+    <script src="vf-geom-core.js"></script>
+    <script src="vf-geom-wgpu.js"></script>
+    <script src="vf-geom-mount.js"></script>
+    <script>
+      (function () {
+        var layer = document.getElementById("layer");
+        if (!layer) return;
+
+        var specs = [
+          { id: "geom-rect", title: "2D — rectangle", preset: "2d_rect" },
+          { id: "geom-poly", title: "2D — polygon (octagon)", preset: "2d_poly" },
+          { id: "geom-cube", title: "3D — cube", preset: "3d_cube" },
+          { id: "geom-surface", title: "3D — surface (heightfield)", preset: "3d_surface" },
+        ];
+
+        function placeFrameInGrid(panel, col, row) {
+          var root = panel.root;
+          var left = 1 + col * 50;
+          var top = 2 + row * 49;
+          root.classList.add("vf-frame--user-sized");
+          root.style.left = left + "%";
+          root.style.top = top + "%";
+          root.style.width = "48%";
+          root.style.height = "44%";
+          root.style.right = "auto";
+        }
+
+        function postLayout() {
+          if (typeof VfFrame === "undefined" || !VfFrame.postNativeHostLayout) return;
+          VfFrame.postNativeHostLayout(layer, { stageAlpha: 1 });
+        }
+
+        var handles = [];
+        for (var i = 0; i < specs.length; i++) {
+          var s = specs[i];
+          var col = i % 2;
+          var row = (i / 2) | 0;
+          var geomHandle = null;
+          var panel = VfFrame.mount(layer, {
+            id: s.id,
+            title: s.title,
+            draggable: true,
+            dockable: true,
+            resizable: true,
+            closable: true,
+            alpha: 0.96,
+            exitWhenLastFrameClosed: true,
+            onBeforeDestroy: function () {
+              if (geomHandle) {
+                geomHandle.destroy();
+                geomHandle = null;
+              }
+            },
+            onFrameRemoved: postLayout,
+          });
+          placeFrameInGrid(panel, col, row);
+          geomHandle = VfGeom.mountInPanel(panel, s.preset, { minHeight: 160 });
+          handles.push(geomHandle);
+        }
+
+        window.addEventListener(
+          "resize",
+          function () {
+            requestAnimationFrame(postLayout);
+          },
+          false
+        );
+        requestAnimationFrame(postLayout);
+      })();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VfFrame demo — vektor-flow</title>
+    <link rel="stylesheet" href="vf-frame.css" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #12121a;
+      }
+      #layer {
+        position: absolute;
+        left: 0;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        overflow: hidden;
+      }
+      .hint {
+        position: absolute;
+        left: 16px;
+        bottom: 16px;
+        color: rgba(255, 255, 255, 0.45);
+        font: 12px system-ui, sans-serif;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="layer"></div>
+    <p class="hint">Drag header · minimize · resize corner · close · button expands frame to fit</p>
+    <script src="vf-frame.js"></script>
+    <script>
+      const layer = document.getElementById("layer");
+      const f = VfFrame.mount(layer, {
+        id: "demo-panel",
+        title: "Vektor Flow",
+        draggable: true,
+        dockable: true,
+        resizable: true,
+        closable: true,
+        alpha: 0.97,
+      });
+      const label = document.createElement("p");
+      label.textContent = "Panel body — content drives expand_to_fit_content.";
+      f.body.appendChild(label);
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = "expandToFitContent()";
+      btn.style.marginTop = "8px";
+      btn.addEventListener("click", () => f.expandToFitContent());
+      f.body.appendChild(btn);
+    </script>
+  </body>
+</html>
