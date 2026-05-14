@@ -6,6 +6,33 @@
 (function (global) {
   "use strict";
 
+  function getOrigin() {
+    if (typeof location !== "undefined" && location && location.origin) {
+      return location.origin;
+    }
+    var p =
+      (typeof global !== "undefined" && global.__agentPort) ||
+      (typeof window !== "undefined" && window.__agentPort);
+    if (p) {
+      return "http://127.0.0.1:" + String(p);
+    }
+    return "http://127.0.0.1";
+  }
+
+  function enqueueFrameEvent(obj) {
+    var s = JSON.stringify(obj);
+    var url = getOrigin() + "/api/enqueue";
+    if (typeof fetch === "function") {
+      fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ line: s }),
+        mode: "cors",
+        cache: "no-store",
+      }).catch(function () {});
+    }
+  }
+
   const VfFrame = {
     /**
      * Parse frame alpha from JSON (number or numeric string). Default `fallback` if missing/invalid.
@@ -645,6 +672,7 @@
         opt.dockable !== false && (opt.minimizable !== false);
       const resizable = opt.resizable !== false;
       const closable = opt.closable !== false;
+      const aspect = opt.aspect != null ? String(opt.aspect).trim().toLowerCase() : "";
       const alpha = VfFrame._coerceAlpha(opt.alpha, 1);
       const master = opt.master === true;
       const exitWhenLastFrameClosed = opt.exitWhenLastFrameClosed === true;
@@ -672,6 +700,7 @@
       root.classList.toggle("vf-frame--resizable", resizable);
       root.dataset.vfFrameId = id;
       root.dataset.vfMinDock = minDock;
+      if (aspect) { root.dataset.vfAspect = aspect; }
       /* Opacity on whole root would dim title/KaTeX; only shell rgba use --vf-ui-alpha. */
       root.style.opacity = "1";
       root.style.setProperty("--vf-ui-alpha", String(alpha));
@@ -719,6 +748,10 @@
 
       const body = document.createElement("div");
       body.className = "vf-frame__body";
+      const hasBodyContent = Array.isArray(opt.body) ? opt.body.length > 0 : !!opt.body;
+      if (!hasBodyContent) {
+        body.classList.add("vf-frame__body--empty");
+      }
       const drawCanvas = document.createElement("canvas");
       drawCanvas.className = "vf-frame__draw-canvas";
       drawCanvas.setAttribute("aria-hidden", "true");
@@ -812,6 +845,11 @@
           root.style.right = "auto";
           if (minibar) minibar.style.display = "none";
           VfFrame.layoutMinimizedDock(layer);
+          enqueueFrameEvent({
+            frameId: String(id),
+            event: "frame.docked",
+            data: { dock: String(minDock), minimized: true },
+          });
         } else {
           root.style.position = "";
           if (posBeforeMin) {
@@ -934,7 +972,19 @@
           layer,
           onDragStart: bringToFront,
           onDragMove: postHitRegionsToHostImpl,
-          onDragEnd: flushPostHitRegionsToHost,
+          onDragEnd: function () {
+            flushPostHitRegionsToHost();
+            enqueueFrameEvent({
+              frameId: String(id),
+              event: "frame.dragged",
+              data: {
+                left: root.style.left || "",
+                top: root.style.top || "",
+                width: root.style.width || "",
+                height: root.style.height || "",
+              },
+            });
+          },
         });
       }
 
@@ -974,6 +1024,16 @@
         } catch (_) {}
         resizeState = null;
         flushPostHitRegionsToHost();
+        enqueueFrameEvent({
+          frameId: String(id),
+          event: "frame.resized",
+          data: {
+            left: root.style.left || "",
+            top: root.style.top || "",
+            width: root.style.width || "",
+            height: root.style.height || "",
+          },
+        });
       }
       if (resizable) {
         resizeGrip.addEventListener("pointerdown", (e) => {

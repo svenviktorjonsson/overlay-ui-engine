@@ -1,6 +1,7 @@
 /**
  * VKF — declarative widget bodies + host event queue (POST /api/enqueue).
- * State patches: vf-ui-state.json (polled) — from Python :meth:`Screen.widget_set`.
+ * Preferred runtime path: explicit packet application from vf-runtime-packets.json.
+ * Legacy fallback: vf-ui-state.json polling.
  */
 (function (global) {
   "use strict";
@@ -24,6 +25,12 @@
   }
 
   function enqueueEvent(obj) {
+    try {
+      if (typeof window !== "undefined" && window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
+        window.chrome.webview.postMessage(obj);
+        return;
+      }
+    } catch (_) {}
     var s = JSON.stringify(obj);
     var url = getOrigin() + "/api/enqueue";
     if (typeof fetch === "function") {
@@ -56,12 +63,22 @@
     if (!p || typeof p !== "object") return;
     var r = reg[fid] && reg[fid][wid];
     if (!r) return;
+    if (p.append_text != null && r.type === "textarea" && r.el) {
+      var seq = Number(p.append_seq || 0);
+      if (!Number.isFinite(seq)) seq = 0;
+      if (!r.lastAppendSeq || seq > r.lastAppendSeq) {
+        r.el.value = String(r.el.value || "") + String(p.append_text);
+        r.el.scrollTop = r.el.scrollHeight;
+        r.lastAppendSeq = seq;
+      }
+    }
     if (p.text != null) {
       if (r.type === "label" && r.labelEl) {
         r.labelEl.textContent = String(p.text);
       }
       if (r.type === "textarea" && r.el) {
         r.el.value = String(p.text);
+        r.el.scrollTop = r.el.scrollHeight;
       }
       if (r.type === "input" && r.el) {
         r.el.value = String(p.text);
@@ -118,13 +135,51 @@
       .catch(function () {});
   }
 
+  function applyStateObject(o) {
+    if (!o || typeof o !== "object") return;
+    for (var fid in o) {
+      if (!Object.prototype.hasOwnProperty.call(o, fid)) continue;
+      var byId = o[fid];
+      if (!byId || typeof byId !== "object") continue;
+      for (var wid in byId) {
+        if (!Object.prototype.hasOwnProperty.call(byId, wid)) continue;
+        applyPropsToNode(String(fid), String(wid), byId[wid]);
+      }
+    }
+  }
+
+  function applyRuntimePacket(packet) {
+    if (!packet || typeof packet !== "object") return;
+    var kind = String(packet.kind || "");
+    var payload = packet.payload;
+    if (kind === "ui_state.replace" && payload && typeof payload.state === "object") {
+      applyStateObject(payload.state);
+      return;
+    }
+    if (kind === "widget.append_text" && payload) {
+      applyPropsToNode(String(payload.frame_id || ""), String(payload.widget_id || ""), {
+        append_text: payload.text,
+        append_seq: payload.append_seq
+      });
+    }
+  }
+
   function startStatePoll() {
     if (started) return;
     started = true;
     if (typeof window !== "undefined" && window.setInterval) {
       loadAndApplyState();
-      pollTimer = window.setInterval(loadAndApplyState, 300);
+      pollTimer = window.setInterval(loadAndApplyState, 16);
     }
+  }
+
+  function stopStatePoll() {
+    if (!started) return;
+    started = false;
+    if (pollTimer && typeof window !== "undefined" && window.clearInterval) {
+      window.clearInterval(pollTimer);
+    }
+    pollTimer = 0;
   }
 
   function onFrameClose(fid) {
@@ -251,7 +306,9 @@
     if (t === "textarea") {
       var ta = document.createElement("textarea");
       ta.className = "vf-w-textarea";
-      ta.rows = 4;
+      var rows = spec.rows != null ? parseInt(String(spec.rows), 10) : 4;
+      ta.rows = Number.isFinite(rows) && rows > 0 ? rows : 4;
+      ta.readOnly = !!spec.readonly;
       ta.value = spec.text != null ? String(spec.text) : "";
       var last2 = ta.value;
       ta.addEventListener("input", function () {
@@ -382,6 +439,9 @@
     onFrameClose: onFrameClose,
     enqueue: enqueueEvent,
     startStatePoll: startStatePoll,
+    stopStatePoll: stopStatePoll,
+    applyStateObject: applyStateObject,
+    applyRuntimePacket: applyRuntimePacket,
     clearFrame: clearFrameWidgets,
   };
 })(typeof window !== "undefined" ? window : this);

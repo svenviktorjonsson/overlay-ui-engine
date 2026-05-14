@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VF Native Event Probe</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: rgba(18, 20, 26, 0.92);
+      color: #eef3ff;
+      font: 14px/1.35 Consolas, "SFMono-Regular", Menlo, monospace;
+    }
+    .root {
+      display: grid;
+      grid-template-columns: 0.42fr 0.58fr;
+      gap: 16px;
+      box-sizing: border-box;
+      width: 100%;
+      height: 100%;
+      padding: 16px;
+    }
+    .pane {
+      min-width: 0;
+      min-height: 0;
+      border: 1px solid rgba(180, 200, 255, 0.3);
+      border-radius: 12px;
+      background: rgba(36, 40, 52, 0.82);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+    }
+    #surface {
+      position: relative;
+      outline: none;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: none;
+    }
+    #surface:focus {
+      border-color: rgba(120, 190, 255, 0.85);
+      box-shadow: 0 0 0 2px rgba(120, 190, 255, 0.24), 0 10px 30px rgba(0, 0, 0, 0.28);
+    }
+    .surface-label {
+      position: absolute;
+      left: 16px;
+      top: 14px;
+      font-size: 13px;
+      color: rgba(225, 232, 255, 0.82);
+    }
+    #log {
+      width: 100%;
+      height: 100%;
+      box-sizing: border-box;
+      border: none;
+      resize: none;
+      outline: none;
+      border-radius: 12px;
+      padding: 14px 16px;
+      background: rgba(11, 13, 19, 0.9);
+      color: #dff7ff;
+      font: 13px/1.3 Consolas, "SFMono-Regular", Menlo, monospace;
+    }
+  </style>
+</head>
+<body>
+  <div class="root">
+    <div id="surface" class="pane" tabindex="0" aria-label="Event surface">
+      <div class="surface-label">native binary event surface</div>
+    </div>
+    <div class="pane">
+      <textarea id="log" readonly></textarea>
+    </div>
+  </div>
+  <script>
+    (function() {
+      "use strict";
+      function hostLog(level, message) {
+        try {
+          console.log(message);
+        } catch (_) {}
+        try {
+          if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
+            window.chrome.webview.postMessage({
+              type: "vf_log",
+              level: level,
+              message: message
+            });
+          }
+        } catch (_) {}
+      }
+
+      hostLog("info", "[native-event-probe] webview boot");
+
+      try {
+        var surface = document.getElementById("surface");
+        var log = document.getElementById("log");
+        var seq = 0;
+
+        hostLog("info", "[native-event-probe] nodes surface=" + (!!surface) + " log=" + (!!log));
+
+        function fmt(n) {
+          return Number(n).toFixed(3);
+        }
+
+        function append(line) {
+          seq += 1;
+          if (!log) {
+            throw new Error("log textarea missing");
+          }
+          log.value += "[" + seq + "] " + line + "\n";
+          log.scrollTop = log.scrollHeight;
+        }
+
+        function pos(ev) {
+          if (!surface) {
+            throw new Error("surface missing");
+          }
+          var r = surface.getBoundingClientRect();
+          return {
+            x: Math.round(ev.clientX - r.left),
+            y: Math.round(ev.clientY - r.top)
+          };
+        }
+
+        function logPointer(kind, ev) {
+          var p = pos(ev);
+          append(
+            fmt(performance.now()) +
+            " " + kind +
+            " x=" + p.x +
+            " y=" + p.y +
+            " button=" + Number(ev.button || 0) +
+            " buttons=" + Number(ev.buttons || 0) +
+            " pointerId=" + Number(ev.pointerId || 0)
+          );
+        }
+
+        function logWheel(ev) {
+          var p = pos(ev);
+          append(
+            fmt(performance.now()) +
+            " wheel x=" + p.x +
+            " y=" + p.y +
+            " dx=" + Math.round(ev.deltaX || 0) +
+            " dy=" + Math.round(ev.deltaY || 0)
+          );
+        }
+
+        function logKey(kind, ev) {
+          append(
+            fmt(performance.now()) +
+            " " + kind +
+            " key=" + String(ev.key || "") +
+            " code=" + String(ev.code || "") +
+            " ctrl=" + (ev.ctrlKey ? 1 : 0) +
+            " shift=" + (ev.shiftKey ? 1 : 0) +
+            " alt=" + (ev.altKey ? 1 : 0)
+          );
+        }
+
+        surface.addEventListener("pointerenter", function(ev) { logPointer("pointerenter", ev); });
+        surface.addEventListener("pointermove", function(ev) { logPointer("pointermove", ev); });
+        surface.addEventListener("pointerdown", function(ev) {
+          try { surface.setPointerCapture(ev.pointerId); } catch (_) {}
+          logPointer("pointerdown", ev);
+        });
+        surface.addEventListener("pointerup", function(ev) {
+          try { surface.releasePointerCapture(ev.pointerId); } catch (_) {}
+          logPointer("pointerup", ev);
+        });
+        surface.addEventListener("pointercancel", function(ev) { logPointer("pointercancel", ev); });
+        surface.addEventListener("pointerleave", function(ev) { logPointer("pointerleave", ev); });
+        surface.addEventListener("wheel", function(ev) { logWheel(ev); }, { passive: true });
+        surface.addEventListener("keydown", function(ev) { logKey("keydown", ev); });
+        surface.addEventListener("keyup", function(ev) { logKey("keyup", ev); });
+
+        append("native-event-probe ready");
+        append("focus the left pane, then move / click / type");
+        surface.focus();
+        hostLog("info", "[native-event-probe] ready");
+      } catch (err) {
+        hostLog("error", "[native-event-probe] crash " + (err && err.message ? err.message : String(err)));
+        throw err;
+      }
+    })();
+  </script>
+</body>
+</html>

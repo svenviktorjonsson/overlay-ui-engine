@@ -7,6 +7,8 @@
 (function (global) {
   "use strict";
 
+  var RUNTIME_ASSET_VERSION = String(global.__vfRuntimeAssetVersion || "");
+
   function wlog(level, text) {
     var s = "[vf-geom-wgpu] " + String(text);
     try {
@@ -21,6 +23,20 @@
         global.chrome.webview.postMessage({ type: "vf_log", level: level, message: s, t: Date.now() });
       }
     } catch (e) {}
+  }
+
+  function failFast(message) {
+    var text = String(message);
+    wlog("error", text);
+    throw new Error("[vf-geom-wgpu] " + text);
+  }
+
+  function failFastAsync(message) {
+    var text = String(message);
+    wlog("error", text);
+    setTimeout(function () {
+      throw new Error("[vf-geom-wgpu] " + text);
+    }, 0);
   }
 
   // ---------------------------------------------------------------------------
@@ -38,7 +54,7 @@ struct Scene {
   light_color: vec4<f32>,     // 16 bytes  offset 160
   // 0=flat, 1=lambert, 2=blinn_phong
   light_model: u32,           // 4 bytes   offset 176
-  _pad2      : u32,
+  alpha_mul  : f32,           // 4 bytes   offset 180
   _pad3      : u32,
   _pad4      : u32,           // total 192 bytes (12 * 16)
 }
@@ -71,7 +87,7 @@ fn vs(v: Vin) -> Vout {
 @fragment
 fn fs(i: Vout) -> @location(0) vec4f {
   let base = i.color.rgb;
-  let a    = i.color.a;
+  let a    = i.color.a * sc.alpha_mul;
   let t    = a;
   let N    = normalize(i.normal);
   let L    = normalize(sc.light_pos - i.world_pos);
@@ -106,7 +122,7 @@ fn fs(i: Vout) -> @location(0) vec4f {
 
 
   // ---------------------------------------------------------------------------
-  // Picking shader — writes object_id + primitive index to rg32uint texture
+  // Picking shader — writes object_id + primitive_index to rg32uint texture
   // ---------------------------------------------------------------------------
   var PICK_SHADER = `
 struct PickScene {
@@ -128,12 +144,13 @@ fn vs_pick(v: PVin) -> @builtin(position) vec4<f32> {
   return pk.mvp * vec4f(wp, 1.0);
 }
 @fragment
-fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> {
-  return vec2<u32>(pk.object_id, prim_index);
+fn fs_pick() -> @location(0) vec2<u32> {
+  return vec2<u32>(pk.object_id, 0u);
 }
 `;
 
   var PICK_UB_SIZE = 144; // 16+16 f32 + 4 u32 = 128+16 = 144 bytes
+  var SAMPLE_COUNT = 4;
 
   var M = null;
   function getMath() {
@@ -218,6 +235,7 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
             vertex:   { module: mod, entryPoint: "vs", buffers: [vbufDesc] },
             fragment: { module: mod, entryPoint: "fs", targets: targets },
             primitive: { topology: topo },
+            multisample: { count: SAMPLE_COUNT },
             depthStencil: {
               depthWriteEnabled: transparent ? false : true,
               depthCompare: "less",
@@ -228,15 +246,43 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
           return d;
         };
 
-        var pipeTri, pipeLine, pipeTriAlpha;
+        var pipeTri, pipeLine, pipeTriAlpha, pipeTriAlphaDepth;
         if (typeof device.createRenderPipelineAsync === "function") {
           pipeTri  = await device.createRenderPipelineAsync(makeDesc("triangle-list"));
           pipeLine = await device.createRenderPipelineAsync(makeDesc("line-list"));
           pipeTriAlpha = await device.createRenderPipelineAsync(makeDesc("triangle-list", null, true));
+          pipeTriAlphaDepth = await device.createRenderPipelineAsync({
+            layout: plLayout,
+            vertex:   { module: mod, entryPoint: "vs", buffers: [vbufDesc] },
+            fragment: { module: mod, entryPoint: "fs", targets: [{
+              format: format,
+              blend: {
+                color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+                alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+              },
+            }] },
+            primitive: { topology: "triangle-list" },
+            multisample: { count: SAMPLE_COUNT },
+            depthStencil: { depthWriteEnabled: true, depthCompare: "less", format: "depth24plus" },
+          });
         } else {
           pipeTri  = device.createRenderPipeline(makeDesc("triangle-list"));
           pipeLine = device.createRenderPipeline(makeDesc("line-list"));
           pipeTriAlpha = device.createRenderPipeline(makeDesc("triangle-list", null, true));
+          pipeTriAlphaDepth = device.createRenderPipeline({
+            layout: plLayout,
+            vertex:   { module: mod, entryPoint: "vs", buffers: [vbufDesc] },
+            fragment: { module: mod, entryPoint: "fs", targets: [{
+              format: format,
+              blend: {
+                color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+                alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+              },
+            }] },
+            primitive: { topology: "triangle-list" },
+            multisample: { count: SAMPLE_COUNT },
+            depthStencil: { depthWriteEnabled: true, depthCompare: "less", format: "depth24plus" },
+          });
         }
         // Picking pipeline — writes rg32uint (object_id, prim_index)
         var pickMod = device.createShaderModule({ code: PICK_SHADER });
@@ -262,7 +308,7 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
         } else {
           pipePick = device.createRenderPipeline(pickPipeDesc);
         }
-        sharedWgpu = { device, format, bindLayout, pipeTri, pipeLine, pipeTriAlpha, pipePick, pickBindLayout };
+        sharedWgpu = { device, format, bindLayout, pipeTri, pipeLine, pipeTriAlpha, pipeTriAlphaDepth, pipePick, pickBindLayout };
         wlog("info", "getSharedWgpu: OK");
         return sharedWgpu;
       } catch (err) {
@@ -278,7 +324,7 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
   // ---------------------------------------------------------------------------
   // Build scene uniform buffer (192 bytes)
   // ---------------------------------------------------------------------------
-  function buildUniform(mvp, model, camera, lights, lightModel) {
+  function buildUniform(mvp, model, camera, lights, lightModel, alphaMul) {
     var buf = new ArrayBuffer(UB_SIZE);
     var f32 = new Float32Array(buf);
     var u32 = new Uint32Array(buf);
@@ -301,8 +347,22 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
 
     // light_model (u32 @ offset 44)
     u32[44] = lightModel;
+    f32[45] = Number(alphaMul);
+    if (!Number.isFinite(f32[45])) { f32[45] = 1.0; }
 
     return f32;
+  }
+
+  function resolveAlphaMul(meshLike) {
+    if (!meshLike) { return 1.0; }
+    var raw = (typeof meshLike.alpha_provider === "function")
+      ? meshLike.alpha_provider()
+      : meshLike.alpha_mul;
+    var alpha = Number(raw);
+    if (!Number.isFinite(alpha)) { return 1.0; }
+    if (alpha < 0) { return 0.0; }
+    if (alpha > 1) { return 1.0; }
+    return alpha;
   }
 
   // ---------------------------------------------------------------------------
@@ -364,104 +424,6 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
   // ---------------------------------------------------------------------------
   // VfGeomWgpu — one renderer per canvas
   // ---------------------------------------------------------------------------
-  function vec3Sub(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
-  function vec3Add(a, b) { return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]; }
-  function vec3Scale(a, s) { return [a[0] * s, a[1] * s, a[2] * s]; }
-  function vec3Dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
-  function vec3Cross(a, b) {
-    return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
-  }
-  function vec3Norm(a) {
-    var l = Math.sqrt(vec3Dot(a, a));
-    return l > 1e-12 ? [a[0] / l, a[1] / l, a[2] / l] : [0, 0, 0];
-  }
-  function clipPlaneIntersection(a, da, b, db) {
-    var t = da / (da - db);
-    return [
-      a[0] + (b[0] - a[0]) * t,
-      a[1] + (b[1] - a[1]) * t,
-      a[2] + (b[2] - a[2]) * t,
-    ];
-  }
-  function pushUniquePoint(points, p) {
-    for (var i = 0; i < points.length; i++) {
-      var q = points[i];
-      var dx = p[0] - q[0], dy = p[1] - q[1], dz = p[2] - q[2];
-      if (dx * dx + dy * dy + dz * dz < 1e-8) { return; }
-    }
-    points.push(p);
-  }
-  function appendNearPlaneVolumeCaps(mesh, camPos, camTarget, camUp, near) {
-    if (!mesh || mesh.topology !== "triangle-list") { return mesh; }
-    var ranges = Array.isArray(mesh.solid_volume_ranges) ? mesh.solid_volume_ranges.slice() : [];
-    if (mesh.solid_volume) { ranges.push({ start: 0, count: mesh.indices.length }); }
-    if (!ranges.length) { return mesh; }
-
-    var fwd = vec3Norm(vec3Sub(camTarget, camPos));
-    if (vec3Dot(fwd, fwd) < 1e-12) { return mesh; }
-    var capNear = (near || 0.05) + 0.0004;
-    var planePoint = vec3Add(camPos, vec3Scale(fwd, capNear));
-    var right = vec3Norm(vec3Cross(fwd, camUp || [0, 1, 0]));
-    if (vec3Dot(right, right) < 1e-12) { right = [1, 0, 0]; }
-    var up = vec3Norm(vec3Cross(right, fwd));
-    var verts = mesh.vertices;
-    var inds = mesh.indices;
-    var stride = 10;
-    var capVerts = [];
-    var capIdx = [];
-
-    for (var ri = 0; ri < ranges.length; ri++) {
-      var r = ranges[ri];
-      var start = Math.max(0, Number(r.start) || 0);
-      var end = Math.min(inds.length, start + (Number(r.count) || 0));
-      var points = [];
-      for (var ii = start; ii + 2 < end; ii += 3) {
-        var ia = inds[ii] * stride, ib = inds[ii + 1] * stride, ic = inds[ii + 2] * stride;
-        var a = [verts[ia], verts[ia + 1], verts[ia + 2]];
-        var b = [verts[ib], verts[ib + 1], verts[ib + 2]];
-        var c = [verts[ic], verts[ic + 1], verts[ic + 2]];
-        var da = vec3Dot(vec3Sub(a, planePoint), fwd);
-        var db = vec3Dot(vec3Sub(b, planePoint), fwd);
-        var dc = vec3Dot(vec3Sub(c, planePoint), fwd);
-        if ((da < 0 && db >= 0) || (da >= 0 && db < 0)) { pushUniquePoint(points, clipPlaneIntersection(a, da, b, db)); }
-        if ((db < 0 && dc >= 0) || (db >= 0 && dc < 0)) { pushUniquePoint(points, clipPlaneIntersection(b, db, c, dc)); }
-        if ((dc < 0 && da >= 0) || (dc >= 0 && da < 0)) { pushUniquePoint(points, clipPlaneIntersection(c, dc, a, da)); }
-      }
-      if (points.length < 3) { continue; }
-      var center = [0, 0, 0];
-      for (var pi = 0; pi < points.length; pi++) { center = vec3Add(center, points[pi]); }
-      center = vec3Scale(center, 1 / points.length);
-      points.sort(function (p, q) {
-        var px = vec3Dot(vec3Sub(p, center), right), py = vec3Dot(vec3Sub(p, center), up);
-        var qx = vec3Dot(vec3Sub(q, center), right), qy = vec3Dot(vec3Sub(q, center), up);
-        return Math.atan2(py, px) - Math.atan2(qy, qx);
-      });
-      var base = (verts.length + capVerts.length) / stride;
-      var rgbaOff = (inds[start] || 0) * stride + 6;
-      var cr = verts[rgbaOff] || 1, cg = verts[rgbaOff + 1] || 0, cb = verts[rgbaOff + 2] || 0, ca = verts[rgbaOff + 3] || 1;
-      capVerts.push(center[0], center[1], center[2], -fwd[0], -fwd[1], -fwd[2], cr, cg, cb, ca);
-      for (var pj = 0; pj < points.length; pj++) {
-        var p = points[pj];
-        capVerts.push(p[0], p[1], p[2], -fwd[0], -fwd[1], -fwd[2], cr, cg, cb, ca);
-      }
-      for (var tj = 0; tj < points.length; tj++) {
-        capIdx.push(base, base + 1 + ((tj + 1) % points.length), base + 1 + tj);
-      }
-    }
-    if (!capIdx.length) { return mesh; }
-    var outVerts = new Float32Array(verts.length + capVerts.length);
-    outVerts.set(verts, 0);
-    outVerts.set(capVerts, verts.length);
-    var outIdx = new Uint32Array(inds.length + capIdx.length);
-    outIdx.set(inds, 0);
-    outIdx.set(capIdx, inds.length);
-    var out = {};
-    for (var k in mesh) { out[k] = mesh[k]; }
-    out.vertices = outVerts;
-    out.indices = outIdx;
-    return out;
-  }
-
   function VfGeomWgpu(canvas, getMeshFn) {
     this._canvas     = canvas;
     this._getMesh    = getMeshFn;
@@ -473,15 +435,20 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
     this._pipeTriAlpha = null;
     this._bindLayout = null;
     this._depthTex   = null;
+    this._msaaTex    = null;
     this._uniformBuf = null;
     this._bindGroup  = null;
     this._vb         = null;
     this._ib         = null;
     this._ibCount    = 0;
     this._topology   = "triangle-list";
+    this._parts      = null;
     this._lastMesh   = null;
+    this._lastMeshRevision = -1;
     this._depthW     = 0;
     this._depthH     = 0;
+    this._msaaW      = 0;
+    this._msaaH      = 0;
     this._running    = false;
     this._raf        = 0;
     this._resizeRaf  = 0;
@@ -491,19 +458,11 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
     this._pickDepthTex  = null;
     this._pickUb        = null;    // picking uniform buffer (PICK_UB_SIZE bytes)
     this._pickBG        = null;    // picking bind group
-    this._pickReadBuf   = null;    // 8-byte mapAsync readback buffer
+    this._pickReadBuf   = null;    // mapAsync readback buffer for small pick neighborhood
     this._pickW         = 0;
     this._pickH         = 0;
     this._pickPending   = false;   // readback in flight
     this._pickCallback  = null;    // fn(object_id, simplex_id, x, y) called after readback
-    // Hit-map readback (for native overlay pass-through)
-    this._hitMapBuf     = null;
-    this._hitMapW       = 0;
-    this._hitMapH       = 0;
-    this._hitMapPending = false;
-    this._hitMapFrame   = 0;
-    this._hitMapInterval= 6;
-    this._lastHitJson   = null;
   }
 
   VfGeomWgpu.prototype = {
@@ -526,11 +485,12 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
         size: [w, h, 1], format: "depth24plus",
         usage: GPUTextureUsage.RENDER_ATTACHMENT,
       });
-      // Readback buffer: 1 pixel of rg32uint = 2×u32 = 8 bytes.
-      // Align to 256 bytes (WebGPU bytesPerRow minimum).
+      // Read back a tiny exact rg32uint neighborhood from the GPU pick buffer.
+      // This reduces false background samples on moving edges without inventing
+      // a larger hover radius in JS.
       if (this._pickReadBuf) { try { this._pickReadBuf.destroy(); } catch(_){} }
       this._pickReadBuf = this._device.createBuffer({
-        size: 256,   // bytesPerRow must be ≥ 256
+        size: 256 * 3,
         usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
       });
     },
@@ -545,44 +505,113 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
       return new Uint8Array(buf);
     },
 
-    /** Ask for the object_id + simplex_id at canvas pixel (cx, cy).
-     *  cb(object_id, simplex_id, cx, cy) called asynchronously (next frame). */
+    /** Ask for the object_id + simplex_id at canvas pixel (cx, cy). */
     pickAt: function (cx, cy, cb) {
-      if (this._pickPending || !this._device || !this._pickTex || !this._pickReadBuf) { return; }
+      if (!this._device) {
+        failFast("pickAt called before GPU device initialization completed");
+      }
+      if (!this._pickTex || !this._pickDepthTex || !this._pickReadBuf) {
+        failFast("pickAt called before GPU pick textures were initialized");
+      }
+      if (this._pickPending) {
+        failFast("pickAt called while previous GPU pick is pending; caller must serialize pick requests");
+      }
       var self = this;
       var px = Math.max(0, Math.min(this._pickW - 1, Math.floor(cx)));
       var py = Math.max(0, Math.min(this._pickH - 1, Math.floor(cy)));
+      var sampleRadius = 1;
+      var ox = Math.max(0, px - sampleRadius);
+      var oy = Math.max(0, py - sampleRadius);
+      var sampleW = Math.min(this._pickW - ox, (sampleRadius * 2) + 1);
+      var sampleH = Math.min(this._pickH - oy, (sampleRadius * 2) + 1);
+      var centerSX = px - ox;
+      var centerSY = py - oy;
       this._pickPending = true;
-      /* Safety: if mapAsync never resolves (GPU lost, validation error etc.) unlock after 500ms. */
       var safetyTimer = setTimeout(function () {
         if (self._pickPending) {
-          wlog("warn", "pickAt: timed out, resetting _pickPending");
+          failFastAsync("GPU pick readback timed out");
           self._pickPending = false;
           self._pickCallback = null;
           self._pendingPickPx = null;
         }
       }, 500);
-      // Schedule readback on the next rendered frame
+      // Schedule readback on a freshly rendered GPU pick pass.
       this._pickCallback = function() {
         var buf = self._pickReadBuf;
         buf.mapAsync(GPUMapMode.READ).then(function() {
           clearTimeout(safetyTimer);
-          var u32 = new Uint32Array(buf.getMappedRange(0, 8));
-          var oid = u32[0], sid = u32[1];
+          var u32 = new Uint32Array(buf.getMappedRange(0, 256 * sampleH));
+          var u32PerRow = 256 / 4;
+          var bestOid = 0;
+          var bestSid = 0;
+          var bestCount = 0;
+          var nearestOid = 0;
+          var nearestSid = 0;
+          var nearestDistanceSq = Number.POSITIVE_INFINITY;
+          var counts = Object.create(null);
+          var sampleCount = 0;
+          for (var sy = 0; sy < sampleH; sy += 1) {
+            var rowOffset = sy * u32PerRow;
+            for (var sx = 0; sx < sampleW; sx += 1) {
+              var pixelOffset = rowOffset + (sx * 2);
+              var sampleOid = u32[pixelOffset] >>> 0;
+              var sampleSid = u32[pixelOffset + 1] >>> 0;
+              if (!(sampleOid > 0)) { continue; }
+              sampleCount += 1;
+              var key = String(sampleOid);
+              var nextCount = (counts[key] || 0) + 1;
+              counts[key] = nextCount;
+              if (nextCount > bestCount) {
+                bestCount = nextCount;
+                bestOid = sampleOid;
+                bestSid = sampleSid;
+              }
+              var dx = sx - centerSX;
+              var dy = sy - centerSY;
+              var distSq = (dx * dx) + (dy * dy);
+              if (distSq < nearestDistanceSq) {
+                nearestDistanceSq = distSq;
+                nearestOid = sampleOid;
+                nearestSid = sampleSid;
+              }
+            }
+          }
+          var oid = nearestOid || bestOid || 0;
+          var sid = nearestOid ? nearestSid : (bestOid ? bestSid : 0);
+          var pickMeta = {
+            occupiedHint: sampleCount > 0,
+            bestOid: bestOid,
+            bestCount: bestCount,
+            sampleCount: sampleCount,
+            nearestOid: nearestOid,
+            nearestDistanceSq: nearestOid ? nearestDistanceSq : -1
+          };
           buf.unmap();
           self._pickPending = false;
-          if (cb) { cb(oid, sid, cx, cy); }
+          if (cb) {
+            cb(oid, sid, cx, cy, Object.assign({}, pickMeta, {
+              _sample_count: sampleCount,
+              _best_oid: bestOid,
+              _nearest_oid: nearestOid
+            }));
+          }
         }).catch(function(e) {
           clearTimeout(safetyTimer);
-          wlog("warn", "pickAt mapAsync failed: " + (e && e.message ? e.message : e));
+          failFastAsync("GPU pick readback failed: " + (e && e.message ? e.message : e));
           self._pickPending = false;
+          self._pickCallback = null;
+          self._pendingPickPx = null;
         });
         self._pickCallback = null;
       };
-      this._pendingPickPx = [px, py];
+      this._pendingPickPx = [ox, oy, sampleW, sampleH];
+      var now = global.performance && typeof global.performance.now === "function"
+        ? global.performance.now()
+        : Date.now();
+      this._renderContent(now);
     },
 
-        _ensureDepth: function () {
+    _ensureDepth: function () {
       var c = this._canvas;
       var w = Math.max(1, c.width);
       var h = Math.max(1, c.height);
@@ -593,12 +622,137 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
         size: { width: w, height: h, depthOrArrayLayers: 1 },
         format: "depth24plus",
         usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        sampleCount: SAMPLE_COUNT,
       });
+    },
+
+    _ensureMsaaColor: function () {
+      var c = this._canvas;
+      var w = Math.max(1, c.width);
+      var h = Math.max(1, c.height);
+      if (this._msaaTex && this._msaaW === w && this._msaaH === h) { return; }
+      this._msaaW = w; this._msaaH = h;
+      if (this._msaaTex) { this._msaaTex.destroy(); }
+      this._msaaTex = this._device.createTexture({
+        size: { width: w, height: h, depthOrArrayLayers: 1 },
+        format: this._format,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        sampleCount: SAMPLE_COUNT,
+      });
+    },
+
+    _destroyParts: function () {
+      if (!this._parts || !this._parts.length) { this._parts = null; return; }
+      for (var i = 0; i < this._parts.length; i++) {
+        var p = this._parts[i];
+        this._destroyPart(p);
+      }
+      this._parts = null;
+    },
+
+    _destroyPart: function (part) {
+      if (!part) { return; }
+      if (part.vb) { try { part.vb.destroy(); } catch(_){} }
+      if (part.ib) { try { part.ib.destroy(); } catch(_){} }
+      if (part.uniformBuf) { try { part.uniformBuf.destroy(); } catch(_){} }
+      if (part.pickUb) { try { part.pickUb.destroy(); } catch(_){} }
+    },
+
+    _createScenePart: function (mesh, index) {
+      var dev = this._device;
+      var sg2 = sharedWgpu;
+      var vb = dev.createBuffer({ size: mesh.vertices.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+      dev.queue.writeBuffer(vb, 0, mesh.vertices);
+      var ib = dev.createBuffer({ size: mesh.indices.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+      dev.queue.writeBuffer(ib, 0, mesh.indices);
+      var uniformBuf = dev.createBuffer({
+        size: UB_SIZE,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      var bindGroup = dev.createBindGroup({
+        layout: this._bindLayout,
+        entries: [{ binding: 0, resource: { buffer: uniformBuf } }],
+      });
+      var pickUb = dev.createBuffer({
+        size: PICK_UB_SIZE,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      var pickBg = dev.createBindGroup({
+        layout: sg2.pickBindLayout,
+        entries: [{ binding: 0, resource: { buffer: pickUb } }],
+      });
+      return {
+        mesh: mesh,
+        vb: vb,
+        ib: ib,
+        ibCount: mesh.indices.length,
+        topology: mesh.topology || "triangle-list",
+        uniformBuf: uniformBuf,
+        bindGroup: bindGroup,
+        pickUb: pickUb,
+        pickBg: pickBg,
+        objectId: Number(mesh.object_id || (index + 1)) || (index + 1)
+      };
+    },
+
+    _canReuseScenePart: function (part, mesh, index) {
+      if (!part || !mesh) { return false; }
+      if (!part.vb || !part.ib || !part.uniformBuf || !part.pickUb || !part.pickBg || !part.bindGroup) { return false; }
+      if ((part.topology || "triangle-list") !== (mesh.topology || "triangle-list")) { return false; }
+      if (Number(part.objectId || 0) !== (Number(mesh.object_id || (index + 1)) || (index + 1))) { return false; }
+      if (!part.mesh) { return false; }
+      if (!part.mesh.vertices || !part.mesh.indices || !mesh.vertices || !mesh.indices) { return false; }
+      if (part.mesh.vertices.byteLength !== mesh.vertices.byteLength) { return false; }
+      if (part.mesh.indices.byteLength !== mesh.indices.byteLength) { return false; }
+      return true;
+    },
+
+    _uploadSceneParts: function (scene) {
+      if (!scene || !Array.isArray(scene.parts) || !this._device) { return; }
+      var dev = this._device;
+      var previousParts = Array.isArray(this._parts) ? this._parts : [];
+      var nextParts = new Array(scene.parts.length);
+      for (var i = 0; i < scene.parts.length; i++) {
+        var mesh = scene.parts[i];
+        if (!mesh) { continue; }
+        var existing = previousParts[i];
+        if (this._canReuseScenePart(existing, mesh, i)) {
+          dev.queue.writeBuffer(existing.vb, 0, mesh.vertices);
+          dev.queue.writeBuffer(existing.ib, 0, mesh.indices);
+          existing.mesh = mesh;
+          existing.ibCount = mesh.indices.length;
+          existing.topology = mesh.topology || "triangle-list";
+          existing.objectId = Number(mesh.object_id || (i + 1)) || (i + 1);
+          nextParts[i] = existing;
+          previousParts[i] = null;
+          continue;
+        }
+        if (existing) {
+          this._destroyPart(existing);
+          previousParts[i] = null;
+        }
+        nextParts[i] = this._createScenePart(mesh, i);
+      }
+      for (var j = 0; j < previousParts.length; j++) {
+        if (previousParts[j]) {
+          this._destroyPart(previousParts[j]);
+        }
+      }
+      this._parts = nextParts.filter(function (part) { return !!part; });
     },
 
     _uploadMesh: function (mesh) {
       if (!mesh || !this._device) { return; }
+      if (mesh.parts && Array.isArray(mesh.parts)) {
+        if (this._vb) { try { this._vb.destroy(); } catch(_){} this._vb = null; }
+        if (this._ib) { try { this._ib.destroy(); } catch(_){} this._ib = null; }
+        this._ibCount = 0;
+        this._topology = "triangle-list";
+        this._uploadSceneParts(mesh);
+        return;
+      }
       var dev = this._device;
+      this._destroyParts();
       if (this._vb) { this._vb.destroy(); this._vb = null; }
       if (this._ib) { this._ib.destroy(); this._ib = null; }
       this._vb = dev.createBuffer({ size: mesh.vertices.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
@@ -613,12 +767,176 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
       if (!this._device) { return; }
       var mesh = this._getMesh(t * 0.001);
       if (!mesh) { return; }
-      var camEarly = mesh.camera || {};
-      var posEarly = camEarly.pos || [0, 0, 5];
-      var targetEarly = camEarly.target || [0, 0, 0];
-      var upEarly = camEarly.up || [0, 1, 0];
-      mesh = appendNearPlaneVolumeCaps(mesh, posEarly, targetEarly, upEarly, 0.05);
-      if (mesh !== this._lastMesh) { this._lastMesh = mesh; this._uploadMesh(mesh); }
+      var meshRevision = Number(mesh && mesh.__revision);
+      if (mesh !== this._lastMesh || meshRevision !== this._lastMeshRevision) {
+        this._lastMesh = mesh;
+        this._lastMeshRevision = meshRevision;
+        this._uploadMesh(mesh);
+      }
+      if (mesh.parts && Array.isArray(mesh.parts)) {
+        if (!this._parts || !this._parts.length) { return; }
+        var MmBatch = getMath();
+        var wBatch = this._canvas.width;
+        var hBatch = this._canvas.height;
+        var aspBatch = wBatch / Math.max(1, hBatch);
+        this._ensureDepth();
+        this._ensureMsaaColor();
+        var encBatch = this._device.createCommandEncoder();
+        var passBatch = encBatch.beginRenderPass({
+          colorAttachments: [{
+            view: this._msaaTex.createView(),
+            resolveTarget: this._ctx.getCurrentTexture().createView(),
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: "clear",
+            storeOp: "store",
+          }],
+          depthStencilAttachment: {
+            view: this._depthTex.createView(),
+            depthClearValue: 1,
+            depthLoadOp: "clear",
+            depthStoreOp: "store",
+          },
+        });
+        for (var partIndex = 0; partIndex < this._parts.length; partIndex++) {
+          var part = this._parts[partIndex];
+          var partMesh = part.mesh;
+          if (!partMesh || !part.vb || !part.ib) { continue; }
+          var camPart = partMesh.camera || mesh.camera || {};
+          var posPart = camPart.pos || [0, 0, 5];
+          var targetPart = camPart.target || [0, 0, 0];
+          var fovPart = camPart.fov !== undefined ? camPart.fov : 45;
+          var upPart = camPart.up || [0, 1, 0];
+          var projMatPart, viewMatPart, mvpPart, modelMatPart;
+          if (partMesh.center !== undefined || partMesh.rotation !== undefined || partMesh.scale !== undefined) {
+            modelMatPart = MmBatch.mat4ModelTRS
+              ? MmBatch.mat4ModelTRS(partMesh.center, partMesh.rotation, partMesh.scale)
+              : (partMesh._modelMatrix || MmBatch.mat4Identity());
+          } else {
+            modelMatPart = partMesh._modelMatrix || MmBatch.mat4Identity();
+          }
+          if (partMesh.mode3d === false) {
+            projMatPart = MmBatch.mat4OrthoZ01(-1, 1, -1, 1, 0, 1);
+            mvpPart = projMatPart;
+          } else {
+            var fovRadPart = fovPart * Math.PI / 180;
+            projMatPart = MmBatch.mat4PerspectiveZ01(fovRadPart, aspBatch, 0.05, 500);
+            if (!partMesh.camera && !mesh.camera) {
+              var angPart = t * 0.0008;
+              var trPart = MmBatch.mat4Translation(0, 0, -5);
+              var rotPart = MmBatch.mat4RotationY(angPart);
+              viewMatPart = MmBatch.mat4Mul(trPart, rotPart);
+              posPart = [0, 0, 5];
+            } else {
+              viewMatPart = mat4LookAt(posPart, targetPart, upPart);
+            }
+            mvpPart = MmBatch.mat4Mul(projMatPart, viewMatPart);
+          }
+          var rawLightsPart = partMesh.lights || mesh.lights || [];
+          var lightsNormPart = rawLightsPart.map(function (l) {
+            return {
+              pos: l.pos || [0, 10, 10],
+              color_f32: parseColor(l.color || "white"),
+              model: l.model || "blinn_phong",
+            };
+          });
+          if (!lightsNormPart.length) {
+            lightsNormPart = [{ pos: [0, 10, 10], color_f32: [1,1,1,1], model: "blinn_phong" }];
+          }
+          var lmNamePart = lightsNormPart[0].model || "blinn_phong";
+          var lmIntPart = LIGHT_MODELS[lmNamePart] !== undefined ? LIGHT_MODELS[lmNamePart] : 2;
+          var ubPart = buildUniform(mvpPart, modelMatPart, posPart, lightsNormPart, lmIntPart, resolveAlphaMul(partMesh));
+          this._device.queue.writeBuffer(part.uniformBuf, 0, ubPart);
+          var isTransparentPart = !!partMesh.transparent && part.topology === "triangle-list";
+          var useTransparentDepthPart = isTransparentPart && !!partMesh.depth_write;
+          var pipePart = part.topology === "line-list"
+            ? this._pipeLine
+            : (
+                useTransparentDepthPart && this._pipeTriAlphaDepth ? this._pipeTriAlphaDepth :
+                (isTransparentPart && this._pipeTriAlpha ? this._pipeTriAlpha : this._pipeTri)
+              );
+          passBatch.setPipeline(pipePart);
+          passBatch.setBindGroup(0, part.bindGroup);
+          passBatch.setVertexBuffer(0, part.vb);
+          passBatch.setIndexBuffer(part.ib, "uint32");
+          passBatch.drawIndexed(part.ibCount, 1, 0, 0, 0);
+        }
+        passBatch.end();
+
+        var sgBatch = sharedWgpu;
+        var pendingBatchPick = !!this._pendingPickPx;
+        var fireBatchPickCallback = false;
+        if (sgBatch && sgBatch.pipePick && this._pickTex) {
+          var pickPassBatch = encBatch.beginRenderPass({
+            colorAttachments: [{
+              view: this._pickTex.createView(),
+              clearValue: [0, 0, 0, 0],
+              loadOp: "clear",
+              storeOp: "store",
+            }],
+            depthStencilAttachment: {
+              view: this._pickDepthTex.createView(),
+              depthClearValue: 1.0,
+              depthLoadOp: "clear",
+              depthStoreOp: "discard",
+            },
+          });
+          for (var pickIndex = 0; pickIndex < this._parts.length; pickIndex++) {
+            var pickPart = this._parts[pickIndex];
+            var pickMesh = pickPart.mesh;
+            if (!pickMesh || pickPart.topology !== "triangle-list") { continue; }
+            if (pickMesh.pickable === false) { continue; }
+            var camPick = pickMesh.camera || mesh.camera || {};
+            var posPick = camPick.pos || [0, 0, 5];
+            var targetPick = camPick.target || [0, 0, 0];
+            var upPick = camPick.up || [0, 1, 0];
+            var modelPick;
+            if (pickMesh.center !== undefined || pickMesh.rotation !== undefined || pickMesh.scale !== undefined) {
+              modelPick = MmBatch.mat4ModelTRS
+                ? MmBatch.mat4ModelTRS(pickMesh.center, pickMesh.rotation, pickMesh.scale)
+                : (pickMesh._modelMatrix || MmBatch.mat4Identity());
+            } else {
+              modelPick = pickMesh._modelMatrix || MmBatch.mat4Identity();
+            }
+            var mvpPick;
+            if (pickMesh.mode3d === false) {
+              mvpPick = MmBatch.mat4OrthoZ01(-1, 1, -1, 1, 0, 1);
+            } else {
+              var fovPick = camPick.fov !== undefined ? camPick.fov : 45;
+              var projPick = MmBatch.mat4PerspectiveZ01(fovPick * Math.PI / 180, aspBatch, 0.05, 500);
+              var viewPick = mat4LookAt(posPick, targetPick, upPick);
+              mvpPick = MmBatch.mat4Mul(projPick, viewPick);
+            }
+            var pickUbPart = this._buildPickUniform(mvpPick, modelPick);
+            (new Uint32Array(pickUbPart.buffer))[32] = pickPart.objectId >>> 0;
+            this._device.queue.writeBuffer(pickPart.pickUb, 0, pickUbPart);
+            pickPassBatch.setPipeline(sgBatch.pipePick);
+            pickPassBatch.setBindGroup(0, pickPart.pickBg);
+            pickPassBatch.setVertexBuffer(0, pickPart.vb);
+            pickPassBatch.setIndexBuffer(pickPart.ib, "uint32");
+            pickPassBatch.drawIndexed(pickPart.ibCount);
+          }
+          pickPassBatch.end();
+          var ppxBatch = this._pendingPickPx;
+          if (ppxBatch) {
+            this._pendingPickPx = null;
+            var oxBatch = Math.max(0, Math.min(this._pickW - 1, ppxBatch[0]));
+            var oyBatch = Math.max(0, Math.min(this._pickH - 1, ppxBatch[1]));
+            var sampleWBatch = Math.max(1, Math.min(this._pickW - oxBatch, ppxBatch[2] || 1));
+            var sampleHBatch = Math.max(1, Math.min(this._pickH - oyBatch, ppxBatch[3] || 1));
+            encBatch.copyTextureToBuffer(
+              { texture: this._pickTex, origin: { x: oxBatch, y: oyBatch, z: 0 }, mipLevel: 0 },
+              { buffer: this._pickReadBuf, offset: 0, bytesPerRow: 256, rowsPerImage: sampleHBatch },
+              { width: sampleWBatch, height: sampleHBatch, depthOrArrayLayers: 1 }
+            );
+            fireBatchPickCallback = !!this._pickCallback;
+          }
+        } else if (pendingBatchPick) {
+          failFast("pending GPU pick request but pick pass is unavailable for scene parts");
+        }
+        this._device.queue.submit([encBatch.finish()]);
+        if (fireBatchPickCallback && this._pickCallback) { this._pickCallback(); }
+        return;
+      }
       if (!this._vb || !this._ib) { return; }
 
       var Mm    = getMath();
@@ -628,10 +946,10 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
 
       // --- Camera ---
       var cam   = mesh.camera || {};
-      var pos   = cam.pos    || posEarly;
-      var target= cam.target || targetEarly;
+      var pos   = cam.pos    || [0, 0, 5];
+      var target= cam.target || [0, 0, 0];
       var fov   = cam.fov    !== undefined ? cam.fov : 45;
-      var up    = cam.up     || upEarly;
+      var up    = cam.up     || [0, 1, 0];
 
       var projMat, viewMat, mvp, modelMat;
       // Compute model matrix live from mesh data so rotation/center/scale
@@ -651,11 +969,13 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
       } else {
         var fovRad = fov * Math.PI / 180;
         projMat  = Mm.mat4PerspectiveZ01(fovRad, asp, 0.05, 500);
+        // auto-spin if no camera is set on mesh
         if (!mesh.camera) {
+          var ang  = t * 0.0008;
+          var tr   = Mm.mat4Translation(0, 0, -5);
+          var rot  = Mm.mat4RotationY(ang);
+          viewMat  = Mm.mat4Mul(tr, rot);
           pos      = [0, 0, 5];
-          target   = [0, 0, 0];
-          up       = [0, 1, 0];
-          viewMat  = mat4LookAt(pos, target, up);
         } else {
           viewMat = mat4LookAt(pos, target, up);
         }
@@ -678,15 +998,16 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
       var lmInt  = LIGHT_MODELS[lmName] !== undefined ? LIGHT_MODELS[lmName] : 2;
 
       // --- Build + upload uniform ---
-      var ub = buildUniform(mvp, modelMat, pos, lightsNorm, lmInt);
+      var ub = buildUniform(mvp, modelMat, pos, lightsNorm, lmInt, resolveAlphaMul(mesh));
       this._device.queue.writeBuffer(this._uniformBuf, 0, ub);
-
       // --- Draw ---
       this._ensureDepth();
+      this._ensureMsaaColor();
       var enc  = this._device.createCommandEncoder();
       var pass = enc.beginRenderPass({
         colorAttachments: [{
-          view:       this._ctx.getCurrentTexture().createView(),
+          view:       this._msaaTex.createView(),
+          resolveTarget: this._ctx.getCurrentTexture().createView(),
           clearValue: { r: 0, g: 0, b: 0, a: 0 },
           loadOp:  "clear",
           storeOp: "store",
@@ -699,19 +1020,24 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
         },
       });
       var isTransparent = !!mesh.transparent && this._topology === "triangle-list";
+      var useTransparentDepth = isTransparent && !!mesh.depth_write;
       var pipe = this._topology === "line-list"
         ? this._pipeLine
-        : (isTransparent && this._pipeTriAlpha ? this._pipeTriAlpha : this._pipeTri);
+        : (
+            useTransparentDepth && this._pipeTriAlphaDepth ? this._pipeTriAlphaDepth :
+            (isTransparent && this._pipeTriAlpha ? this._pipeTriAlpha : this._pipeTri)
+          );
       pass.setPipeline(pipe);
       pass.setBindGroup(0, this._bindGroup);
       pass.setVertexBuffer(0, this._vb);
       pass.setIndexBuffer(this._ib, "uint32");
       pass.drawIndexed(this._ibCount, 1, 0, 0, 0);
       pass.end();
-      this._device.queue.submit([enc.finish()]);
 
       // ── Picking pass (triangle-list only, skips wireframe) ────────────────
       var sg2 = sharedWgpu;
+      var pendingSinglePick = !!this._pendingPickPx;
+      var fireSinglePickCallback = false;
       if (sg2 && sg2.pipePick && this._pickTex && this._topology === "triangle-list") {
         // Ensure picking UB + BG exist
         if (!this._pickUb) {
@@ -727,8 +1053,7 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
         var pickUb = this._buildPickUniform(mvp, modelMat);
         this._device.queue.writeBuffer(this._pickUb, 0, pickUb);
 
-        var pickEnc  = this._device.createCommandEncoder();
-        var pickPass = pickEnc.beginRenderPass({
+        var pickPass = enc.beginRenderPass({
           colorAttachments: [{
             view:       this._pickTex.createView(),
             clearValue: [0, 0, 0, 0],
@@ -753,149 +1078,25 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
         var ppx = this._pendingPickPx;
         if (ppx) {
           this._pendingPickPx = null;
-          pickEnc.copyTextureToBuffer(
-            { texture: this._pickTex, origin: { x: ppx[0], y: ppx[1], z: 0 }, mipLevel: 0 },
-            { buffer: this._pickReadBuf, offset: 0, bytesPerRow: 256 },
-            { width: 1, height: 1, depthOrArrayLayers: 1 }
+          var ox = Math.max(0, Math.min(this._pickW - 1, ppx[0]));
+          var oy = Math.max(0, Math.min(this._pickH - 1, ppx[1]));
+          var sampleW = Math.max(1, Math.min(this._pickW - ox, ppx[2] || 1));
+          var sampleH = Math.max(1, Math.min(this._pickH - oy, ppx[3] || 1));
+          enc.copyTextureToBuffer(
+            { texture: this._pickTex, origin: { x: ox, y: oy, z: 0 }, mipLevel: 0 },
+            { buffer: this._pickReadBuf, offset: 0, bytesPerRow: 256, rowsPerImage: sampleH },
+            { width: sampleW, height: sampleH, depthOrArrayLayers: 1 }
           );
+          fireSinglePickCallback = !!this._pickCallback;
         }
-        this._device.queue.submit([pickEnc.finish()]);
-
-        // Fire the callback after submit (readback is now in flight)
-        if (this._pickCallback) { this._pickCallback(); }
-
-        // Hit-map readback for native overlay pass-through (throttled).
-        // Skip the frame where a pickAt callback just fired to avoid two
-        // simultaneous copyTextureToBuffer submits on the same texture.
-        this._hitMapFrame++;
-        if (this._hitMapFrame >= this._hitMapInterval && !this._hitMapPending && !this._pickCallback) {
-          this._hitMapFrame = 0;
-          this._ensureHitMapBuf();
-          this._scheduleHitMapReadback();
-        }
+      } else if (pendingSinglePick) {
+        failFast("pending GPU pick request but pick pass is unavailable for mesh");
       }
-    },
-
-    /* Ensure a GPUBuffer large enough to read back the full picking texture.
-       rg32uint = 8 bytes/pixel, bytesPerRow must be a multiple of 256. */
-    _ensureHitMapBuf: function () {
-      var c = this._canvas;
-      var w = Math.max(1, c.width);
-      var h = Math.max(1, c.height);
-      var bpr = Math.ceil(w * 8 / 256) * 256;
-      var needed = bpr * h;
-      if (this._hitMapBuf && this._hitMapW === w && this._hitMapH === h) { return; }
-      if (this._hitMapBuf) { try { this._hitMapBuf.destroy(); } catch(_){} }
-      this._hitMapBuf = this._device.createBuffer({
-        size: needed,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-      });
-      this._hitMapW = w;
-      this._hitMapH = h;
-    },
-
-    /* Read back the picking texture, derive coarse 16-px-tile hit rects,
-       merge with VfFrame panel rects, and post to native via postNativeHostLayout.
-       Alpha ≥ 0.05 → interactive. Here: any picked pixel (object_id > 0) → interactive. */
-    _scheduleHitMapReadback: function () {
-      if (this._hitMapPending || !this._device || !this._pickTex || !this._hitMapBuf) { return; }
-      var self = this;
-      var w = this._hitMapW;
-      var h = this._hitMapH;
-      var bpr = Math.ceil(w * 8 / 256) * 256;
-      var enc = this._device.createCommandEncoder();
-      enc.copyTextureToBuffer(
-        { texture: this._pickTex, origin: { x: 0, y: 0, z: 0 }, mipLevel: 0 },
-        { buffer: this._hitMapBuf, offset: 0, bytesPerRow: bpr, rowsPerImage: h },
-        { width: w, height: h, depthOrArrayLayers: 1 }
-      );
       this._device.queue.submit([enc.finish()]);
-      this._hitMapPending = true;
-      this._hitMapBuf.mapAsync(GPUMapMode.READ).then(function () {
-        try {
-          var mapped = self._hitMapBuf.getMappedRange();
-          var u32    = new Uint32Array(mapped);
-          var TILE   = 16;
-          var canvas = self._canvas;
-          var cw = canvas.width, ch = canvas.height;
-          var cr = canvas.getBoundingClientRect();
-          var scaleX = cr.width  / cw;
-          var scaleY = cr.height / ch;
-          var cols   = Math.ceil(cw / TILE);
-          var rows   = Math.ceil(ch / TILE);
-          var bprU32 = bpr / 4;
-          var occupied = new Uint8Array(rows * cols);
-          for (var ty = 0; ty < rows; ty++) {
-            for (var tx = 0; tx < cols; tx++) {
-              var px0 = tx * TILE, py0 = ty * TILE;
-              var px1 = Math.min(cw, px0 + TILE);
-              var py1 = Math.min(ch, py0 + TILE);
-              done: for (var py = py0; py < py1; py++) {
-                var rowOff = py * bprU32;
-                for (var px = px0; px < px1; px++) {
-                  if (u32[rowOff + px * 2] !== 0) {  // object_id (first u32 of rg32uint)
-                    occupied[ty * cols + tx] = 1;
-                    break done;
-                  }
-                }
-              }
-            }
-          }
-          // Row-span merge → rects in CSS/DIP space
-          var rects = [];
-          for (var ty = 0; ty < rows; ty++) {
-            var inSpan = false, spanStart = 0;
-            for (var tx = 0; tx <= cols; tx++) {
-              var occ = tx < cols ? occupied[ty * cols + tx] : 0;
-              if (occ && !inSpan)  { inSpan = true; spanStart = tx; }
-              else if (!occ && inSpan) {
-                inSpan = false;
-                rects.push({
-                  left:   Math.round(cr.left + spanStart * TILE * scaleX),
-                  top:    Math.round(cr.top  + ty        * TILE * scaleY),
-                  right:  Math.round(cr.left + tx        * TILE * scaleX),
-                  bottom: Math.round(cr.top  + (ty + 1)  * TILE * scaleY),
-                });
-              }
-            }
-          }
-          self._hitMapBuf.unmap();
-          self._hitMapPending = false;
-          // Merge panel (VfFrame) hit regions too
-          var panelRects = [];
-          var doc = canvas.ownerDocument;
-          var layer = (canvas.closest ? canvas.closest("#layer") : null) ||
-                      (doc ? doc.getElementById("layer") : null);
-          if (layer) {
-            var nodes = layer.querySelectorAll(".vf-frame:not(.vf-frame--pass-through)");
-            for (var i = 0; i < nodes.length; i++) {
-              var el = nodes[i];
-              if (!(el instanceof HTMLElement)) { continue; }
-              var er = el.getBoundingClientRect();
-              if (er.width < 1 || er.height < 1) { continue; }
-              panelRects.push({
-                left: Math.round(er.left), top: Math.round(er.top),
-                right: Math.round(er.right), bottom: Math.round(er.bottom),
-              });
-            }
-          }
-          var allRects = rects.concat(panelRects);
-          if (typeof VfFrame !== "undefined" && typeof VfFrame.postNativeHostLayout === "function") {
-            var json = JSON.stringify(allRects);
-            if (json !== self._lastHitJson) {
-              self._lastHitJson = json;
-              VfFrame.postNativeHostLayout(layer, { stageAlpha: 0, hitRegions: allRects });
-            }
-          }
-        } catch (e) {
-          try { self._hitMapBuf.unmap(); } catch(_) {}
-          self._hitMapPending = false;
-          wlog("warn", "hitMapReadback: " + (e && e.message ? e.message : e));
-        }
-      }).catch(function (e) {
-        self._hitMapPending = false;
-        wlog("warn", "hitMapReadback mapAsync: " + (e && e.message ? e.message : e));
-      });
+
+      // Fire the callback after the combined visible+pick submit.
+      if (fireSinglePickCallback && this._pickCallback) { this._pickCallback(); }
+
     },
 
     _frame: function (t) {
@@ -923,7 +1124,10 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
 
     destroy: function () {
       this.stop();
+      this._lastMesh = null;
+      this._lastMeshRevision = -1;
       if (this._resizeRaf) { cancelAnimationFrame(this._resizeRaf); this._resizeRaf = 0; }
+      this._destroyParts();
       if (this._vb)        { try { this._vb.destroy(); } catch(_){} this._vb = null; }
       if (this._ib)        { try { this._ib.destroy(); } catch(_){} this._ib = null; }
       if (this._depthTex)  { try { this._depthTex.destroy(); } catch(_){} this._depthTex = null; }
@@ -933,7 +1137,6 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
       if (this._pickDepthTex) { try { this._pickDepthTex.destroy(); } catch(_){} this._pickDepthTex = null; }
       if (this._pickUb)       { try { this._pickUb.destroy();       } catch(_){} this._pickUb       = null; }
       if (this._pickReadBuf)  { try { this._pickReadBuf.destroy();  } catch(_){} this._pickReadBuf  = null; }
-      if (this._hitMapBuf)    { try { this._hitMapBuf.destroy();    } catch(_){} this._hitMapBuf    = null; }
     },
 
     onResize: function () {
@@ -961,6 +1164,7 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
     this._pipeTri    = sg.pipeTri;
     this._pipeLine   = sg.pipeLine;
     this._pipeTriAlpha = sg.pipeTriAlpha || null;
+    this._pipeTriAlphaDepth = sg.pipeTriAlphaDepth || null;
     this._ctx = c.getContext("webgpu");
     if (!this._ctx) { wlog("error", "getContext('webgpu') null"); return false; }
     try {
@@ -988,6 +1192,11 @@ fn fs_pick(@builtin(primitive_index) prim_index: u32) -> @location(0) vec2<u32> 
     }
   };
 
+  VfGeomWgpu.__vfRuntimeAssetVersion = RUNTIME_ASSET_VERSION;
   global.VfGeomWgpu    = VfGeomWgpu;
-  global.VfGeomWgpuUtil = { parseColor: parseColor, LIGHT_MODELS: LIGHT_MODELS };
+  global.VfGeomWgpuUtil = {
+    __vfRuntimeAssetVersion: RUNTIME_ASSET_VERSION,
+    parseColor: parseColor,
+    LIGHT_MODELS: LIGHT_MODELS
+  };
 })(typeof window !== "undefined" ? window : this);

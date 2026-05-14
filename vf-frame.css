@@ -1,12 +1,5 @@
 /* Vektor Flow — minimal floating frame chrome (standalone). */
 
-html.vf-game-cursor-none,
-html.vf-game-cursor-none *,
-body.vf-game-cursor-none,
-body.vf-game-cursor-none * {
-  cursor: none !important;
-}
-
 /* When frame alpha < threshold (~0.05), nothing in the shell receives clicks. */
 .vf-frame--pass-through,
 .vf-frame--pass-through * {
@@ -179,6 +172,17 @@ body.vf-game-cursor-none * {
   padding: 10px 12px 14px;
   overflow: auto;
   border-radius: 0 0 10px 10px;
+  background: rgba(28, 28, 34, calc(0.92 * var(--vf-ui-alpha, 1)));
+}
+
+.vf-frame__body:focus,
+.vf-frame__body:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+.vf-frame__body--empty {
+  padding: 0;
   background: rgba(28, 28, 34, calc(0.92 * var(--vf-ui-alpha, 1)));
 }
 

@@ -1,5 +1,6 @@
 /sessions/
 /vf-display.json
 /vf-host-bootstrap.json
+/vf-runtime-packets.json
 /vf-ui-state.json
 /vkf-scene.json
