@@ -117,6 +117,10 @@
     function routeRuntimePacket(packet) {
       var deps = createRuntimeDependencies();
       if (!packet || typeof packet !== "object") { return; }
+      var seq = Number(packet.seq);
+      if (Number.isFinite(seq) && seq > Number(state.lastRuntimePacketSeq || 0)) {
+        state.lastRuntimePacketSeq = seq;
+      }
       state.packetModeActive = true;
       enterActiveStream("packet seq=" + String(packet.seq));
       if (state.legacyFallbackActive) {
