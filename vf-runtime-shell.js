@@ -58,6 +58,7 @@
       "vf-runtime-source.js",
       "vf-runtime-scene.js",
       "vf-runtime-flow.js",
+      "vf-render-clock.js",
       "katex/katex.min.js",
       "vf-frame.js",
       "vf-widgets.js",
@@ -76,6 +77,7 @@
     packetPollSteadyMs: 400,
     packetPollIdleThreshold: 12,
     packetPollSteadyThreshold: 60,
+    packetPollQuiesceThreshold: 60,
     packetFallbackDelayMs: 1200,
     runtimeAssetVersion: _vfRuntimeAssetVersion
   };
@@ -117,6 +119,7 @@
       packetFallbackStarted: false,
       packetModeActive: false,
       legacyFallbackActive: false,
+      packetRuntimeState: "bootstrap-only",
       scenePollTimer: 0,
       packetPollTimer: 0,
       packetPollDelayMs: Number(DEFAULT_RUNTIME_CONFIG.packetPollMs) || 16,
@@ -138,11 +141,12 @@
       state.packetFallbackStarted = false;
       state.packetModeActive = false;
       state.legacyFallbackActive = false;
+      state.packetRuntimeState = "bootstrap-only";
       if (state.scenePollTimer && typeof global.clearInterval === "function") {
         global.clearInterval(state.scenePollTimer);
       }
-      if (state.packetPollTimer && typeof global.clearInterval === "function") {
-        global.clearInterval(state.packetPollTimer);
+      if (state.packetPollTimer && typeof global.clearTimeout === "function") {
+        global.clearTimeout(state.packetPollTimer);
       }
       state.scenePollTimer = 0;
       state.packetPollTimer = 0;
@@ -647,32 +651,56 @@
       return flow.loadRuntimePackets();
     }
 
+    function getPacketRuntimeState() {
+      var flow = getRuntimeFlow();
+      if (!flow || !flow.getPacketRuntimeState) {
+        return String(state.packetRuntimeState || "bootstrap-only");
+      }
+      return flow.getPacketRuntimeState();
+    }
+
+    function getNextPacketPollDelay(result) {
+      if (result && Object.prototype.hasOwnProperty.call(result, "nextPollDelayMs")) {
+        return result.nextPollDelayMs;
+      }
+      var flow = getRuntimeFlow();
+      if (!flow || !flow.getNextPacketPollDelay) {
+        return Number(DEFAULT_RUNTIME_CONFIG.packetPollMs) || 16;
+      }
+      return flow.getNextPacketPollDelay();
+    }
+
     function schedulePacketPoll(delayMs) {
       if (state.packetPollTimer && typeof global.clearTimeout === "function") {
         global.clearTimeout(state.packetPollTimer);
       }
       state.packetPollTimer = 0;
+      if (delayMs == null || delayMs === false) {
+        state.packetPollDelayMs = 0;
+        runtimeLog("info", "schedulePacketPoll: quiesced state=" + getPacketRuntimeState());
+        return;
+      }
       if (typeof global.setTimeout !== "function") { return; }
       var nextDelay = Math.max(16, Number(delayMs) || 16);
       state.packetPollDelayMs = nextDelay;
       state.packetPollTimer = global.setTimeout(function() {
         state.packetPollTimer = 0;
         var result = loadRuntimePackets();
-        if (result && typeof result.finally === "function") {
-          result.finally(function() {
-            var idlePolls = Number(state.packetIdlePolls || 0);
-            var next = Number(DEFAULT_RUNTIME_CONFIG.packetPollMs) || 16;
-            if (idlePolls >= (Number(DEFAULT_RUNTIME_CONFIG.packetPollSteadyThreshold) || 60)) {
-              next = Number(DEFAULT_RUNTIME_CONFIG.packetPollSteadyMs) || 400;
-            } else if (idlePolls >= (Number(DEFAULT_RUNTIME_CONFIG.packetPollIdleThreshold) || 12)) {
-              next = Number(DEFAULT_RUNTIME_CONFIG.packetPollIdleMs) || 120;
-            }
-            schedulePacketPoll(next);
+        if (result && typeof result.then === "function") {
+          result.then(function(outcome) {
+            schedulePacketPoll(getNextPacketPollDelay(outcome));
+          }).catch(function() {
+            schedulePacketPoll(getNextPacketPollDelay());
           });
           return;
         }
-        schedulePacketPoll(Number(DEFAULT_RUNTIME_CONFIG.packetPollMs) || 16);
+        schedulePacketPoll(getNextPacketPollDelay(result));
       }, nextDelay);
+    }
+
+    function ensurePacketPolling(delayMs) {
+      if (state.packetPollTimer) { return; }
+      schedulePacketPoll(delayMs == null ? getNextPacketPollDelay() : delayMs);
     }
 
     function loadScene() {
@@ -772,8 +800,16 @@
         runtimeLog("info", "navigator.gpu=" + (global.navigator && global.navigator.gpu ? "present" : "MISSING") +
           " webview=" + (typeof global.chrome !== "undefined" && global.chrome.webview ? "present" : "missing"));
       }, 300);
-      loadRuntimePackets();
-      schedulePacketPoll(Number(DEFAULT_RUNTIME_CONFIG.packetPollMs) || 16);
+      var initialPacketLoad = loadRuntimePackets();
+      if (initialPacketLoad && typeof initialPacketLoad.then === "function") {
+        initialPacketLoad.then(function(result) {
+          ensurePacketPolling(getNextPacketPollDelay(result));
+        }).catch(function() {
+          ensurePacketPolling();
+        });
+      } else {
+        ensurePacketPolling();
+      }
       global.setTimeout(function() {
         if (state.runtimePacketsSeen || state.packetFallbackStarted) { return; }
         state.packetFallbackStarted = true;
@@ -809,6 +845,7 @@
       applyRuntimePacket: routeRuntimePacket,
       applyRuntimePayload: applyRuntimePayload,
       loadRuntimePackets: loadRuntimePackets,
+      getPacketRuntimeState: getPacketRuntimeState,
       loadScene: loadScene,
       startLegacyFallback: startLegacyFallback,
       stopLegacyFallback: stopLegacyFallback,

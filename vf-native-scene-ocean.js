@@ -31,7 +31,6 @@
   var durationSeconds = Math.max(0.001, Number(timingCfg.duration_seconds || 10.0));
   var boundary = String(timingCfg.boundary || "repeat");
   var frameCount = Math.max(1, Math.round(fps * durationSeconds));
-  var frameMs = 1000.0 / fps;
   var faceColor = new Float32Array(styles.face_color || [0.06, 0.55, 0.94, 1.0]);
   var edgeColor = new Float32Array(styles.edge_color || [0.08, 0.78, 1.0, 0.95]);
   var vertexColor = new Float32Array(styles.vertex_color || [1.0, 0.45, 0.18, 1.0]);
@@ -63,15 +62,7 @@
   var lightColor = lightCfg.color || [1.0, 0.93, 0.78, 1.0];
   var runtime = {
     running: false,
-    startMs: -1,
-    lastTickMs: -1,
-    nextTickMs: -1,
-    lastStep: -1,
     lastFrameIndex: -1,
-    frameProbeMs: -1,
-    rafProbeCount: 0,
-    updateProbeCount: 0,
-    snapshotProbeCount: 0,
     store: null,
     bound: null,
     surfaceMesh: null,
@@ -79,7 +70,8 @@
     vertexMesh: null,
     camera: null,
     light: null,
-    scene: null
+    scene: null,
+    clock: null
   };
 
   function failFast(message) {
@@ -121,6 +113,9 @@
     if (!global.VfGeomFrameAdapter) {
       failFast("VfGeomFrameAdapter is unavailable");
     }
+    if (!global.VfRenderClock || typeof global.VfRenderClock.createClock !== "function") {
+      failFast("VfRenderClock.createClock is unavailable");
+    }
     if (!global.VfGeomLedger || typeof global.VfGeomLedger.createParametricSurfaceGridSharedStore !== "function") {
       failFast("VfGeomLedger.createParametricSurfaceGridSharedStore is unavailable");
     }
@@ -138,6 +133,8 @@
       !!global.VfGeomCore &&
       !!global.VfGeomWgpu &&
       !!global.VfGeomFrameAdapter &&
+      !!global.VfRenderClock &&
+      typeof global.VfRenderClock.createClock === "function" &&
       global.VfGeomLedger &&
       typeof global.VfGeomLedger.createParametricSurfaceGridSharedStore === "function"
     );
@@ -690,7 +687,6 @@
   }
 
   function buildSnapshot(bound) {
-    runtime.snapshotProbeCount += 1;
     rebuildSurfaceVertices(bound);
     if (showEdges && runtime.edgeMesh) {
       rebuildEdgeVertices(bound);
@@ -748,62 +744,28 @@
         return runtime.store.snapshot();
       });
       global.VfDisplay.requestDynamicGeomFrameUpdate(frameId);
+      runtime.clock = global.VfRenderClock.createClock({
+        fps: fps,
+        initialStep: 0,
+        canStep: function () {
+          return !!(
+            global.VfDisplay &&
+            typeof global.VfDisplay.dynamicGeomFrameCanAcceptUpdate === "function" &&
+            global.VfDisplay.dynamicGeomFrameCanAcceptUpdate(frameId)
+          );
+        },
+        onStep: function (stepIndex) {
+          if (updateLedgerForStep(stepIndex)) {
+            global.VfDisplay.requestDynamicGeomFrameUpdate(frameId);
+          }
+        }
+      });
       pageLog("boot:mounted dynamic frame");
       runtime.running = true;
-      runtime.lastTickMs = -1;
-      runtime.nextTickMs = -1;
-      global.requestAnimationFrame(animate);
+      runtime.clock.start();
     } catch (error) {
       failFast(error && error.message ? error.message : String(error));
     }
-  }
-
-  function animate(now) {
-    if (!runtime.running) {
-      return;
-    }
-    var nowMs = Number(now) || 0;
-    runtime.rafProbeCount += 1;
-    if (runtime.startMs < 0) {
-      runtime.startMs = nowMs;
-      runtime.frameProbeMs = runtime.startMs;
-    }
-    if (runtime.lastTickMs < 0) {
-      runtime.lastTickMs = nowMs;
-      runtime.nextTickMs = nowMs + frameMs;
-      runtime.lastStep = 0;
-    } else if (
-      runtime.nextTickMs >= 0 &&
-      nowMs >= runtime.nextTickMs &&
-      global.VfDisplay &&
-      typeof global.VfDisplay.dynamicGeomFrameCanAcceptUpdate === "function" &&
-      global.VfDisplay.dynamicGeomFrameCanAcceptUpdate(frameId)
-    ) {
-      runtime.lastTickMs = nowMs;
-      runtime.nextTickMs += frameMs;
-      runtime.lastStep += 1;
-      if (updateLedgerForStep(runtime.lastStep)) {
-        runtime.updateProbeCount += 1;
-        global.VfDisplay.requestDynamicGeomFrameUpdate(frameId);
-      }
-    }
-    if (runtime.frameProbeMs >= 0 && (nowMs - runtime.frameProbeMs) >= 2000.0) {
-      var probeElapsed = Math.max(1.0, nowMs - runtime.frameProbeMs);
-      var probeScale = 1000.0 / probeElapsed;
-      pageLog(
-        "fps_probe raf=" +
-        String((runtime.rafProbeCount * probeScale).toFixed(1)) +
-        " updates=" +
-        String((runtime.updateProbeCount * probeScale).toFixed(1)) +
-        " snapshots=" +
-        String((runtime.snapshotProbeCount * probeScale).toFixed(1))
-      );
-      runtime.frameProbeMs = nowMs;
-      runtime.rafProbeCount = 0;
-      runtime.updateProbeCount = 0;
-      runtime.snapshotProbeCount = 0;
-    }
-    global.requestAnimationFrame(animate);
   }
 
   function waitForFrame(attempt) {
@@ -824,6 +786,8 @@
         String(!!global.VfGeomWgpu) +
         " adapter=" +
         String(!!global.VfGeomFrameAdapter) +
+        " clock=" +
+        String(!!global.VfRenderClock) +
         " ledger=" +
         String(!!global.VfGeomLedger)
       );
@@ -846,6 +810,8 @@
         String(!!global.VfGeomWgpu) +
         " adapter=" +
         String(!!global.VfGeomFrameAdapter) +
+        " clock=" +
+        String(!!global.VfRenderClock) +
         " ledger=" +
         String(!!global.VfGeomLedger) +
         ")"

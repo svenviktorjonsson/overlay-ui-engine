@@ -6,6 +6,12 @@
 
   if (global.VfRuntimeFlow) { return; }
 
+  var PACKET_RUNTIME_STATES = {
+    BOOTSTRAP_ONLY: "bootstrap-only",
+    ACTIVE_STREAM: "active-stream",
+    IDLE: "idle"
+  };
+
   function createFlow(options) {
     options = options || {};
     var config = options.config || {};
@@ -14,6 +20,72 @@
     var getRuntimeSource = options.getRuntimeSource || function() { return null; };
     var applySceneCommands = options.applySceneCommands || function() {};
     var state = options.state || {};
+
+    function getPacketRuntimeState() {
+      var value = String(state.packetRuntimeState || "");
+      if (value === PACKET_RUNTIME_STATES.ACTIVE_STREAM || value === PACKET_RUNTIME_STATES.IDLE) {
+        return value;
+      }
+      return PACKET_RUNTIME_STATES.BOOTSTRAP_ONLY;
+    }
+
+    function setPacketRuntimeState(nextState, reason) {
+      var currentState = getPacketRuntimeState();
+      var normalized = String(nextState || "");
+      if (normalized !== PACKET_RUNTIME_STATES.ACTIVE_STREAM && normalized !== PACKET_RUNTIME_STATES.IDLE) {
+        normalized = PACKET_RUNTIME_STATES.BOOTSTRAP_ONLY;
+      }
+      if (currentState === normalized) { return normalized; }
+      state.packetRuntimeState = normalized;
+      runtimeLog(
+        "info",
+        "packetRuntimeState: " + currentState + " -> " + normalized +
+          (reason ? " (" + reason + ")" : "")
+      );
+      return normalized;
+    }
+
+    function enterBootstrapOnly(reason) {
+      state.packetIdlePolls = 0;
+      return setPacketRuntimeState(PACKET_RUNTIME_STATES.BOOTSTRAP_ONLY, reason);
+    }
+
+    function enterActiveStream(reason) {
+      state.packetIdlePolls = 0;
+      return setPacketRuntimeState(PACKET_RUNTIME_STATES.ACTIVE_STREAM, reason);
+    }
+
+    function enterIdle(reason) {
+      return setPacketRuntimeState(PACKET_RUNTIME_STATES.IDLE, reason);
+    }
+
+    function getNextPacketPollDelay() {
+      var currentState = getPacketRuntimeState();
+      if (currentState === PACKET_RUNTIME_STATES.IDLE) {
+        return null;
+      }
+      if (currentState === PACKET_RUNTIME_STATES.BOOTSTRAP_ONLY) {
+        return Number(config.packetPollMs) || 16;
+      }
+      var idlePolls = Number(state.packetIdlePolls || 0);
+      var idleThreshold = Number(config.packetPollIdleThreshold) || 12;
+      var steadyThreshold = Number(config.packetPollSteadyThreshold) || 60;
+      var quiesceThreshold = Number(config.packetPollQuiesceThreshold);
+      if (!(quiesceThreshold > 0)) {
+        quiesceThreshold = steadyThreshold;
+      }
+      if (idlePolls >= quiesceThreshold) {
+        enterIdle("idle polls=" + idlePolls);
+        return null;
+      }
+      if (idlePolls >= steadyThreshold) {
+        return Number(config.packetPollSteadyMs) || 400;
+      }
+      if (idlePolls >= idleThreshold) {
+        return Number(config.packetPollIdleMs) || 120;
+      }
+      return Number(config.packetPollMs) || 16;
+    }
 
     function displayRefresh() {
       var deps = createRuntimeDependencies();
@@ -46,6 +118,7 @@
       var deps = createRuntimeDependencies();
       if (!packet || typeof packet !== "object") { return; }
       state.packetModeActive = true;
+      enterActiveStream("packet seq=" + String(packet.seq));
       if (state.legacyFallbackActive) {
         stopLegacyFallback();
       }
@@ -134,12 +207,16 @@
       state.runtimePacketsInFlight = true;
       return runtimeSource.loadPackets()
         .then(function(packets) {
+          var applied = 0;
           if (!Array.isArray(packets)) {
             runtimeLog("info", "loadRuntimePackets: no packet array");
-            return;
+            return {
+              applied: applied,
+              nextPollDelayMs: getNextPacketPollDelay(),
+              packetRuntimeState: getPacketRuntimeState()
+            };
           }
           runtimeLog("info", "loadRuntimePackets: fetched=" + packets.length + " lastSeq=" + state.lastRuntimePacketSeq);
-          var applied = 0;
           for (var i = 0; i < packets.length; i++) {
             var packet = packets[i];
             var seq = Number(packet && packet.seq);
@@ -154,7 +231,7 @@
           }
           if (applied > 0) {
             state.runtimePacketsSeen = true;
-            state.packetIdlePolls = 0;
+            enterActiveStream("applied=" + applied);
             runtimeLog("info", "loadRuntimePackets: applied=" + applied + " newLastSeq=" + state.lastRuntimePacketSeq);
           } else {
             if (state.runtimePacketsSeen) {
@@ -162,9 +239,19 @@
             }
             runtimeLog("info", "loadRuntimePackets: applied=0");
           }
+          return {
+            applied: applied,
+            nextPollDelayMs: getNextPacketPollDelay(),
+            packetRuntimeState: getPacketRuntimeState()
+          };
         })
         .catch(function(err) {
           runtimeLog("warn", "loadRuntimePackets: " + (err && err.message ? err.message : String(err)));
+          return {
+            applied: 0,
+            nextPollDelayMs: getNextPacketPollDelay(),
+            packetRuntimeState: getPacketRuntimeState()
+          };
         })
         .finally(function() {
           state.runtimePacketsInFlight = false;
@@ -178,7 +265,11 @@
       routeRuntimePacket: routeRuntimePacket,
       applyRuntimePayload: applyRuntimePayload,
       loadRuntimePackets: loadRuntimePackets,
-      loadScene: loadScene
+      loadScene: loadScene,
+      getPacketRuntimeState: getPacketRuntimeState,
+      getNextPacketPollDelay: getNextPacketPollDelay,
+      enterBootstrapOnly: enterBootstrapOnly,
+      packetRuntimeStates: PACKET_RUNTIME_STATES
     };
   }
 
