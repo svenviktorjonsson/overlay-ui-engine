@@ -64,9 +64,11 @@
       "vf-widgets.js",
       "geom/vf-geom-math.js",
       "geom/vf-geom-core.js",
+      "geom/vf-geom-material-arena.js",
       "geom/vf-geom-ledger.js",
       "geom/vf-geom-ledger-layout.js",
       "geom/vf-geom-ledger-transport.js",
+      "geom/vf-geom-parametric-surface.js",
       "geom/vf-geom-frame-adapter.js",
       "geom/vf-geom-wgpu.js",
       "vf-display.js"

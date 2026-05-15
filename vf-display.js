@@ -1859,8 +1859,11 @@
   }
 
   function _buildDynamicGeomScene(geomSpec) {
+    var MaterialArena = global.VfGeomMaterialArena || null;
     if (geomSpec && Array.isArray(geomSpec.parts)) {
-      return geomSpec;
+      return MaterialArena && typeof MaterialArena.resolveScene === "function"
+        ? MaterialArena.resolveScene(geomSpec)
+        : geomSpec;
     }
     if (!geomSpec || !Array.isArray(geomSpec.meshes)) {
       throw new Error("dynamic geom provider returned invalid spec");
@@ -1870,6 +1873,10 @@
       : null;
     if (!scene) {
       throw new Error("dynamic geom provider did not produce a unified scene");
+    }
+    if (geomSpec.materials && MaterialArena && typeof MaterialArena.resolveScene === "function") {
+      scene.materials = geomSpec.materials;
+      return MaterialArena.resolveScene(scene);
     }
     return scene;
   }

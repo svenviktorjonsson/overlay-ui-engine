@@ -31,21 +31,17 @@
   var durationSeconds = Math.max(0.001, Number(timingCfg.duration_seconds || 10.0));
   var boundary = String(timingCfg.boundary || "repeat");
   var frameCount = Math.max(1, Math.round(fps * durationSeconds));
-  var faceColor = new Float32Array(styles.face_color || [0.06, 0.55, 0.94, 1.0]);
-  var edgeColor = new Float32Array(styles.edge_color || [0.08, 0.78, 1.0, 0.95]);
-  var vertexColor = new Float32Array(styles.vertex_color || [1.0, 0.45, 0.18, 1.0]);
   var edgeWidth = Number(styles.edge_width || 1.0);
   var vertexSize = Number(styles.vertex_size || 0.12);
   var showEdges = styles.show_edges !== false;
   var showVertices = styles.show_vertices === true;
   var edgeCaps = styles.edge_caps === true;
-  var forceFlatFace = styles.face_light_model === "flat";
+  var faceLightModel = styles.face_light_model === "flat" ? "flat" : null;
   var frameId = String(config.frame_id || "");
   var waveDefs = normalizeWaves(waves);
   var initialUValues = sampleAxis(uMin, uMax, uCount);
   var initialVValues = sampleAxis(vMin, vMax, vCount);
   var waveTables = buildWaveTables(initialUValues, initialVValues, waveDefs);
-  var surfaceSubdivLayout = buildSurfaceSubdivLayout(faceSubdiv);
   var cameraTarget = cameraCfg.target || [0, 0, 0];
   var cameraUp = cameraCfg.up || [0, 0, 1];
   var cameraRadius = Number(cameraCfg.radius || 9.6);
@@ -65,9 +61,8 @@
     lastFrameIndex: -1,
     store: null,
     bound: null,
-    surfaceMesh: null,
-    edgeMesh: null,
-    vertexMesh: null,
+    materials: null,
+    geometryArena: null,
     camera: null,
     light: null,
     scene: null,
@@ -113,6 +108,12 @@
     if (!global.VfGeomFrameAdapter) {
       failFast("VfGeomFrameAdapter is unavailable");
     }
+    if (!global.VfGeomMaterialArena || typeof global.VfGeomMaterialArena.createArena !== "function") {
+      failFast("VfGeomMaterialArena.createArena is unavailable");
+    }
+    if (!global.VfGeomParametricSurface || typeof global.VfGeomParametricSurface.createGridSurfaceArena !== "function") {
+      failFast("VfGeomParametricSurface.createGridSurfaceArena is unavailable");
+    }
     if (!global.VfRenderClock || typeof global.VfRenderClock.createClock !== "function") {
       failFast("VfRenderClock.createClock is unavailable");
     }
@@ -133,6 +134,10 @@
       !!global.VfGeomCore &&
       !!global.VfGeomWgpu &&
       !!global.VfGeomFrameAdapter &&
+      global.VfGeomMaterialArena &&
+      typeof global.VfGeomMaterialArena.createArena === "function" &&
+      global.VfGeomParametricSurface &&
+      typeof global.VfGeomParametricSurface.createGridSurfaceArena === "function" &&
       !!global.VfRenderClock &&
       typeof global.VfRenderClock.createClock === "function" &&
       global.VfGeomLedger &&
@@ -210,29 +215,6 @@
     return tables;
   }
 
-  function buildSurfaceSubdivLayout(subdiv) {
-    var subcellCount = subdiv * subdiv;
-    var layout = new Float32Array(subcellCount * 6);
-    var offset = 0;
-    for (var sv = 0; sv < subdiv; sv += 1) {
-      var t0 = sv / subdiv;
-      var t1 = (sv + 1) / subdiv;
-      var tm = (t0 + t1) * 0.5;
-      for (var su = 0; su < subdiv; su += 1) {
-        var s0 = su / subdiv;
-        var s1 = (su + 1) / subdiv;
-        var sm = (s0 + s1) * 0.5;
-        layout[offset] = s0; offset += 1;
-        layout[offset] = s1; offset += 1;
-        layout[offset] = sm; offset += 1;
-        layout[offset] = t0; offset += 1;
-        layout[offset] = t1; offset += 1;
-        layout[offset] = tm; offset += 1;
-      }
-    }
-    return layout;
-  }
-
   function boundaryCode(name) {
     if (name === "mirror") { return 1; }
     if (name === "stop") { return 2; }
@@ -240,315 +222,39 @@
     return 0;
   }
 
-  function makeTriangleMesh() {
-    var cellCount = (uCount - 1) * (vCount - 1);
-    var quadCount = cellCount * faceSubdiv * faceSubdiv;
-    var vertexCount = quadCount * 6;
-    var vertices = new Float32Array(vertexCount * 10);
-    var indices = new Uint32Array(vertexCount);
-    for (var vertexIndex = 0; vertexIndex < vertexCount; vertexIndex += 1) {
-      indices[vertexIndex] = vertexIndex;
-    }
-    seedSurfaceVertexLayout(vertices);
-    return {
-      type: "field_mesh",
-      id: "ocean_surface",
-      object_id: 1,
-      topology: "triangle-list",
-      transparent: false,
-      depth_write: true,
-      pickable: false,
-      static_indices: true,
-      vertices: vertices,
-      color: Array.prototype.slice.call(faceColor),
-      indices: indices
-    };
-  }
-
-  function seedSurfaceVertexLayout(vertices) {
-    var offset = 0;
-    for (var vIndex = 0; vIndex < vCount - 1; vIndex += 1) {
-      var ay = initialVValues[vIndex];
-      var cy = initialVValues[vIndex + 1];
-      for (var uIndex = 0; uIndex < uCount - 1; uIndex += 1) {
-        var ax = initialUValues[uIndex];
-        var bx = initialUValues[uIndex + 1];
-        var abx = bx - ax;
-        var acy = cy - ay;
-        for (var layoutOffset = 0; layoutOffset < surfaceSubdivLayout.length; layoutOffset += 6) {
-          var s0 = surfaceSubdivLayout[layoutOffset];
-          var s1 = surfaceSubdivLayout[layoutOffset + 1];
-          var t0 = surfaceSubdivLayout[layoutOffset + 3];
-          var t1 = surfaceSubdivLayout[layoutOffset + 4];
-          writeStaticVertexRaw(vertices, offset, ax + (abx * s0), ay + (acy * t0), faceColor); offset += 10;
-          writeStaticVertexRaw(vertices, offset, ax + (abx * s1), ay + (acy * t0), faceColor); offset += 10;
-          writeStaticVertexRaw(vertices, offset, ax + (abx * s0), ay + (acy * t1), faceColor); offset += 10;
-          writeStaticVertexRaw(vertices, offset, ax + (abx * s1), ay + (acy * t0), faceColor); offset += 10;
-          writeStaticVertexRaw(vertices, offset, ax + (abx * s1), ay + (acy * t1), faceColor); offset += 10;
-          writeStaticVertexRaw(vertices, offset, ax + (abx * s0), ay + (acy * t1), faceColor); offset += 10;
-        }
+  function createMaterials() {
+    return global.VfGeomMaterialArena.createArena({
+      surface: {
+        base_color: styles.face_color || [0.06, 0.55, 0.94, 1.0],
+        light_model: faceLightModel,
+        depth_write: true
+      },
+      edge: {
+        base_color: styles.edge_color || [0.08, 0.78, 1.0, 0.95],
+        depth_write: true
+      },
+      vertex: {
+        base_color: styles.vertex_color || [1.0, 0.45, 0.18, 1.0],
+        depth_write: true
       }
-    }
+    });
   }
 
-  function makeSphereTemplate(latSeg, lonSeg) {
-    var vertexCount = (latSeg + 1) * (lonSeg + 1);
-    var vertices = new Float32Array(vertexCount * 10);
-    var offset = 0;
-    for (var j = 0; j <= latSeg; j += 1) {
-      var v = j / latSeg;
-      var phi = v * Math.PI;
-      var sp = Math.sin(phi);
-      var cp = Math.cos(phi);
-      for (var i = 0; i <= lonSeg; i += 1) {
-        var u = i / lonSeg;
-        var th = u * Math.PI * 2;
-        var nx = sp * Math.cos(th);
-        var ny = cp;
-        var nz = sp * Math.sin(th);
-        writeVertexRaw(vertices, offset, nx, ny, nz, nx, ny, nz, faceColor);
-        offset += 10;
-      }
-    }
-    var row = lonSeg + 1;
-    var indices = new Uint32Array(latSeg * lonSeg * 6);
-    var indexOffset = 0;
-    for (var y = 0; y < latSeg; y += 1) {
-      for (var x = 0; x < lonSeg; x += 1) {
-        var a = (y * row) + x;
-        var b = a + 1;
-        var c = a + row;
-        var d = c + 1;
-        indices[indexOffset] = a; indexOffset += 1;
-        indices[indexOffset] = c; indexOffset += 1;
-        indices[indexOffset] = b; indexOffset += 1;
-        indices[indexOffset] = b; indexOffset += 1;
-        indices[indexOffset] = c; indexOffset += 1;
-        indices[indexOffset] = d; indexOffset += 1;
-      }
-    }
-    return { vertices: vertices, indices: indices };
-  }
-
-  function makeCylinderTemplate(seg) {
-    var ringCount = seg + 1;
-    var vertexCount = ringCount * 2;
-    var vertices = new Float32Array(vertexCount * 10);
-    var offset = 0;
-    for (var i = 0; i <= seg; i += 1) {
-      var th = (i / seg) * Math.PI * 2;
-      var ct = Math.cos(th);
-      var st = Math.sin(th);
-      writeVertexRaw(vertices, offset, ct, st, 0.0, ct, st, 0.0, faceColor);
-      offset += 10;
-      writeVertexRaw(vertices, offset, ct, st, 1.0, ct, st, 0.0, faceColor);
-      offset += 10;
-    }
-    var indices = new Uint32Array(seg * 6);
-    var indexOffset = 0;
-    for (var s = 0; s < seg; s += 1) {
-      var p0 = s * 2;
-      var p1 = p0 + 1;
-      var p2 = p0 + 2;
-      var p3 = p0 + 3;
-      indices[indexOffset] = p0; indexOffset += 1;
-      indices[indexOffset] = p1; indexOffset += 1;
-      indices[indexOffset] = p2; indexOffset += 1;
-      indices[indexOffset] = p2; indexOffset += 1;
-      indices[indexOffset] = p1; indexOffset += 1;
-      indices[indexOffset] = p3; indexOffset += 1;
-    }
-    return { vertices: vertices, indices: indices };
-  }
-
-  function rebuildSurfaceVertices(bound) {
-    var vertices = runtime.surfaceMesh.vertices;
-    var offset = 0;
-    var heights = bound.heights;
-    var layout = surfaceSubdivLayout;
-    for (var vIndex = 0; vIndex < vCount - 1; vIndex += 1) {
-      var ay = bound.vValues[vIndex];
-      var cy = bound.vValues[vIndex + 1];
-      var rowOffset = vIndex * uCount;
-      var nextRowOffset = rowOffset + uCount;
-      for (var uIndex = 0; uIndex < uCount - 1; uIndex += 1) {
-        var ax = bound.uValues[uIndex];
-        var bx = bound.uValues[uIndex + 1];
-        var az = heights[rowOffset + uIndex];
-        var bz = heights[rowOffset + uIndex + 1];
-        var cz = heights[nextRowOffset + uIndex];
-        var dz = heights[nextRowOffset + uIndex + 1];
-        var abx = bx - ax;
-        var abz = bz - az;
-        var acy = cy - ay;
-        var acz = cz - az;
-        var qz = az - bz - cz + dz;
-        for (var layoutOffset = 0; layoutOffset < layout.length; layoutOffset += 6) {
-          var s0 = layout[layoutOffset];
-          var s1 = layout[layoutOffset + 1];
-          var sm = layout[layoutOffset + 2];
-          var t0 = layout[layoutOffset + 3];
-          var t1 = layout[layoutOffset + 4];
-          var tm = layout[layoutOffset + 5];
-          var p00z = az + (abz * s0) + (acz * t0) + (qz * s0 * t0);
-          var p10z = az + (abz * s1) + (acz * t0) + (qz * s1 * t0);
-          var p01z = az + (abz * s0) + (acz * t1) + (qz * s0 * t1);
-          var p11z = az + (abz * s1) + (acz * t1) + (qz * s1 * t1);
-          var tx = abx;
-          var ty = 0.0;
-          var tz = abz + (qz * tm);
-          var bxn = 0.0;
-          var byn = acy;
-          var bzn = acz + (qz * sm);
-          var nx = (ty * bzn) - (tz * byn);
-          var ny = (tz * bxn) - (tx * bzn);
-          var nz = (tx * byn) - (ty * bxn);
-          var nlen = Math.sqrt((nx * nx) + (ny * ny) + (nz * nz)) || 1.0;
-          nx /= nlen;
-          ny /= nlen;
-          nz /= nlen;
-          writeDynamicVertexState(vertices, offset, p00z, nx, ny, nz); offset += 10;
-          writeDynamicVertexState(vertices, offset, p10z, nx, ny, nz); offset += 10;
-          writeDynamicVertexState(vertices, offset, p01z, nx, ny, nz); offset += 10;
-          writeDynamicVertexState(vertices, offset, p10z, nx, ny, nz); offset += 10;
-          writeDynamicVertexState(vertices, offset, p11z, nx, ny, nz); offset += 10;
-          writeDynamicVertexState(vertices, offset, p01z, nx, ny, nz); offset += 10;
-        }
-      }
-    }
-    runtime.surfaceMesh.__revision = Number(runtime.surfaceMesh.__revision || 0) + 1;
-  }
-
-  function makeEdgeMesh() {
-    var segmentCount = ((uCount - 1) * vCount) + ((vCount - 1) * uCount);
-    var template = makeCylinderTemplate(20);
-    var instances = new Float32Array(segmentCount * 12);
-    seedEdgeInstanceLayout(instances);
-    return {
-      id: "ocean_grid",
-      object_id: 2,
-      topology: "triangle-list",
-      instance_kind: "cylinder-list",
-      instance_count: segmentCount,
-      transparent: false,
-      depth_write: true,
-      pickable: false,
-      vertices: template.vertices,
-      indices: template.indices,
-      instances: instances
-    };
-  }
-
-  function makeVertexMesh() {
-    var vertexCount = uCount * vCount;
-    var template = makeSphereTemplate(12, 18);
-    var instances = new Float32Array(vertexCount * 8);
-    seedVertexInstanceLayout(instances);
-    return {
-      id: "ocean_vertices",
-      object_id: 3,
-      topology: "triangle-list",
-      instance_kind: "sphere-list",
-      instance_count: vertexCount,
-      transparent: false,
-      depth_write: true,
-      pickable: false,
-      vertices: template.vertices,
-      indices: template.indices,
-      instances: instances
-    };
-  }
-
-  function seedEdgeInstanceLayout(instances) {
-    var offset = 0;
-    for (var row = 0; row < vCount; row += 1) {
-      var v = initialVValues[row];
-      for (var col = 0; col < uCount - 1; col += 1) {
-        instances[offset] = initialUValues[col]; offset += 1;
-        instances[offset] = v; offset += 1;
-        offset += 1;
-        instances[offset] = edgeWidth; offset += 1;
-        instances[offset] = initialUValues[col + 1]; offset += 1;
-        instances[offset] = v; offset += 1;
-        offset += 1;
-        instances[offset] = 0.0; offset += 1;
-        instances[offset] = edgeColor[0]; offset += 1;
-        instances[offset] = edgeColor[1]; offset += 1;
-        instances[offset] = edgeColor[2]; offset += 1;
-        instances[offset] = edgeColor[3]; offset += 1;
-      }
-    }
-    for (var col2 = 0; col2 < uCount; col2 += 1) {
-      var u = initialUValues[col2];
-      for (var row2 = 0; row2 < vCount - 1; row2 += 1) {
-        instances[offset] = u; offset += 1;
-        instances[offset] = initialVValues[row2]; offset += 1;
-        offset += 1;
-        instances[offset] = edgeWidth; offset += 1;
-        instances[offset] = u; offset += 1;
-        instances[offset] = initialVValues[row2 + 1]; offset += 1;
-        offset += 1;
-        instances[offset] = 0.0; offset += 1;
-        instances[offset] = edgeColor[0]; offset += 1;
-        instances[offset] = edgeColor[1]; offset += 1;
-        instances[offset] = edgeColor[2]; offset += 1;
-        instances[offset] = edgeColor[3]; offset += 1;
-      }
-    }
-  }
-
-  function seedVertexInstanceLayout(instances) {
-    var offset = 0;
-    for (var vIndex = 0; vIndex < vCount; vIndex += 1) {
-      var v = initialVValues[vIndex];
-      for (var uIndex = 0; uIndex < uCount; uIndex += 1) {
-        instances[offset] = initialUValues[uIndex]; offset += 1;
-        instances[offset] = v; offset += 1;
-        offset += 1;
-        instances[offset] = vertexSize; offset += 1;
-        instances[offset] = vertexColor[0]; offset += 1;
-        instances[offset] = vertexColor[1]; offset += 1;
-        instances[offset] = vertexColor[2]; offset += 1;
-        instances[offset] = vertexColor[3]; offset += 1;
-      }
-    }
-  }
-
-  function gridIndex(uIndex, vIndex) {
-    return (vIndex * uCount) + uIndex;
-  }
-
-  function writeVertexRaw(target, offset, px, py, pz, nx, ny, nz, color) {
-    target[offset] = px;
-    target[offset + 1] = py;
-    target[offset + 2] = pz;
-    target[offset + 3] = nx;
-    target[offset + 4] = ny;
-    target[offset + 5] = nz;
-    target[offset + 6] = color[0];
-    target[offset + 7] = color[1];
-    target[offset + 8] = color[2];
-    target[offset + 9] = color[3];
-  }
-
-  function writeStaticVertexRaw(target, offset, px, py, color) {
-    target[offset] = px;
-    target[offset + 1] = py;
-    target[offset + 6] = color[0];
-    target[offset + 7] = color[1];
-    target[offset + 8] = color[2];
-    target[offset + 9] = color[3];
-  }
-
-  function writeDynamicVertexState(target, offset, pz, nx, ny, nz) {
-    target[offset + 2] = pz;
-    target[offset + 3] = nx;
-    target[offset + 4] = ny;
-    target[offset + 5] = nz;
-  }
-
-  function sampleHeightAtIndex(bound, uIndex, vIndex) {
-    return bound.heights[gridIndex(uIndex, vIndex)];
+  function createGeometryArena(materials) {
+    return global.VfGeomParametricSurface.createGridSurfaceArena({
+      uValues: initialUValues,
+      vValues: initialVValues,
+      faceSubdivisions: faceSubdiv,
+      showEdges: showEdges,
+      showVertices: showVertices,
+      edgeWidth: edgeWidth,
+      vertexSize: vertexSize,
+      faceMaterialId: "surface",
+      edgeMaterialId: "edge",
+      vertexMaterialId: "vertex",
+      materials: materials,
+      edgeCaps: edgeCaps
+    });
   }
 
   function rebuildHeights(bound, phase) {
@@ -580,42 +286,6 @@
         }
       }
     }
-  }
-
-  function rebuildEdgeVertices(bound) {
-    if (!runtime.edgeMesh) { return; }
-    var instances = runtime.edgeMesh.instances;
-    var heights = bound.heights;
-    var offset = 0;
-    for (var row = 0; row < vCount; row += 1) {
-      var rowOffset = row * uCount;
-      for (var col = 0; col < uCount - 1; col += 1) {
-        instances[offset + 2] = heights[rowOffset + col];
-        instances[offset + 6] = heights[rowOffset + col + 1];
-        offset += 12;
-      }
-    }
-    for (var col2 = 0; col2 < uCount; col2 += 1) {
-      for (var row2 = 0; row2 < vCount - 1; row2 += 1) {
-        var rowOffset2 = row2 * uCount;
-        instances[offset + 2] = heights[rowOffset2 + col2];
-        instances[offset + 6] = heights[rowOffset2 + uCount + col2];
-        offset += 12;
-      }
-    }
-    runtime.edgeMesh.__revision = Number(runtime.edgeMesh.__revision || 0) + 1;
-  }
-
-  function rebuildVertexVertices(bound) {
-    if (!runtime.vertexMesh) { return; }
-    var instances = runtime.vertexMesh.instances;
-    var heights = bound.heights;
-    var offset = 2;
-    for (var heightIndex = 0; heightIndex < heights.length; heightIndex += 1) {
-      instances[offset] = heights[heightIndex];
-      offset += 8;
-    }
-    runtime.vertexMesh.__revision = Number(runtime.vertexMesh.__revision || 0) + 1;
   }
 
   function resolveFrameIndex(step) {
@@ -687,13 +357,7 @@
   }
 
   function buildSnapshot(bound) {
-    rebuildSurfaceVertices(bound);
-    if (showEdges && runtime.edgeMesh) {
-      rebuildEdgeVertices(bound);
-    }
-    if (showVertices && runtime.vertexMesh) {
-      rebuildVertexVertices(bound);
-    }
+    runtime.geometryArena.rebuild(bound);
     var progress = progressForFrame(bound.frameIndex[0] | 0);
     updateOrbitCamera(progress, runtime.camera);
     updateOrbitLight(progress, runtime.light);
@@ -705,10 +369,8 @@
       pageLog("boot:start");
       requireRuntime();
       global.VfDisplay.renderFromJson({ screen: [], frames: {}, geom: {} });
-      runtime.surfaceMesh = makeTriangleMesh();
-      runtime.edgeMesh = showEdges ? makeEdgeMesh() : null;
-      runtime.vertexMesh = showVertices ? makeVertexMesh() : null;
-      runtime.surfaceMesh.light_model = forceFlatFace ? "flat" : null;
+      runtime.materials = createMaterials();
+      runtime.geometryArena = createGeometryArena(runtime.materials);
       runtime.camera = {
         pos: [0, 0, 0],
         target: cameraTarget,
@@ -722,17 +384,12 @@
         color: lightColor
       };
       runtime.scene = {
-        parts: [runtime.surfaceMesh],
+        parts: runtime.geometryArena.parts(),
+        materials: runtime.materials,
         camera: runtime.camera,
         lights: [runtime.light],
         unified_renderer: true
       };
-      if (showEdges && runtime.edgeMesh) {
-        runtime.scene.parts.push(runtime.edgeMesh);
-      }
-      if (showVertices && runtime.vertexMesh) {
-        runtime.scene.parts.push(runtime.vertexMesh);
-      }
       runtime.store = global.VfGeomLedger.createParametricSurfaceGridSharedStore({
         uValues: initialUValues,
         vValues: initialVValues,
@@ -786,6 +443,10 @@
         String(!!global.VfGeomWgpu) +
         " adapter=" +
         String(!!global.VfGeomFrameAdapter) +
+        " material=" +
+        String(!!global.VfGeomMaterialArena) +
+        " surface=" +
+        String(!!global.VfGeomParametricSurface) +
         " clock=" +
         String(!!global.VfRenderClock) +
         " ledger=" +
@@ -810,6 +471,10 @@
         String(!!global.VfGeomWgpu) +
         " adapter=" +
         String(!!global.VfGeomFrameAdapter) +
+        " material=" +
+        String(!!global.VfGeomMaterialArena) +
+        " surface=" +
+        String(!!global.VfGeomParametricSurface) +
         " clock=" +
         String(!!global.VfRenderClock) +
         " ledger=" +
