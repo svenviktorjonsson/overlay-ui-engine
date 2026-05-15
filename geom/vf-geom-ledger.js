@@ -914,6 +914,141 @@
     };
   }
 
+  function createParametricSurfaceGridSharedStore(options) {
+    options = options || {};
+    if (!global.VfGeomLedgerLayout) {
+      fail("createParametricSurfaceGridSharedStore requires VfGeomLedgerLayout");
+    }
+    if (!global.VfGeomLedgerTransport || typeof global.VfGeomLedgerTransport.createSharedBufferTransport !== "function") {
+      fail("createParametricSurfaceGridSharedStore requires shared-buffer transport support");
+    }
+
+    var uValuesInput = options.uValues;
+    var vValuesInput = options.vValues;
+    if (!uValuesInput || !vValuesInput) {
+      fail("createParametricSurfaceGridSharedStore requires uValues and vValues");
+    }
+    var uCount = Number(uValuesInput.length) | 0;
+    var vCount = Number(vValuesInput.length) | 0;
+    if (uCount < 2 || vCount < 2) {
+      fail("createParametricSurfaceGridSharedStore requires at least a 2x2 sampled grid");
+    }
+    if (typeof options.buildSnapshot !== "function") {
+      fail("createParametricSurfaceGridSharedStore requires buildSnapshot(bound, header)");
+    }
+
+    var headerBuffer = options.headerBuffer || null;
+    var stateBuffer = options.stateBuffer || null;
+    var ownsBuffers = !headerBuffer && !stateBuffer;
+    if (ownsBuffers) {
+      var useShared = typeof SharedArrayBuffer === "function";
+      headerBuffer = useShared
+        ? new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * global.VfGeomLedgerTransport.HEADER_SLOT_COUNT)
+        : new ArrayBuffer(Int32Array.BYTES_PER_ELEMENT * global.VfGeomLedgerTransport.HEADER_SLOT_COUNT);
+      stateBuffer = global.VfGeomLedgerLayout.createSurfaceHeightfieldStateBuffer(uCount, vCount, useShared);
+    } else if (!headerBuffer || !stateBuffer) {
+      fail("createParametricSurfaceGridSharedStore requires both headerBuffer and stateBuffer when binding existing buffers");
+    }
+
+    var header = new Int32Array(headerBuffer);
+    var bound = global.VfGeomLedgerLayout.bindSurfaceHeightfieldState(stateBuffer, uCount, vCount);
+    if (ownsBuffers) {
+      bound.writeInitial(uValuesInput, vValuesInput);
+      header[global.VfGeomLedgerTransport.HEADER_SLOT_REVISION] = 0;
+      header[global.VfGeomLedgerTransport.HEADER_SLOT_PRESENTED_REVISION] = -1;
+      header[global.VfGeomLedgerTransport.HEADER_SLOT_STATE_BYTE_LENGTH] = stateBuffer.byteLength;
+      header[global.VfGeomLedgerTransport.HEADER_SLOT_STATE_FORMAT] = global.VfGeomLedgerLayout.SURFACE_HEIGHTFIELD_STATE_FORMAT;
+      header[global.VfGeomLedgerTransport.HEADER_SLOT_FLAGS] = 0;
+      header[global.VfGeomLedgerTransport.HEADER_SLOT_ERROR_CODE] = 0;
+    }
+
+    var transport = global.VfGeomLedgerTransport.createSharedBufferTransport({
+      headerBuffer: headerBuffer,
+      stateBuffer: stateBuffer,
+    });
+    var listeners = [];
+    var localRevision = 0;
+    var presentedLocalRevision = -1;
+    var snapshotRevision = -1;
+    var cachedSnapshot = null;
+
+    function notify(meta) {
+      for (var i = 0; i < listeners.length; i += 1) {
+        try {
+          listeners[i](meta || {});
+        } catch (_) {}
+      }
+    }
+
+    function currentGeometryRevision() {
+      return transport.readHeader().revision;
+    }
+
+    function invalidate(meta) {
+      localRevision += 1;
+      cachedSnapshot = null;
+      snapshotRevision = -1;
+      transport.writeRevision(currentGeometryRevision() + 1);
+      notify({
+        geometryDirty: !(meta && meta.geometryDirty === false),
+        revision: localRevision,
+        geometryRevision: currentGeometryRevision()
+      });
+      return localRevision;
+    }
+
+    return {
+      transport: transport,
+      boundState: bound,
+      readState: function () {
+        return bound;
+      },
+      mutate: function (mutator) {
+        if (typeof mutator !== "function") {
+          fail("surface heightfield shared store mutate requires a function");
+        }
+        var result = mutator(bound);
+        return invalidate(result && typeof result === "object" ? result : { geometryDirty: true });
+      },
+      touch: function () {
+        return invalidate({ geometryDirty: true });
+      },
+      revision: function () {
+        return localRevision;
+      },
+      presentedRevision: function () {
+        return presentedLocalRevision;
+      },
+      needsPresentation: function () {
+        return localRevision !== presentedLocalRevision;
+      },
+      snapshot: function () {
+        if (snapshotRevision === localRevision && cachedSnapshot !== null) {
+          return cachedSnapshot;
+        }
+        cachedSnapshot = options.buildSnapshot(bound, transport.readHeader());
+        snapshotRevision = localRevision;
+        return cachedSnapshot;
+      },
+      markPresented: function () {
+        presentedLocalRevision = localRevision;
+        transport.ackPresented(currentGeometryRevision());
+      },
+      subscribe: function (listener) {
+        if (typeof listener !== "function") {
+          fail("surface heightfield shared store subscribe requires a function");
+        }
+        listeners.push(listener);
+        return function unsubscribe() {
+          var idx = listeners.indexOf(listener);
+          if (idx >= 0) {
+            listeners.splice(idx, 1);
+          }
+        };
+      }
+    };
+  }
+
   global.VfGeomLedger = {
     kindCode: kindCode,
     kindName: kindName,
@@ -922,6 +1057,8 @@
     createRafPresenter: createRafPresenter,
     createFaceEdgeVertexController: createFaceEdgeVertexController,
     createFaceEdgeVertex: createFaceEdgeVertex,
-    createFaceEdgeVertexSharedStore: createFaceEdgeVertexSharedStore
+    createFaceEdgeVertexSharedStore: createFaceEdgeVertexSharedStore,
+    createParametricSurfaceGridSharedStore: createParametricSurfaceGridSharedStore,
+    createSurfaceHeightfieldSharedStore: createParametricSurfaceGridSharedStore
   };
 })(typeof window !== "undefined" ? window : this);

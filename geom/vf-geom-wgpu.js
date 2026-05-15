@@ -65,6 +65,21 @@ struct Vin {
   @location(1) normal: vec3<f32>,
   @location(2) color : vec4<f32>,
 }
+struct SphereInstVin {
+  @location(0) pos        : vec3<f32>,
+  @location(1) normal     : vec3<f32>,
+  @location(2) _baseColor : vec4<f32>,
+  @location(3) centerRad  : vec4<f32>,
+  @location(4) instColor  : vec4<f32>,
+}
+struct CylinderInstVin {
+  @location(0) pos        : vec3<f32>,
+  @location(1) normal     : vec3<f32>,
+  @location(2) _baseColor : vec4<f32>,
+  @location(3) aRad       : vec4<f32>,
+  @location(4) bPad       : vec4<f32>,
+  @location(5) instColor  : vec4<f32>,
+}
 struct Vout {
   @builtin(position) clip    : vec4<f32>,
   @location(0)       color   : vec4<f32>,
@@ -84,14 +99,54 @@ fn vs(v: Vin) -> Vout {
   return o;
 }
 
+@vertex
+fn vs_sphere_instance(v: SphereInstVin) -> Vout {
+  var o: Vout;
+  let radius = v.centerRad.w;
+  let wp = v.centerRad.xyz + (radius * v.pos);
+  o.clip = sc.mvp * vec4f(wp, 1.0);
+  o.color = v.instColor;
+  o.world_pos = wp;
+  o.normal = normalize((sc.model * vec4f(v.normal, 0.0)).xyz);
+  return o;
+}
+
+@vertex
+fn vs_cylinder_instance(v: CylinderInstVin) -> Vout {
+  var o: Vout;
+  let a = v.aRad.xyz;
+  let b = v.bPad.xyz;
+  let radius = v.aRad.w;
+  let axis = b - a;
+  let dir = normalize(axis);
+  var refVec = vec3f(0.0, 1.0, 0.0);
+  if (abs(dir.y) >= 0.92) {
+    refVec = vec3f(1.0, 0.0, 0.0);
+  }
+  let u = normalize(cross(dir, refVec));
+  let vv = cross(dir, u);
+  let center = a + (axis * v.pos.z);
+  let radial = (u * v.pos.x) + (vv * v.pos.y);
+  let wp = center + (radius * radial);
+  let wn = normalize((u * v.normal.x) + (vv * v.normal.y) + (dir * v.normal.z));
+  o.clip = sc.mvp * vec4f(wp, 1.0);
+  o.color = v.instColor;
+  o.world_pos = wp;
+  o.normal = normalize((sc.model * vec4f(wn, 0.0)).xyz);
+  return o;
+}
+
 @fragment
 fn fs(i: Vout) -> @location(0) vec4f {
   let base = i.color.rgb;
   let a    = i.color.a * sc.alpha_mul;
   let t    = a;
-  let N    = normalize(i.normal);
   let L    = normalize(sc.light_pos - i.world_pos);
   let V    = normalize(sc.cam_pos   - i.world_pos);
+  var N    = normalize(i.normal);
+  if (dot(N, V) < 0.0) {
+    N = -N;
+  }
   let lc   = sc.light_color.rgb;
 
   if (sc.light_model == 0u) {
@@ -209,6 +264,23 @@ fn fs_pick() -> @location(0) vec2<u32> {
             { format: "float32x4", offset: 24, shaderLocation: 2 }, // color
           ],
         };
+        var sphereInstDesc = {
+          arrayStride: 32,
+          stepMode: "instance",
+          attributes: [
+            { format: "float32x4", offset:  0, shaderLocation: 3 },
+            { format: "float32x4", offset: 16, shaderLocation: 4 },
+          ],
+        };
+        var cylinderInstDesc = {
+          arrayStride: 48,
+          stepMode: "instance",
+          attributes: [
+            { format: "float32x4", offset:  0, shaderLocation: 3 },
+            { format: "float32x4", offset: 16, shaderLocation: 4 },
+            { format: "float32x4", offset: 32, shaderLocation: 5 },
+          ],
+        };
 
         var bindLayout = device.createBindGroupLayout({
           entries: [{
@@ -219,7 +291,7 @@ fn fs_pick() -> @location(0) vec2<u32> {
         });
         var plLayout = device.createPipelineLayout({ bindGroupLayouts: [bindLayout] });
 
-        var makeDesc = function (topo, cullMode, transparent) {
+        var makeDesc = function (topo, cullMode, transparent, vertexEntry, buffers) {
           var targets = [{ format: format }];
           if (transparent) {
             targets = [{
@@ -232,7 +304,7 @@ fn fs_pick() -> @location(0) vec2<u32> {
           }
           var d = {
             layout: plLayout,
-            vertex:   { module: mod, entryPoint: "vs", buffers: [vbufDesc] },
+            vertex:   { module: mod, entryPoint: vertexEntry || "vs", buffers: buffers || [vbufDesc] },
             fragment: { module: mod, entryPoint: "fs", targets: targets },
             primitive: { topology: topo },
             multisample: { count: SAMPLE_COUNT },
@@ -246,11 +318,17 @@ fn fs_pick() -> @location(0) vec2<u32> {
           return d;
         };
 
-        var pipeTri, pipeLine, pipeTriAlpha, pipeTriAlphaDepth;
+        var pipeTri, pipeLine, pipeTriAlpha, pipeTriAlphaDepth, pipeSphereInst, pipeCylinderInst;
         if (typeof device.createRenderPipelineAsync === "function") {
           pipeTri  = await device.createRenderPipelineAsync(makeDesc("triangle-list"));
           pipeLine = await device.createRenderPipelineAsync(makeDesc("line-list"));
           pipeTriAlpha = await device.createRenderPipelineAsync(makeDesc("triangle-list", null, true));
+          pipeSphereInst = await device.createRenderPipelineAsync(
+            makeDesc("triangle-list", null, false, "vs_sphere_instance", [vbufDesc, sphereInstDesc])
+          );
+          pipeCylinderInst = await device.createRenderPipelineAsync(
+            makeDesc("triangle-list", null, false, "vs_cylinder_instance", [vbufDesc, cylinderInstDesc])
+          );
           pipeTriAlphaDepth = await device.createRenderPipelineAsync({
             layout: plLayout,
             vertex:   { module: mod, entryPoint: "vs", buffers: [vbufDesc] },
@@ -269,6 +347,12 @@ fn fs_pick() -> @location(0) vec2<u32> {
           pipeTri  = device.createRenderPipeline(makeDesc("triangle-list"));
           pipeLine = device.createRenderPipeline(makeDesc("line-list"));
           pipeTriAlpha = device.createRenderPipeline(makeDesc("triangle-list", null, true));
+          pipeSphereInst = device.createRenderPipeline(
+            makeDesc("triangle-list", null, false, "vs_sphere_instance", [vbufDesc, sphereInstDesc])
+          );
+          pipeCylinderInst = device.createRenderPipeline(
+            makeDesc("triangle-list", null, false, "vs_cylinder_instance", [vbufDesc, cylinderInstDesc])
+          );
           pipeTriAlphaDepth = device.createRenderPipeline({
             layout: plLayout,
             vertex:   { module: mod, entryPoint: "vs", buffers: [vbufDesc] },
@@ -308,7 +392,12 @@ fn fs_pick() -> @location(0) vec2<u32> {
         } else {
           pipePick = device.createRenderPipeline(pickPipeDesc);
         }
-        sharedWgpu = { device, format, bindLayout, pipeTri, pipeLine, pipeTriAlpha, pipeTriAlphaDepth, pipePick, pickBindLayout };
+        sharedWgpu = {
+          device, format, bindLayout,
+          pipeTri, pipeLine, pipeTriAlpha, pipeTriAlphaDepth,
+          pipeSphereInst, pipeCylinderInst,
+          pipePick, pickBindLayout
+        };
         wlog("info", "getSharedWgpu: OK");
         return sharedWgpu;
       } catch (err) {
@@ -421,6 +510,53 @@ fn fs_pick() -> @location(0) vec2<u32> {
     return [0.8, 0.8, 0.8, 1];
   }
 
+  function vec3Or(value, fallback) {
+    if (value && typeof value === "object" && value.length >= 3) {
+      return [
+        Number(value[0]) || 0,
+        Number(value[1]) || 0,
+        Number(value[2]) || 0,
+      ];
+    }
+    return fallback.slice();
+  }
+
+  function resolveLightPosition(light, t) {
+    light = light || {};
+    var target = vec3Or(light.target, [0, 0, 0]);
+    var hasOrbit = light.orbit === true ||
+      light.orbit_radius !== undefined ||
+      light.angular_velocity !== undefined ||
+      light.theta !== undefined;
+    if (!hasOrbit) {
+      return vec3Or(light.pos, [0, 10, 10]);
+    }
+    var radius = Number(light.orbit_radius);
+    if (!(radius > 0)) { radius = 4; }
+    var height = Number(light.height);
+    if (!isFinite(height)) { height = 3; }
+    var theta = Number(light.theta);
+    if (!isFinite(theta)) { theta = 0; }
+    var angularVelocity = Number(light.angular_velocity);
+    if (!isFinite(angularVelocity)) { angularVelocity = 0; }
+    var seconds = Number(t || 0) * 0.001;
+    var angle = theta + angularVelocity * seconds;
+    return [
+      target[0] + Math.cos(angle) * radius,
+      target[1] + height,
+      target[2] + Math.sin(angle) * radius,
+    ];
+  }
+
+  function normalizeLight(light, t) {
+    light = light || {};
+    return {
+      pos: resolveLightPosition(light, t),
+      color_f32: parseColor(light.color || "white"),
+      model: light.model || "blinn_phong",
+    };
+  }
+
   // ---------------------------------------------------------------------------
   // VfGeomWgpu — one renderer per canvas
   // ---------------------------------------------------------------------------
@@ -433,6 +569,8 @@ fn fs_pick() -> @location(0) vec2<u32> {
     this._pipeTri    = null;
     this._pipeLine   = null;
     this._pipeTriAlpha = null;
+    this._pipeSphereInst = null;
+    this._pipeCylinderInst = null;
     this._bindLayout = null;
     this._depthTex   = null;
     this._msaaTex    = null;
@@ -654,6 +792,7 @@ fn fs_pick() -> @location(0) vec2<u32> {
       if (!part) { return; }
       if (part.vb) { try { part.vb.destroy(); } catch(_){} }
       if (part.ib) { try { part.ib.destroy(); } catch(_){} }
+      if (part.instanceBuf) { try { part.instanceBuf.destroy(); } catch(_){} }
       if (part.uniformBuf) { try { part.uniformBuf.destroy(); } catch(_){} }
       if (part.pickUb) { try { part.pickUb.destroy(); } catch(_){} }
     },
@@ -665,6 +804,14 @@ fn fs_pick() -> @location(0) vec2<u32> {
       dev.queue.writeBuffer(vb, 0, mesh.vertices);
       var ib = dev.createBuffer({ size: mesh.indices.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
       dev.queue.writeBuffer(ib, 0, mesh.indices);
+      var instanceBuf = null;
+      if (mesh.instances && mesh.instances.byteLength > 0) {
+        instanceBuf = dev.createBuffer({
+          size: mesh.instances.byteLength,
+          usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        });
+        dev.queue.writeBuffer(instanceBuf, 0, mesh.instances);
+      }
       var uniformBuf = dev.createBuffer({
         size: UB_SIZE,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -685,6 +832,11 @@ fn fs_pick() -> @location(0) vec2<u32> {
         mesh: mesh,
         vb: vb,
         ib: ib,
+        instanceBuf: instanceBuf,
+        instanceCount: Number(mesh.instance_count || 0),
+        instanceKind: mesh.instance_kind || null,
+        staticIndices: mesh.static_indices === true,
+        staticVertices: mesh.static_vertices === true,
         ibCount: mesh.indices.length,
         topology: mesh.topology || "triangle-list",
         uniformBuf: uniformBuf,
@@ -699,11 +851,14 @@ fn fs_pick() -> @location(0) vec2<u32> {
       if (!part || !mesh) { return false; }
       if (!part.vb || !part.ib || !part.uniformBuf || !part.pickUb || !part.pickBg || !part.bindGroup) { return false; }
       if ((part.topology || "triangle-list") !== (mesh.topology || "triangle-list")) { return false; }
+      if ((part.instanceKind || null) !== (mesh.instance_kind || null)) { return false; }
       if (Number(part.objectId || 0) !== (Number(mesh.object_id || (index + 1)) || (index + 1))) { return false; }
       if (!part.mesh) { return false; }
       if (!part.mesh.vertices || !part.mesh.indices || !mesh.vertices || !mesh.indices) { return false; }
       if (part.mesh.vertices.byteLength !== mesh.vertices.byteLength) { return false; }
       if (part.mesh.indices.byteLength !== mesh.indices.byteLength) { return false; }
+      if (!!part.mesh.instances !== !!mesh.instances) { return false; }
+      if (part.mesh.instances && mesh.instances && part.mesh.instances.byteLength !== mesh.instances.byteLength) { return false; }
       return true;
     },
 
@@ -717,10 +872,23 @@ fn fs_pick() -> @location(0) vec2<u32> {
         if (!mesh) { continue; }
         var existing = previousParts[i];
         if (this._canReuseScenePart(existing, mesh, i)) {
-          dev.queue.writeBuffer(existing.vb, 0, mesh.vertices);
-          dev.queue.writeBuffer(existing.ib, 0, mesh.indices);
+          if (!mesh.instance_kind) {
+            if (!existing.staticVertices) {
+              dev.queue.writeBuffer(existing.vb, 0, mesh.vertices);
+            }
+            if (!existing.staticIndices) {
+              dev.queue.writeBuffer(existing.ib, 0, mesh.indices);
+            }
+          }
+          if (mesh.instances && existing.instanceBuf) {
+            dev.queue.writeBuffer(existing.instanceBuf, 0, mesh.instances);
+          }
           existing.mesh = mesh;
           existing.ibCount = mesh.indices.length;
+          existing.instanceCount = Number(mesh.instance_count || 0);
+          existing.instanceKind = mesh.instance_kind || null;
+          existing.staticIndices = mesh.static_indices === true;
+          existing.staticVertices = mesh.static_vertices === true;
           existing.topology = mesh.topology || "triangle-list";
           existing.objectId = Number(mesh.object_id || (i + 1)) || (i + 1);
           nextParts[i] = existing;
@@ -832,40 +1000,45 @@ fn fs_pick() -> @location(0) vec2<u32> {
             mvpPart = MmBatch.mat4Mul(projMatPart, viewMatPart);
           }
           var rawLightsPart = partMesh.lights || mesh.lights || [];
-          var lightsNormPart = rawLightsPart.map(function (l) {
-            return {
-              pos: l.pos || [0, 10, 10],
-              color_f32: parseColor(l.color || "white"),
-              model: l.model || "blinn_phong",
-            };
-          });
+          var lightsNormPart = rawLightsPart.map(function (l) { return normalizeLight(l, t); });
           if (!lightsNormPart.length) {
             lightsNormPart = [{ pos: [0, 10, 10], color_f32: [1,1,1,1], model: "blinn_phong" }];
           }
-          var lmNamePart = lightsNormPart[0].model || "blinn_phong";
+          var lmNamePart = partMesh.light_model || mesh.light_model || lightsNormPart[0].model || "blinn_phong";
           var lmIntPart = LIGHT_MODELS[lmNamePart] !== undefined ? LIGHT_MODELS[lmNamePart] : 2;
           var ubPart = buildUniform(mvpPart, modelMatPart, posPart, lightsNormPart, lmIntPart, resolveAlphaMul(partMesh));
           this._device.queue.writeBuffer(part.uniformBuf, 0, ubPart);
           var isTransparentPart = !!partMesh.transparent && part.topology === "triangle-list";
           var useTransparentDepthPart = isTransparentPart && !!partMesh.depth_write;
-          var pipePart = part.topology === "line-list"
-            ? this._pipeLine
+          var pipePart = part.instanceKind === "sphere-list"
+            ? this._pipeSphereInst
             : (
-                useTransparentDepthPart && this._pipeTriAlphaDepth ? this._pipeTriAlphaDepth :
-                (isTransparentPart && this._pipeTriAlpha ? this._pipeTriAlpha : this._pipeTri)
+                part.instanceKind === "cylinder-list"
+                  ? this._pipeCylinderInst
+                  : (
+                      part.topology === "line-list"
+                        ? this._pipeLine
+                        : (
+                            useTransparentDepthPart && this._pipeTriAlphaDepth ? this._pipeTriAlphaDepth :
+                            (isTransparentPart && this._pipeTriAlpha ? this._pipeTriAlpha : this._pipeTri)
+                          )
+                    )
               );
           passBatch.setPipeline(pipePart);
           passBatch.setBindGroup(0, part.bindGroup);
           passBatch.setVertexBuffer(0, part.vb);
+          if (part.instanceBuf) {
+            passBatch.setVertexBuffer(1, part.instanceBuf);
+          }
           passBatch.setIndexBuffer(part.ib, "uint32");
-          passBatch.drawIndexed(part.ibCount, 1, 0, 0, 0);
+          passBatch.drawIndexed(part.ibCount, Math.max(1, Number(part.instanceCount || 0)), 0, 0, 0);
         }
         passBatch.end();
 
         var sgBatch = sharedWgpu;
         var pendingBatchPick = !!this._pendingPickPx;
         var fireBatchPickCallback = false;
-        if (sgBatch && sgBatch.pipePick && this._pickTex) {
+        if (pendingBatchPick && sgBatch && sgBatch.pipePick && this._pickTex) {
           var pickPassBatch = encBatch.beginRenderPass({
             colorAttachments: [{
               view: this._pickTex.createView(),
@@ -984,17 +1157,11 @@ fn fs_pick() -> @location(0) vec2<u32> {
 
       // --- Lights ---
       var rawLights = mesh.lights || [];
-      var lightsNorm = rawLights.map(function (l) {
-        return {
-          pos:      l.pos      || [0, 10, 10],
-          color_f32: parseColor(l.color || "white"),
-          model:    l.model    || "blinn_phong",
-        };
-      });
+      var lightsNorm = rawLights.map(function (l) { return normalizeLight(l, t); });
       if (!lightsNorm.length) {
         lightsNorm = [{ pos: [0, 10, 10], color_f32: [1,1,1,1], model: "blinn_phong" }];
       }
-      var lmName = lightsNorm[0].model || "blinn_phong";
+      var lmName = mesh.light_model || lightsNorm[0].model || "blinn_phong";
       var lmInt  = LIGHT_MODELS[lmName] !== undefined ? LIGHT_MODELS[lmName] : 2;
 
       // --- Build + upload uniform ---
@@ -1036,9 +1203,9 @@ fn fs_pick() -> @location(0) vec2<u32> {
 
       // ── Picking pass (triangle-list only, skips wireframe) ────────────────
       var sg2 = sharedWgpu;
-      var pendingSinglePick = !!this._pendingPickPx;
-      var fireSinglePickCallback = false;
-      if (sg2 && sg2.pipePick && this._pickTex && this._topology === "triangle-list") {
+        var pendingSinglePick = !!this._pendingPickPx;
+        var fireSinglePickCallback = false;
+      if (pendingSinglePick && sg2 && sg2.pipePick && this._pickTex && this._topology === "triangle-list") {
         // Ensure picking UB + BG exist
         if (!this._pickUb) {
           this._pickUb = this._device.createBuffer({
@@ -1165,6 +1332,8 @@ fn fs_pick() -> @location(0) vec2<u32> {
     this._pipeLine   = sg.pipeLine;
     this._pipeTriAlpha = sg.pipeTriAlpha || null;
     this._pipeTriAlphaDepth = sg.pipeTriAlphaDepth || null;
+    this._pipeSphereInst = sg.pipeSphereInst || null;
+    this._pipeCylinderInst = sg.pipeCylinderInst || null;
     this._ctx = c.getContext("webgpu");
     if (!this._ctx) { wlog("error", "getContext('webgpu') null"); return false; }
     try {

@@ -54,6 +54,9 @@
       revision: function () {
         return revision;
       },
+      isDirty: function () {
+        return dirty;
+      },
       hostSizeKey: function () {
         return hostSizeKey;
       },
@@ -81,7 +84,7 @@
           return scene;
         }
         var geomSpec = provider();
-        if (!geomSpec || !Array.isArray(geomSpec.meshes)) {
+        if (!geomSpec || (!Array.isArray(geomSpec.meshes) && !Array.isArray(geomSpec.parts))) {
           fail("provider returned invalid geom spec");
         }
         var nextScene = buildScene(geomSpec, scene);
@@ -130,6 +133,7 @@
 
     return {
       revision: adapter.revision,
+      isDirty: adapter.isDirty,
       hostSizeKey: adapter.hostSizeKey,
       markDirty: adapter.markDirty,
       onHostResize: adapter.onHostResize,

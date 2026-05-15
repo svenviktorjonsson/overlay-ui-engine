@@ -165,7 +165,7 @@
       },
       emit: function (hit, req) {
         if (req && req.evtType === "leave") {
-          postEvent(hit);
+          postEvent(Object.assign({}, hit, { event: "leave" }));
           return;
         }
         if (req && req.evtType === "down" && body.__vfGeomDragState) {
@@ -824,6 +824,464 @@
     return 1;
   }
 
+  function meshVec3At(vertices, index) {
+    var o = index * 10;
+    return [Number(vertices[o] || 0), Number(vertices[o + 1] || 0), Number(vertices[o + 2] || 0)];
+  }
+
+  function meshColorAt(vertices, index) {
+    var o = index * 10;
+    return [
+      Number(vertices[o + 6] == null ? 0.8 : vertices[o + 6]),
+      Number(vertices[o + 7] == null ? 0.8 : vertices[o + 7]),
+      Number(vertices[o + 8] == null ? 0.8 : vertices[o + 8]),
+      Number(vertices[o + 9] == null ? 1.0 : vertices[o + 9])
+    ];
+  }
+
+  function norm3(x, y, z) {
+    var l = Math.sqrt(x * x + y * y + z * z);
+    if (l < 1e-9) { return [0, 0, 1]; }
+    return [x / l, y / l, z / l];
+  }
+
+  function cross3(a, b) {
+    return [
+      a[1] * b[2] - a[2] * b[1],
+      a[2] * b[0] - a[0] * b[2],
+      a[0] * b[1] - a[1] * b[0]
+    ];
+  }
+
+  var sphereTemplateCache = Object.create(null);
+  var cylinderTemplateCache = Object.create(null);
+
+  function getSphereTemplate(latSeg, lonSeg) {
+    var key = String(latSeg) + "x" + String(lonSeg);
+    var cached = sphereTemplateCache[key];
+    if (cached) { return cached; }
+    var verts = [];
+    var idx = [];
+    for (var j = 0; j <= latSeg; j++) {
+      var v = j / latSeg;
+      var phi = v * Math.PI;
+      var sp = Math.sin(phi);
+      var cp = Math.cos(phi);
+      for (var i = 0; i <= lonSeg; i++) {
+        var u = i / lonSeg;
+        var th = u * Math.PI * 2;
+        var nx = sp * Math.cos(th);
+        var ny = cp;
+        var nz = sp * Math.sin(th);
+        verts.push(nx, ny, nz);
+      }
+    }
+    var row = lonSeg + 1;
+    for (var y = 0; y < latSeg; y++) {
+      for (var x = 0; x < lonSeg; x++) {
+        var a = y * row + x;
+        var b = a + 1;
+        var c = a + row;
+        var d = c + 1;
+        idx.push(a, c, b, b, c, d);
+      }
+    }
+    cached = {
+      verts: verts,
+      idx: idx
+    };
+    sphereTemplateCache[key] = cached;
+    return cached;
+  }
+
+  function getCylinderTemplate(seg) {
+    var key = String(seg);
+    var cached = cylinderTemplateCache[key];
+    if (cached) { return cached; }
+    var ring = [];
+    var idx = [];
+    for (var i = 0; i <= seg; i++) {
+      var th = (i / seg) * Math.PI * 2;
+      ring.push(Math.cos(th), Math.sin(th));
+    }
+    for (var s = 0; s < seg; s++) {
+      var p0 = s * 2;
+      var p1 = p0 + 1;
+      var p2 = p0 + 2;
+      var p3 = p0 + 3;
+      idx.push(p0, p1, p2, p2, p1, p3);
+    }
+    cached = {
+      ring: ring,
+      idx: idx
+    };
+    cylinderTemplateCache[key] = cached;
+    return cached;
+  }
+
+  function appendSphereMesh(outVerts, outIdx, center, radius, color, latSeg, lonSeg) {
+    radius = Number(radius);
+    if (!(radius > 0)) { return; }
+    latSeg = latSeg || 10;
+    lonSeg = lonSeg || 16;
+    var template = getSphereTemplate(latSeg, lonSeg);
+    var base = Math.floor(outVerts.length / 10);
+    for (var i = 0; i < template.verts.length; i += 3) {
+      var nx = template.verts[i];
+      var ny = template.verts[i + 1];
+      var nz = template.verts[i + 2];
+      outVerts.push(
+        center[0] + radius * nx, center[1] + radius * ny, center[2] + radius * nz,
+        nx, ny, nz,
+        color[0], color[1], color[2], color[3]
+      );
+    }
+    for (var k = 0; k < template.idx.length; k += 1) {
+      outIdx.push(base + template.idx[k]);
+    }
+  }
+
+  function appendCylinderMesh(outVerts, outIdx, a, b, radius, color, seg) {
+    radius = Number(radius);
+    if (!(radius > 0)) { return; }
+    seg = seg || 18;
+    var template = getCylinderTemplate(seg);
+    var dir = norm3(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+    var ref = Math.abs(dir[1]) < 0.92 ? [0, 1, 0] : [1, 0, 0];
+    var u = norm3.apply(null, cross3(dir, ref));
+    var v = cross3(dir, u);
+    var base = Math.floor(outVerts.length / 10);
+    for (var i = 0; i < template.ring.length; i += 2) {
+      var ct = template.ring[i];
+      var st = template.ring[i + 1];
+      var nx = u[0] * ct + v[0] * st;
+      var ny = u[1] * ct + v[1] * st;
+      var nz = u[2] * ct + v[2] * st;
+      outVerts.push(
+        a[0] + radius * nx, a[1] + radius * ny, a[2] + radius * nz,
+        nx, ny, nz,
+        color[0], color[1], color[2], color[3],
+        b[0] + radius * nx, b[1] + radius * ny, b[2] + radius * nz,
+        nx, ny, nz,
+        color[0], color[1], color[2], color[3]
+      );
+    }
+    for (var k = 0; k < template.idx.length; k += 1) {
+      outIdx.push(base + template.idx[k]);
+    }
+  }
+
+  function createExpandedOverlayMesh(spec, kind, vertexFloatCount, indexCount, spheres, cylinders) {
+    return {
+      id: String(spec.id || "combined_field_overlays"),
+      mode3d: true,
+      label: String(spec.id || "combined_field_overlays"),
+      vertices: new Float32Array(vertexFloatCount),
+      indices: new Uint32Array(indexCount),
+      topology: "triangle-list",
+      camera: null,
+      lights: [],
+      center: [0, 0, 0],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1],
+      alpha: 1,
+      transparent: false,
+      overlay_expanded: true,
+      overlay_counts: { spheres: spheres, cylinders: cylinders },
+      __cacheKind: kind
+    };
+  }
+
+  function buildExpandedPointMesh(spec, camera, lights) {
+    var verts = spec.vertices || [];
+    var inds = spec.indices || [];
+    var vertexRadius = Number(spec.vertex_size || 0);
+    if (!(vertexRadius > 0) || !inds.length) { return null; }
+    var template = getSphereTemplate(12, 18);
+    var templateVertCount = Math.floor(template.verts.length / 3);
+    var templateIdxCount = template.idx.length;
+    var pointCount = inds.length;
+    var vertexCount = pointCount * templateVertCount;
+    var indexCount = pointCount * templateIdxCount;
+    var mesh = spec.__overlayExpandedMesh;
+    if (
+      !mesh ||
+      mesh.__cacheKind !== "point-list" ||
+      mesh.__sourceCount !== pointCount ||
+      mesh.__radius !== vertexRadius ||
+      !mesh.vertices ||
+      mesh.vertices.length !== vertexCount * 10 ||
+      !mesh.indices ||
+      mesh.indices.length !== indexCount
+    ) {
+      mesh = createExpandedOverlayMesh(spec, "point-list", vertexCount * 10, indexCount, pointCount, 0);
+      for (var pointIndex = 0; pointIndex < pointCount; pointIndex += 1) {
+        var baseVertex = pointIndex * templateVertCount;
+        var indexBase = pointIndex * templateIdxCount;
+        for (var indexIndex = 0; indexIndex < templateIdxCount; indexIndex += 1) {
+          mesh.indices[indexBase + indexIndex] = baseVertex + template.idx[indexIndex];
+        }
+      }
+      mesh.__sourceCount = pointCount;
+      mesh.__radius = vertexRadius;
+      spec.__overlayExpandedMesh = mesh;
+    }
+    var out = mesh.vertices;
+    var outOffset = 0;
+    for (var pi = 0; pi < pointCount; pi += 1) {
+      var sourceIndex = Number(inds[pi]) * 10;
+      var px = Number(verts[sourceIndex] || 0);
+      var py = Number(verts[sourceIndex + 1] || 0);
+      var pz = Number(verts[sourceIndex + 2] || 0);
+      var cr = Number(verts[sourceIndex + 6] == null ? 0.8 : verts[sourceIndex + 6]);
+      var cg = Number(verts[sourceIndex + 7] == null ? 0.8 : verts[sourceIndex + 7]);
+      var cb = Number(verts[sourceIndex + 8] == null ? 0.8 : verts[sourceIndex + 8]);
+      var ca = Number(verts[sourceIndex + 9] == null ? 1.0 : verts[sourceIndex + 9]);
+      for (var tv = 0; tv < template.verts.length; tv += 3) {
+        var nx = template.verts[tv];
+        var ny = template.verts[tv + 1];
+        var nz = template.verts[tv + 2];
+        out[outOffset] = px + (vertexRadius * nx);
+        out[outOffset + 1] = py + (vertexRadius * ny);
+        out[outOffset + 2] = pz + (vertexRadius * nz);
+        out[outOffset + 3] = nx;
+        out[outOffset + 4] = ny;
+        out[outOffset + 5] = nz;
+        out[outOffset + 6] = cr;
+        out[outOffset + 7] = cg;
+        out[outOffset + 8] = cb;
+        out[outOffset + 9] = ca;
+        outOffset += 10;
+      }
+    }
+    mesh.camera = camera || null;
+    mesh.lights = lights || [];
+    mesh.__revision = Number(mesh.__revision || 0) + 1;
+    return mesh;
+  }
+
+  function buildExpandedLineMesh(spec, camera, lights) {
+    var verts = spec.vertices || [];
+    var inds = spec.indices || [];
+    var edgeRadius = Number(spec.edge_width || 0);
+    if (!(edgeRadius > 0) || inds.length < 2) { return null; }
+    var edgeCaps = spec.edge_caps === true;
+    var cylinderTemplate = getCylinderTemplate(20);
+    var cylinderVertCount = Math.floor(cylinderTemplate.ring.length / 2) * 2;
+    var cylinderIdxCount = cylinderTemplate.idx.length;
+    var capTemplate = edgeCaps ? getSphereTemplate(10, 14) : null;
+    var capVertCount = capTemplate ? Math.floor(capTemplate.verts.length / 3) : 0;
+    var capIdxCount = capTemplate ? capTemplate.idx.length : 0;
+    var segmentCount = Math.floor(inds.length / 2);
+    var vertexCount = segmentCount * (cylinderVertCount + (edgeCaps ? (capVertCount * 2) : 0));
+    var indexCount = segmentCount * (cylinderIdxCount + (edgeCaps ? (capIdxCount * 2) : 0));
+    var mesh = spec.__overlayExpandedMesh;
+    if (
+      !mesh ||
+      mesh.__cacheKind !== "line-list" ||
+      mesh.__sourceCount !== segmentCount ||
+      mesh.__radius !== edgeRadius ||
+      mesh.__edgeCaps !== edgeCaps ||
+      !mesh.vertices ||
+      mesh.vertices.length !== vertexCount * 10 ||
+      !mesh.indices ||
+      mesh.indices.length !== indexCount
+    ) {
+      mesh = createExpandedOverlayMesh(
+        spec,
+        "line-list",
+        vertexCount * 10,
+        indexCount,
+        edgeCaps ? segmentCount * 2 : 0,
+        segmentCount
+      );
+      var vertexBase = 0;
+      var indexBase = 0;
+      for (var segmentIndex = 0; segmentIndex < segmentCount; segmentIndex += 1) {
+        for (var cylIndex = 0; cylIndex < cylinderIdxCount; cylIndex += 1) {
+          mesh.indices[indexBase + cylIndex] = vertexBase + cylinderTemplate.idx[cylIndex];
+        }
+        indexBase += cylinderIdxCount;
+        vertexBase += cylinderVertCount;
+        if (edgeCaps) {
+          for (var capAIndex = 0; capAIndex < capIdxCount; capAIndex += 1) {
+            mesh.indices[indexBase + capAIndex] = vertexBase + capTemplate.idx[capAIndex];
+          }
+          indexBase += capIdxCount;
+          vertexBase += capVertCount;
+          for (var capBIndex = 0; capBIndex < capIdxCount; capBIndex += 1) {
+            mesh.indices[indexBase + capBIndex] = vertexBase + capTemplate.idx[capBIndex];
+          }
+          indexBase += capIdxCount;
+          vertexBase += capVertCount;
+        }
+      }
+      mesh.__sourceCount = segmentCount;
+      mesh.__radius = edgeRadius;
+      mesh.__edgeCaps = edgeCaps;
+      spec.__overlayExpandedMesh = mesh;
+    }
+    var out = mesh.vertices;
+    var outOffset = 0;
+    for (var segment = 0; segment < segmentCount; segment += 1) {
+      var aSource = Number(inds[segment * 2]) * 10;
+      var bSource = Number(inds[(segment * 2) + 1]) * 10;
+      var ax = Number(verts[aSource] || 0);
+      var ay = Number(verts[aSource + 1] || 0);
+      var az = Number(verts[aSource + 2] || 0);
+      var bx = Number(verts[bSource] || 0);
+      var by = Number(verts[bSource + 1] || 0);
+      var bz = Number(verts[bSource + 2] || 0);
+      var cr = Number(verts[aSource + 6] == null ? 0.8 : verts[aSource + 6]);
+      var cg = Number(verts[aSource + 7] == null ? 0.8 : verts[aSource + 7]);
+      var cb = Number(verts[aSource + 8] == null ? 0.8 : verts[aSource + 8]);
+      var ca = Number(verts[aSource + 9] == null ? 1.0 : verts[aSource + 9]);
+      var dir = norm3(bx - ax, by - ay, bz - az);
+      var ref = Math.abs(dir[1]) < 0.92 ? [0, 1, 0] : [1, 0, 0];
+      var u = norm3.apply(null, cross3(dir, ref));
+      var v = cross3(dir, u);
+      for (var ringIndex = 0; ringIndex < cylinderTemplate.ring.length; ringIndex += 2) {
+        var ct = cylinderTemplate.ring[ringIndex];
+        var st = cylinderTemplate.ring[ringIndex + 1];
+        var nx = (u[0] * ct) + (v[0] * st);
+        var ny = (u[1] * ct) + (v[1] * st);
+        var nz = (u[2] * ct) + (v[2] * st);
+        out[outOffset] = ax + (edgeRadius * nx);
+        out[outOffset + 1] = ay + (edgeRadius * ny);
+        out[outOffset + 2] = az + (edgeRadius * nz);
+        out[outOffset + 3] = nx;
+        out[outOffset + 4] = ny;
+        out[outOffset + 5] = nz;
+        out[outOffset + 6] = cr;
+        out[outOffset + 7] = cg;
+        out[outOffset + 8] = cb;
+        out[outOffset + 9] = ca;
+        outOffset += 10;
+        out[outOffset] = bx + (edgeRadius * nx);
+        out[outOffset + 1] = by + (edgeRadius * ny);
+        out[outOffset + 2] = bz + (edgeRadius * nz);
+        out[outOffset + 3] = nx;
+        out[outOffset + 4] = ny;
+        out[outOffset + 5] = nz;
+        out[outOffset + 6] = cr;
+        out[outOffset + 7] = cg;
+        out[outOffset + 8] = cb;
+        out[outOffset + 9] = ca;
+        outOffset += 10;
+      }
+      if (edgeCaps) {
+        for (var capVertA = 0; capVertA < capTemplate.verts.length; capVertA += 3) {
+          var cax = capTemplate.verts[capVertA];
+          var cay = capTemplate.verts[capVertA + 1];
+          var caz = capTemplate.verts[capVertA + 2];
+          out[outOffset] = ax + (edgeRadius * cax);
+          out[outOffset + 1] = ay + (edgeRadius * cay);
+          out[outOffset + 2] = az + (edgeRadius * caz);
+          out[outOffset + 3] = cax;
+          out[outOffset + 4] = cay;
+          out[outOffset + 5] = caz;
+          out[outOffset + 6] = cr;
+          out[outOffset + 7] = cg;
+          out[outOffset + 8] = cb;
+          out[outOffset + 9] = ca;
+          outOffset += 10;
+        }
+        for (var capVertB = 0; capVertB < capTemplate.verts.length; capVertB += 3) {
+          var cbx = capTemplate.verts[capVertB];
+          var cby = capTemplate.verts[capVertB + 1];
+          var cbz = capTemplate.verts[capVertB + 2];
+          out[outOffset] = bx + (edgeRadius * cbx);
+          out[outOffset + 1] = by + (edgeRadius * cby);
+          out[outOffset + 2] = bz + (edgeRadius * cbz);
+          out[outOffset + 3] = cbx;
+          out[outOffset + 4] = cby;
+          out[outOffset + 5] = cbz;
+          out[outOffset + 6] = cr;
+          out[outOffset + 7] = cg;
+          out[outOffset + 8] = cb;
+          out[outOffset + 9] = ca;
+          outOffset += 10;
+        }
+      }
+    }
+    mesh.camera = camera || null;
+    mesh.lights = lights || [];
+    mesh.__revision = Number(mesh.__revision || 0) + 1;
+    return mesh;
+  }
+
+  function buildCombinedTriangleMesh(specs, camera, lights) {
+    if (Array.isArray(specs) && specs.length === 1) {
+      var singleSpec = specs[0] || {};
+      if (singleSpec.type === "field_mesh") {
+        var singleTopology = String(singleSpec.topology || "");
+        if (singleTopology === "point-list") {
+          return buildExpandedPointMesh(singleSpec, camera, lights);
+        }
+        if (singleTopology === "line-list") {
+          return buildExpandedLineMesh(singleSpec, camera, lights);
+        }
+      }
+    }
+    if (!Array.isArray(specs) || !specs.length) { return null; }
+    var outVerts = [];
+    var outIdx = [];
+    var spheres = 0;
+    var cylinders = 0;
+    for (var si = 0; si < specs.length; si++) {
+      var spec = specs[si] || {};
+      if (spec.type !== "field_mesh") { return null; }
+      var verts = spec.vertices || [];
+      var inds = spec.indices || [];
+      var topology = String(spec.topology || "");
+      var vertexRadius = Number(spec.vertex_size || 0);
+      var edgeRadius = Number(spec.edge_width || 0);
+      if (topology === "point-list" && vertexRadius > 0) {
+        for (var pi = 0; pi < inds.length; pi++) {
+          var vi = Number(inds[pi]);
+          appendSphereMesh(outVerts, outIdx, meshVec3At(verts, vi), vertexRadius, meshColorAt(verts, vi), 12, 18);
+          spheres += 1;
+        }
+      } else if (topology === "line-list" && edgeRadius > 0) {
+        var edgeCaps = spec.edge_caps === true;
+        for (var ei = 0; ei + 1 < inds.length; ei += 2) {
+          var aIdx = Number(inds[ei]);
+          var bIdx = Number(inds[ei + 1]);
+          var pa = meshVec3At(verts, aIdx);
+          var pb = meshVec3At(verts, bIdx);
+          var col = meshColorAt(verts, aIdx);
+          appendCylinderMesh(outVerts, outIdx, pa, pb, edgeRadius, col, 20);
+          if (edgeCaps) {
+            appendSphereMesh(outVerts, outIdx, pa, edgeRadius, col, 10, 14);
+            appendSphereMesh(outVerts, outIdx, pb, edgeRadius, col, 10, 14);
+            spheres += 2;
+          }
+          cylinders += 1;
+        }
+      } else {
+        return null;
+      }
+    }
+    if (!outIdx.length) { return null; }
+    return {
+      id: "combined_field_overlays",
+      mode3d: true,
+      label: "combined_field_overlays",
+      vertices: new Float32Array(outVerts),
+      indices: new Uint32Array(outIdx),
+      topology: "triangle-list",
+      camera: camera || null,
+      lights: lights || [],
+      center: [0, 0, 0],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1],
+      alpha: 1,
+      transparent: false,
+      overlay_expanded: true,
+      overlay_counts: { spheres: spheres, cylinders: cylinders }
+    };
+  }
+
   function transformPointMat4(m, x, y, z) {
     return [
       m[0] * x + m[4] * y + m[8]  * z + m[12],
@@ -975,14 +1433,17 @@
     } else if (spec.type === "field_mesh") {
       var verts = spec.vertices || [];
       var inds = spec.indices || [];
-      mesh = {
-        id: spec.id || "field_mesh",
-        mode3d: spec.mode3d === false ? false : true,
-        label: spec.id || "field_mesh",
-        vertices: (verts instanceof Float32Array) ? verts : new Float32Array(verts),
-        indices: (inds instanceof Uint32Array) ? inds : new Uint32Array(inds),
-        topology: spec.topology || "triangle-list",
-      };
+      mesh = buildCombinedTriangleMesh([spec], camera, lights);
+      if (!mesh) {
+        mesh = {
+          id: spec.id || "field_mesh",
+          mode3d: spec.mode3d === false ? false : true,
+          label: spec.id || "field_mesh",
+          vertices: (verts instanceof Float32Array) ? verts : new Float32Array(verts),
+          indices: (inds instanceof Uint32Array) ? inds : new Uint32Array(inds),
+          topology: spec.topology || "triangle-list",
+        };
+      }
     } else if (spec.preset) {
       mesh = Core.getPreset(spec.preset);
     } else {
@@ -997,14 +1458,17 @@
     for (var k in mesh) { out[k] = mesh[k]; }
     out.camera   = camera || null;
     out.lights   = lights  || [];
-    // Forward spec fields so vf-geom-wgpu.js can recompute TRS every frame
-    out.center   = spec.center   || [0,0,0];
-    out.rotation = spec.rotation || [0,0,0];
-    out.scale    = spec.scale    || [1,1,1];
+    // Field point/line overlays are expanded into world-space impostor meshes.
+    // Do not apply the source field TRS a second time.
+    out.center   = out.overlay_expanded ? [0,0,0] : (spec.center   || [0,0,0]);
+    out.rotation = out.overlay_expanded ? [0,0,0] : (spec.rotation || [0,0,0]);
+    out.scale    = out.overlay_expanded ? [1,1,1] : (spec.scale    || [1,1,1]);
     out.alpha    = meshAlpha(spec);
     out.transparent = spec.transparent === true || out.alpha < 0.999;
     out.depth_write = spec.depth_write === true;
-    out._modelMatrix = meshModelMatrix(spec);  // fallback if VfGeomMath.mat4ModelTRS absent
+    out._modelMatrix = out.overlay_expanded
+      ? meshModelMatrix({ center: [0,0,0], rotation: [0,0,0], scale: [1,1,1] })
+      : meshModelMatrix(spec);  // fallback if VfGeomMath.mat4ModelTRS absent
     return out;
   }
 
@@ -1278,6 +1742,122 @@
     schedulePostGeomLayout();
   }
 
+  function parseRuntimeColor(color) {
+    if (color && typeof color === "object" && color.length >= 3) {
+      return [
+        Number(color[0]) || 0,
+        Number(color[1]) || 0,
+        Number(color[2]) || 0,
+        color.length >= 4 ? Number(color[3]) || 0 : 1
+      ];
+    }
+    var s = String(color || "").trim().toLowerCase();
+    var named = {
+      white: [1, 1, 1, 1],
+      black: [0, 0, 0, 1],
+      red: [1, 0.1, 0.1, 1],
+      green: [0.15, 0.85, 0.15, 1],
+      blue: [0.15, 0.35, 1, 1],
+      yellow: [1, 0.9, 0.1, 1],
+      cyan: [0.1, 0.9, 0.9, 1],
+      magenta: [0.9, 0.1, 0.9, 1],
+      orange: [1, 0.5, 0.05, 1],
+      gray: [0.5, 0.5, 0.5, 1],
+      grey: [0.5, 0.5, 0.5, 1]
+    };
+    if (named[s]) { return named[s].slice(); }
+    if (s.charAt(0) === "#") {
+      var h = s.slice(1);
+      if (h.length === 3) { h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2]; }
+      var n = parseInt(h, 16);
+      if (Number.isFinite(n)) {
+        return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255, 1];
+      }
+    }
+    throw new Error("geom.color.patch received unsupported color: " + String(color));
+  }
+
+  function paintVertexBufferColor(vertices, color) {
+    if (!vertices || vertices.length < 10) { return false; }
+    for (var offset = 6; offset + 3 < vertices.length; offset += 10) {
+      vertices[offset] = color[0];
+      vertices[offset + 1] = color[1];
+      vertices[offset + 2] = color[2];
+      vertices[offset + 3] = color[3];
+    }
+    return true;
+  }
+
+  function patchDisplaySpecColor(fid, objectId, color) {
+    if (!_lastDisplayPayload || !_lastDisplayPayload.geom) { return; }
+    var geom = _lastDisplayPayload.geom[String(fid)];
+    if (!geom || !Array.isArray(geom.meshes)) { return; }
+    var spec = geom.meshes[objectId - 1];
+    if (!spec) { return; }
+    spec.color = color.slice();
+    paintVertexBufferColor(spec.vertices, color);
+  }
+
+  function patchRendererPartColor(entry, objectId, color) {
+    if (!entry || !entry.renderer) { return false; }
+    var renderer = entry.renderer;
+    var mesh = entry.ref && entry.ref.mesh;
+    var wrote = false;
+    if (mesh && Array.isArray(mesh.parts)) {
+      var gpuParts = Array.isArray(renderer._parts) ? renderer._parts : [];
+      for (var i = 0; i < mesh.parts.length; i++) {
+        var partMesh = mesh.parts[i];
+        var partObjectId = Number(partMesh && partMesh.object_id || (i + 1)) || (i + 1);
+        if (partObjectId !== objectId) { continue; }
+        if (!paintVertexBufferColor(partMesh.vertices, color)) { return false; }
+        partMesh.color = color.slice();
+        partMesh.__revision = Number(partMesh.__revision || 0) + 1;
+        var gpuPart = gpuParts[i];
+        if (gpuPart && gpuPart.vb && renderer._device && renderer._device.queue) {
+          renderer._device.queue.writeBuffer(gpuPart.vb, 0, partMesh.vertices);
+          gpuPart.mesh = partMesh;
+        }
+        wrote = true;
+      }
+      if (wrote) {
+        mesh.__revision = Number(mesh.__revision || 0) + 1;
+      }
+      return wrote;
+    }
+    var rendererObjectId = Number(renderer._objectId || 1) || 1;
+    if (objectId !== rendererObjectId || !mesh) { return false; }
+    if (!paintVertexBufferColor(mesh.vertices, color)) { return false; }
+    mesh.color = color.slice();
+    mesh.__revision = Number(mesh.__revision || 0) + 1;
+    if (renderer._vb && renderer._device && renderer._device.queue) {
+      renderer._device.queue.writeBuffer(renderer._vb, 0, mesh.vertices);
+    }
+    return true;
+  }
+
+  function applyGeomColorPatch(payload) {
+    if (!payload || typeof payload !== "object") { return; }
+    var fid = String(payload.frame_id || "");
+    var objectId = Number(payload.object_id || 0);
+    if (!fid || !(objectId > 0)) {
+      throw new Error("geom.color.patch requires frame_id and positive object_id");
+    }
+    var color = parseRuntimeColor(payload.color);
+    patchDisplaySpecColor(fid, objectId, color);
+    var rec = frameRecs[fid];
+    if (!rec || !Array.isArray(rec.entries)) {
+      vlog("warn", "geom.color.patch [" + fid + "]: frame renderer not ready for object_id=" + objectId);
+      return;
+    }
+    var patched = false;
+    for (var i = 0; i < rec.entries.length; i++) {
+      patched = patchRendererPartColor(rec.entries[i], objectId, color) || patched;
+    }
+    if (!patched) {
+      vlog("warn", "geom.color.patch [" + fid + "]: object_id=" + objectId + " was not present in live GPU parts");
+    }
+  }
+
   function _buildDynamicGeomScene(geomSpec) {
     if (geomSpec && Array.isArray(geomSpec.parts)) {
       return geomSpec;
@@ -1493,6 +2073,14 @@
     rec.dynamicAdapter.markDirty();
   }
 
+  function dynamicGeomFrameCanAcceptUpdate(fid) {
+    var rec = frameRecs[fid];
+    if (!rec || !rec.dynamicAdapter || typeof rec.dynamicAdapter.isDirty !== "function") {
+      return false;
+    }
+    return !rec.dynamicAdapter.isDirty();
+  }
+
   // ── Main render from JSON ─────────────────────────────────────────────────
 
   function renderFromJson(data) {
@@ -1587,6 +2175,10 @@
     var payload = packet.payload;
     if (kind === "display.replace" && payload && payload.display && typeof payload.display === "object") {
       renderFromJson(payload.display);
+      return;
+    }
+    if (kind === "geom.color.patch") {
+      applyGeomColorPatch(payload);
     }
   }
 
@@ -1720,7 +2312,13 @@
     redrawCurrentDisplay: redrawCurrentDisplay,
     mountDynamicGeomFrame: mountDynamicGeomFrame,
     mountLedgerGeomFrame: mountLedgerGeomFrame,
-    requestDynamicGeomFrameUpdate: requestDynamicGeomFrameUpdate
+    requestDynamicGeomFrameUpdate: requestDynamicGeomFrameUpdate,
+    dynamicGeomFrameCanAcceptUpdate: dynamicGeomFrameCanAcceptUpdate,
+    __test: {
+      buildSingleMesh: buildSingleMesh,
+      buildCombinedTriangleMesh: buildCombinedTriangleMesh,
+      buildCombinedTransparentMesh: buildCombinedTransparentMesh
+    }
   };
   ensureRuntimeShellLoaded();
   vlog("info", "VfDisplay registered");

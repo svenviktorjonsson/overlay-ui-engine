@@ -17,6 +17,7 @@
   }
 
   var FACE_EDGE_VERTEX_STATE_FORMAT = 1001;
+  var SURFACE_HEIGHTFIELD_STATE_FORMAT = 1002;
   var F32_POINT_COUNT = 8;
   var I32_EDGE_COUNT = 8;
   var U8_SELECTION_EDGE_COUNT = 4;
@@ -46,9 +47,44 @@
   var OFF_U8_DRAG_VERTICES = OFF_I32_DRAG_POINTER_ID + Int32Array.BYTES_PER_ELEMENT;
   var FACE_EDGE_VERTEX_STATE_BYTE_LENGTH = OFF_U8_DRAG_VERTICES + U8_DRAG_VERTEX_COUNT;
 
+  var OFF_I32_SURFACE_U_COUNT = 0;
+  var OFF_I32_SURFACE_V_COUNT = OFF_I32_SURFACE_U_COUNT + Int32Array.BYTES_PER_ELEMENT;
+  var OFF_I32_SURFACE_FRAME_INDEX = OFF_I32_SURFACE_V_COUNT + Int32Array.BYTES_PER_ELEMENT;
+  var OFF_I32_SURFACE_BOUNDARY = OFF_I32_SURFACE_FRAME_INDEX + Int32Array.BYTES_PER_ELEMENT;
+  var OFF_F32_SURFACE_PHASE = OFF_I32_SURFACE_BOUNDARY + Int32Array.BYTES_PER_ELEMENT;
+  var OFF_F32_SURFACE_U_VALUES = align4(OFF_F32_SURFACE_PHASE + Float32Array.BYTES_PER_ELEMENT);
+
+  function requirePositiveInt(value, name, minimum) {
+    var out = Number(value) | 0;
+    if (!Number.isFinite(Number(value)) || out !== Number(value) || out < minimum) {
+      fail(name + " must be an integer >= " + String(minimum));
+    }
+    return out;
+  }
+
+  function surfaceHeightfieldOffsets(uCount, vCount) {
+    var uLen = requirePositiveInt(uCount, "uCount", 2);
+    var vLen = requirePositiveInt(vCount, "vCount", 2);
+    var offV = OFF_F32_SURFACE_U_VALUES + (uLen * Float32Array.BYTES_PER_ELEMENT);
+    var offH = offV + (vLen * Float32Array.BYTES_PER_ELEMENT);
+    return {
+      uCount: uLen,
+      vCount: vLen,
+      offUValues: OFF_F32_SURFACE_U_VALUES,
+      offVValues: offV,
+      offHeights: offH,
+      byteLength: offH + (uLen * vLen * Float32Array.BYTES_PER_ELEMENT)
+    };
+  }
+
   function createFaceEdgeVertexStateBuffer(useSharedArrayBuffer) {
     var Ctor = useSharedArrayBuffer ? SharedArrayBuffer : ArrayBuffer;
     return new Ctor(FACE_EDGE_VERTEX_STATE_BYTE_LENGTH);
+  }
+
+  function createSurfaceHeightfieldStateBuffer(uCount, vCount, useSharedArrayBuffer) {
+    var Ctor = useSharedArrayBuffer ? SharedArrayBuffer : ArrayBuffer;
+    return new Ctor(surfaceHeightfieldOffsets(uCount, vCount).byteLength);
   }
 
   function bindFaceEdgeVertexState(buffer) {
@@ -206,10 +242,92 @@
     };
   }
 
+  function bindSurfaceHeightfieldState(buffer, uCount, vCount) {
+    var layout = surfaceHeightfieldOffsets(uCount, vCount);
+    if (!(buffer instanceof ArrayBuffer) && !(typeof SharedArrayBuffer === "function" && buffer instanceof SharedArrayBuffer)) {
+      fail("bindSurfaceHeightfieldState requires ArrayBuffer or SharedArrayBuffer");
+    }
+    if (buffer.byteLength < layout.byteLength) {
+      fail("surface-heightfield state buffer too small");
+    }
+
+    var uCountView = new Int32Array(buffer, OFF_I32_SURFACE_U_COUNT, 1);
+    var vCountView = new Int32Array(buffer, OFF_I32_SURFACE_V_COUNT, 1);
+    var frameIndex = new Int32Array(buffer, OFF_I32_SURFACE_FRAME_INDEX, 1);
+    var boundaryCode = new Int32Array(buffer, OFF_I32_SURFACE_BOUNDARY, 1);
+    var phase = new Float32Array(buffer, OFF_F32_SURFACE_PHASE, 1);
+    var uValues = new Float32Array(buffer, layout.offUValues, layout.uCount);
+    var vValues = new Float32Array(buffer, layout.offVValues, layout.vCount);
+    var heights = new Float32Array(buffer, layout.offHeights, layout.uCount * layout.vCount);
+
+    function writeInitial(nextUValues, nextVValues) {
+      var i;
+      if (!nextUValues || Number(nextUValues.length) !== layout.uCount) {
+        fail("writeInitial requires uCount sampled u values");
+      }
+      if (!nextVValues || Number(nextVValues.length) !== layout.vCount) {
+        fail("writeInitial requires vCount sampled v values");
+      }
+      uCountView[0] = layout.uCount;
+      vCountView[0] = layout.vCount;
+      frameIndex[0] = 0;
+      boundaryCode[0] = 0;
+      phase[0] = 0.0;
+      for (i = 0; i < layout.uCount; i += 1) {
+        uValues[i] = Number(nextUValues[i]) || 0.0;
+      }
+      for (i = 0; i < layout.vCount; i += 1) {
+        vValues[i] = Number(nextVValues[i]) || 0.0;
+      }
+      heights.fill(0.0);
+    }
+
+    function validateCounts() {
+      if ((uCountView[0] | 0) !== layout.uCount || (vCountView[0] | 0) !== layout.vCount) {
+        fail("surface-heightfield ledger count header does not match requested dimensions");
+      }
+    }
+
+    function toPlainState() {
+      validateCounts();
+      return {
+        uCount: layout.uCount,
+        vCount: layout.vCount,
+        frameIndex: frameIndex[0] | 0,
+        boundaryCode: boundaryCode[0] | 0,
+        phase: Number(phase[0]) || 0.0,
+        uValues: Array.from(uValues),
+        vValues: Array.from(vValues),
+        heights: Array.from(heights)
+      };
+    }
+
+    return {
+      buffer: buffer,
+      uCount: uCountView,
+      vCount: vCountView,
+      frameIndex: frameIndex,
+      boundaryCode: boundaryCode,
+      phase: phase,
+      uValues: uValues,
+      vValues: vValues,
+      heights: heights,
+      writeInitial: writeInitial,
+      toPlainState: toPlainState,
+      byteLength: layout.byteLength
+    };
+  }
+
   global.VfGeomLedgerLayout = {
     FACE_EDGE_VERTEX_STATE_FORMAT: FACE_EDGE_VERTEX_STATE_FORMAT,
     FACE_EDGE_VERTEX_STATE_BYTE_LENGTH: FACE_EDGE_VERTEX_STATE_BYTE_LENGTH,
     createFaceEdgeVertexStateBuffer: createFaceEdgeVertexStateBuffer,
     bindFaceEdgeVertexState: bindFaceEdgeVertexState,
+    SURFACE_HEIGHTFIELD_STATE_FORMAT: SURFACE_HEIGHTFIELD_STATE_FORMAT,
+    surfaceHeightfieldStateByteLength: function (uCount, vCount) {
+      return surfaceHeightfieldOffsets(uCount, vCount).byteLength;
+    },
+    createSurfaceHeightfieldStateBuffer: createSurfaceHeightfieldStateBuffer,
+    bindSurfaceHeightfieldState: bindSurfaceHeightfieldState,
   };
 })(typeof window !== "undefined" ? window : globalThis);

@@ -154,8 +154,12 @@
           }
           if (applied > 0) {
             state.runtimePacketsSeen = true;
+            state.packetIdlePolls = 0;
             runtimeLog("info", "loadRuntimePackets: applied=" + applied + " newLastSeq=" + state.lastRuntimePacketSeq);
           } else {
+            if (state.runtimePacketsSeen) {
+              state.packetIdlePolls = Number(state.packetIdlePolls || 0) + 1;
+            }
             runtimeLog("info", "loadRuntimePackets: applied=0");
           }
         })

@@ -29,6 +29,11 @@
         existingVersion + " requested version " + _vfRuntimeAssetVersion
       );
     }
+    try {
+      if (typeof global.VfRuntimeShell.autoBootIfSceneDocument === "function") {
+        global.VfRuntimeShell.autoBootIfSceneDocument();
+      }
+    } catch (_) {}
     return;
   }
   global.__vfRuntimeAssetVersion = _vfRuntimeAssetVersion;
@@ -67,6 +72,10 @@
     ],
     scenePollMs: 1500,
     packetPollMs: 16,
+    packetPollIdleMs: 120,
+    packetPollSteadyMs: 400,
+    packetPollIdleThreshold: 12,
+    packetPollSteadyThreshold: 60,
     packetFallbackDelayMs: 1200,
     runtimeAssetVersion: _vfRuntimeAssetVersion
   };
@@ -110,6 +119,8 @@
       legacyFallbackActive: false,
       scenePollTimer: 0,
       packetPollTimer: 0,
+      packetPollDelayMs: Number(DEFAULT_RUNTIME_CONFIG.packetPollMs) || 16,
+      packetIdlePolls: 0,
       bootstrapPromise: null,
       sceneAdapter: null,
       runtimeSource: null,
@@ -117,6 +128,27 @@
       sharedBufferEntries: Object.create(null),
       sharedBufferBridgeInstalled: false
     };
+
+    function resetSceneBootState() {
+      state.lastSceneText = "";
+      state.sceneLoadInFlight = false;
+      state.runtimePacketsInFlight = false;
+      state.runtimePacketsSeen = false;
+      state.lastRuntimePacketSeq = 0;
+      state.packetFallbackStarted = false;
+      state.packetModeActive = false;
+      state.legacyFallbackActive = false;
+      if (state.scenePollTimer && typeof global.clearInterval === "function") {
+        global.clearInterval(state.scenePollTimer);
+      }
+      if (state.packetPollTimer && typeof global.clearInterval === "function") {
+        global.clearInterval(state.packetPollTimer);
+      }
+      state.scenePollTimer = 0;
+      state.packetPollTimer = 0;
+      state.packetPollDelayMs = Number(DEFAULT_RUNTIME_CONFIG.packetPollMs) || 16;
+      state.packetIdlePolls = 0;
+    }
 
     function sharedBufferKey(channel, name) {
       return String(channel || "") + "::" + String(name || "");
@@ -402,11 +434,12 @@
       if (state.bootstrapPromise) { return state.bootstrapPromise; }
       var styles = DEFAULT_RUNTIME_CONFIG.sceneStyleDeps.slice();
       var deps = DEFAULT_RUNTIME_CONFIG.sceneScriptDeps.slice();
-      state.bootstrapPromise = styles.reduce(function(chain, spec) {
-        return chain.then(function() {
-          return ensureStylesheetLoaded(spec);
+      state.bootstrapPromise = Promise.resolve().then(function() {
+        styles.forEach(function(spec) {
+          ensureStylesheetLoaded(spec).catch(function(err) {
+            runtimeLog("warn", "stylesheet skipped: " + String(spec && spec.href || "") + " " + (err && err.message ? err.message : String(err)));
+          });
         });
-      }, Promise.resolve()).then(function() {
         return deps.reduce(function(chain, path) {
           return chain.then(function() {
             return ensureScriptLoaded(path);
@@ -614,6 +647,34 @@
       return flow.loadRuntimePackets();
     }
 
+    function schedulePacketPoll(delayMs) {
+      if (state.packetPollTimer && typeof global.clearTimeout === "function") {
+        global.clearTimeout(state.packetPollTimer);
+      }
+      state.packetPollTimer = 0;
+      if (typeof global.setTimeout !== "function") { return; }
+      var nextDelay = Math.max(16, Number(delayMs) || 16);
+      state.packetPollDelayMs = nextDelay;
+      state.packetPollTimer = global.setTimeout(function() {
+        state.packetPollTimer = 0;
+        var result = loadRuntimePackets();
+        if (result && typeof result.finally === "function") {
+          result.finally(function() {
+            var idlePolls = Number(state.packetIdlePolls || 0);
+            var next = Number(DEFAULT_RUNTIME_CONFIG.packetPollMs) || 16;
+            if (idlePolls >= (Number(DEFAULT_RUNTIME_CONFIG.packetPollSteadyThreshold) || 60)) {
+              next = Number(DEFAULT_RUNTIME_CONFIG.packetPollSteadyMs) || 400;
+            } else if (idlePolls >= (Number(DEFAULT_RUNTIME_CONFIG.packetPollIdleThreshold) || 12)) {
+              next = Number(DEFAULT_RUNTIME_CONFIG.packetPollIdleMs) || 120;
+            }
+            schedulePacketPoll(next);
+          });
+          return;
+        }
+        schedulePacketPoll(Number(DEFAULT_RUNTIME_CONFIG.packetPollMs) || 16);
+      }, nextDelay);
+    }
+
     function loadScene() {
       var flow = getRuntimeFlow();
       if (!flow || !flow.loadScene) { return; }
@@ -693,7 +754,7 @@
     }
 
     function boot(options) {
-      if (state.booted) { return shell; }
+      resetSceneBootState();
       state.booted = true;
       installSharedBufferBridge();
       options = options || {};
@@ -712,9 +773,7 @@
           " webview=" + (typeof global.chrome !== "undefined" && global.chrome.webview ? "present" : "missing"));
       }, 300);
       loadRuntimePackets();
-      if (typeof global.setInterval === "function") {
-        state.packetPollTimer = global.setInterval(loadRuntimePackets, DEFAULT_RUNTIME_CONFIG.packetPollMs);
-      }
+      schedulePacketPoll(Number(DEFAULT_RUNTIME_CONFIG.packetPollMs) || 16);
       global.setTimeout(function() {
         if (state.runtimePacketsSeen || state.packetFallbackStarted) { return; }
         state.packetFallbackStarted = true;
