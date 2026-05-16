@@ -1028,11 +1028,16 @@
     }
     var out = mesh.vertices;
     var outOffset = 0;
+    var scales = Array.isArray(spec.vertex_scale) ? spec.vertex_scale : null;
+    var globalScale = scales ? null : Number(spec.vertex_scale == null ? 1.0 : spec.vertex_scale);
     for (var pi = 0; pi < pointCount; pi += 1) {
       var sourceIndex = Number(inds[pi]) * 10;
       var px = Number(verts[sourceIndex] || 0);
       var py = Number(verts[sourceIndex + 1] || 0);
       var pz = Number(verts[sourceIndex + 2] || 0);
+      var sizeScale = scales ? Number(scales[pi] == null ? 1.0 : scales[pi]) : globalScale;
+      if (!(sizeScale > 0)) { sizeScale = 1.0; }
+      var radius = vertexRadius * sizeScale;
       var cr = Number(verts[sourceIndex + 6] == null ? 0.8 : verts[sourceIndex + 6]);
       var cg = Number(verts[sourceIndex + 7] == null ? 0.8 : verts[sourceIndex + 7]);
       var cb = Number(verts[sourceIndex + 8] == null ? 0.8 : verts[sourceIndex + 8]);
@@ -1041,9 +1046,9 @@
         var nx = template.verts[tv];
         var ny = template.verts[tv + 1];
         var nz = template.verts[tv + 2];
-        out[outOffset] = px + (vertexRadius * nx);
-        out[outOffset + 1] = py + (vertexRadius * ny);
-        out[outOffset + 2] = pz + (vertexRadius * nz);
+        out[outOffset] = px + (radius * nx);
+        out[outOffset + 1] = py + (radius * ny);
+        out[outOffset + 2] = pz + (radius * nz);
         out[outOffset + 3] = nx;
         out[outOffset + 4] = ny;
         out[outOffset + 5] = nz;
@@ -1237,9 +1242,13 @@
       var vertexRadius = Number(spec.vertex_size || 0);
       var edgeRadius = Number(spec.edge_width || 0);
       if (topology === "point-list" && vertexRadius > 0) {
+        var pointScales = Array.isArray(spec.vertex_scale) ? spec.vertex_scale : null;
+        var pointGlobalScale = pointScales ? null : Number(spec.vertex_scale == null ? 1.0 : spec.vertex_scale);
         for (var pi = 0; pi < inds.length; pi++) {
           var vi = Number(inds[pi]);
-          appendSphereMesh(outVerts, outIdx, meshVec3At(verts, vi), vertexRadius, meshColorAt(verts, vi), 12, 18);
+          var pointScale = pointScales ? Number(pointScales[pi] == null ? 1.0 : pointScales[pi]) : pointGlobalScale;
+          if (!(pointScale > 0)) { pointScale = 1.0; }
+          appendSphereMesh(outVerts, outIdx, meshVec3At(verts, vi), vertexRadius * pointScale, meshColorAt(verts, vi), 12, 18);
           spheres += 1;
         }
       } else if (topology === "line-list" && edgeRadius > 0) {
@@ -1466,6 +1475,17 @@
     out.alpha    = meshAlpha(spec);
     out.transparent = spec.transparent === true || out.alpha < 0.999;
     out.depth_write = spec.depth_write === true;
+    out.light_model = spec.light_model || mesh.light_model || null;
+    out.blend_mode = spec.blend_mode || mesh.blend_mode || null;
+    out.no_cull = spec.no_cull === true || mesh.no_cull === true;
+    out.shadow_hull = Array.isArray(spec.shadow_hull) ? spec.shadow_hull : (Array.isArray(mesh.shadow_hull) ? mesh.shadow_hull : []);
+    out.shadow_hulls = Array.isArray(spec.shadow_hulls) ? spec.shadow_hulls : (Array.isArray(mesh.shadow_hulls) ? mesh.shadow_hulls : []);
+    out.shadow_softness = Number.isFinite(Number(spec.shadow_softness))
+      ? Number(spec.shadow_softness)
+      : (Number.isFinite(Number(mesh.shadow_softness)) ? Number(mesh.shadow_softness) : 0.0);
+    out.shadow_softnesses = Array.isArray(spec.shadow_softnesses)
+      ? spec.shadow_softnesses
+      : (Array.isArray(mesh.shadow_softnesses) ? mesh.shadow_softnesses : []);
     out._modelMatrix = out.overlay_expanded
       ? meshModelMatrix({ center: [0,0,0], rotation: [0,0,0], scale: [1,1,1] })
       : meshModelMatrix(spec);  // fallback if VfGeomMath.mat4ModelTRS absent

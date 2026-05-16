@@ -24,6 +24,17 @@
     throw new Error("[vf-geom-material-arena] " + String(message));
   }
 
+  function normalizeLightModel(model) {
+    if (model == null || model === "") {
+      return null;
+    }
+    var normalized = String(model).toLowerCase().replace(/-/g, "_");
+    if (normalized === "flat" || normalized === "lambert" || normalized === "phong") {
+      return "blinn_phong";
+    }
+    return "blinn_phong";
+  }
+
   function toColorArray(source, fallback) {
     var input = source;
     if (!input) {
@@ -54,7 +65,7 @@
       alpha: alpha,
       transparent: source.transparent === true || alpha < 0.999,
       depth_write: source.depth_write === true,
-      light_model: source.light_model == null ? null : String(source.light_model)
+      light_model: normalizeLightModel(source.light_model)
     };
   }
 

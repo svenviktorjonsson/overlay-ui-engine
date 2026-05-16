@@ -36,7 +36,6 @@
   var showEdges = styles.show_edges !== false;
   var showVertices = styles.show_vertices === true;
   var edgeCaps = styles.edge_caps === true;
-  var faceLightModel = styles.face_light_model === "flat" ? "flat" : null;
   var frameId = String(config.frame_id || "");
   var waveDefs = normalizeWaves(waves);
   var initialUValues = sampleAxis(uMin, uMax, uCount);
@@ -226,7 +225,7 @@
     return global.VfGeomMaterialArena.createArena({
       surface: {
         base_color: styles.face_color || [0.06, 0.55, 0.94, 1.0],
-        light_model: faceLightModel,
+        light_model: "blinn_phong",
         depth_write: true
       },
       edge: {

@@ -1,6 +1,8 @@
 /**
  * WebGPU renderer: packed vertex layout pos(3)+normal(3)+color(4) = 10 f32 = 40 bytes/vertex.
- * Lighting models: flat (unlit), lambert (diffuse), blinn_phong (diffuse+specular).
+ * Lighting model: unified blinn_phong shading. Legacy names are normalized to
+ * this single renderer path for compatibility, but the shader no longer
+ * branches by model.
  * Camera and lights are passed in from mesh.camera / mesh.lights.
  * Depends: vf-geom-math.js (VfGeomMath)
  */
@@ -40,7 +42,8 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Shader — supports flat / lambert / blinn_phong via light_model uniform
+  // Shader — single blinn_phong lighting path. light_model stays in the
+  // uniform layout only for compatibility with older packet/scene shapes.
   // Vertex layout: pos(3) + normal(3) + color(4) — 10 f32 = 40 bytes stride
   // ---------------------------------------------------------------------------
   var SHADER = `
@@ -49,14 +52,36 @@ struct Scene {
   model      : mat4x4<f32>,   // 64 bytes  offset 64
   cam_pos    : vec3<f32>,     // 12 bytes  offset 128
   _pad0      : f32,           // 4 bytes   offset 140
-  light_pos  : vec3<f32>,     // 12 bytes  offset 144
+  light0_pos : vec3<f32>,     // 12 bytes  offset 144
   _pad1      : f32,           // 4 bytes   offset 156
-  light_color: vec4<f32>,     // 16 bytes  offset 160
-  // 0=flat, 1=lambert, 2=blinn_phong
-  light_model: u32,           // 4 bytes   offset 176
-  alpha_mul  : f32,           // 4 bytes   offset 180
-  _pad3      : u32,
-  _pad4      : u32,           // total 192 bytes (12 * 16)
+  light0_color: vec4<f32>,    // 16 bytes  offset 160
+  light1_pos : vec3<f32>,     // 12 bytes  offset 176
+  _pad2      : f32,           // 4 bytes   offset 188
+  light1_color: vec4<f32>,    // 16 bytes  offset 192
+  light_count: u32,           // 4 bytes   offset 208
+  light_model: u32,           // 4 bytes   offset 212
+  alpha_mul  : f32,           // 4 bytes   offset 216
+  shadow0_count: u32,         // 4 bytes   offset 220
+  shadow1_count: u32,         // 4 bytes   offset 224
+  shadow0_softness: f32,      // 4 bytes   offset 228
+  shadow1_softness: f32,      // 4 bytes   offset 232
+  _pad3      : f32,           // 4 bytes   offset 236
+  shadow0_pts0 : vec4<f32>,   // 16 bytes  offset 240
+  shadow0_pts1 : vec4<f32>,   // 16 bytes  offset 256
+  shadow0_pts2 : vec4<f32>,   // 16 bytes  offset 272
+  shadow0_pts3 : vec4<f32>,   // 16 bytes  offset 288
+  shadow0_pts4 : vec4<f32>,   // 16 bytes  offset 304
+  shadow0_pts5 : vec4<f32>,   // 16 bytes  offset 320
+  shadow0_pts6 : vec4<f32>,   // 16 bytes  offset 336
+  shadow0_pts7 : vec4<f32>,   // 16 bytes  offset 352
+  shadow1_pts0 : vec4<f32>,   // 16 bytes  offset 368
+  shadow1_pts1 : vec4<f32>,   // 16 bytes  offset 384
+  shadow1_pts2 : vec4<f32>,   // 16 bytes  offset 400
+  shadow1_pts3 : vec4<f32>,   // 16 bytes  offset 416
+  shadow1_pts4 : vec4<f32>,   // 16 bytes  offset 432
+  shadow1_pts5 : vec4<f32>,   // 16 bytes  offset 448
+  shadow1_pts6 : vec4<f32>,   // 16 bytes  offset 464
+  shadow1_pts7 : vec4<f32>,   // 16 bytes  offset 480
 }
 @group(0) @binding(0) var<uniform> sc: Scene;
 
@@ -85,6 +110,70 @@ struct Vout {
   @location(0)       color   : vec4<f32>,
   @location(1)       world_pos: vec3<f32>,
   @location(2)       normal  : vec3<f32>,
+}
+
+fn cross2(a: vec2<f32>, b: vec2<f32>, p: vec2<f32>) -> f32 {
+  return ((b.x - a.x) * (p.y - a.y)) - ((b.y - a.y) * (p.x - a.x));
+}
+
+fn shadowPoint0(idx: u32) -> vec2<f32> {
+  if (idx == 0u) { return sc.shadow0_pts0.xy; }
+  if (idx == 1u) { return sc.shadow0_pts1.xy; }
+  if (idx == 2u) { return sc.shadow0_pts2.xy; }
+  if (idx == 3u) { return sc.shadow0_pts3.xy; }
+  if (idx == 4u) { return sc.shadow0_pts4.xy; }
+  if (idx == 5u) { return sc.shadow0_pts5.xy; }
+  if (idx == 6u) { return sc.shadow0_pts6.xy; }
+  return sc.shadow0_pts7.xy;
+}
+
+fn shadowPoint1(idx: u32) -> vec2<f32> {
+  if (idx == 0u) { return sc.shadow1_pts0.xy; }
+  if (idx == 1u) { return sc.shadow1_pts1.xy; }
+  if (idx == 2u) { return sc.shadow1_pts2.xy; }
+  if (idx == 3u) { return sc.shadow1_pts3.xy; }
+  if (idx == 4u) { return sc.shadow1_pts4.xy; }
+  if (idx == 5u) { return sc.shadow1_pts5.xy; }
+  if (idx == 6u) { return sc.shadow1_pts6.xy; }
+  return sc.shadow1_pts7.xy;
+}
+
+fn edgeOcclusion(side: f32, edgeLen: f32, softness: f32) -> f32 {
+  let sd = side / max(edgeLen, 1e-6);
+  if (softness <= 1e-6) {
+    return select(0.0, 1.0, sd >= 0.0);
+  }
+  return smoothstep(-softness, softness, sd);
+}
+
+fn shadowOcclusion0(p: vec2<f32>) -> f32 {
+  if (sc.shadow0_count < 3u) {
+    return 0.0;
+  }
+  var occ = 1.0;
+  for (var i: u32 = 0u; i < sc.shadow0_count; i = i + 1u) {
+    let a = shadowPoint0(i);
+    let b = shadowPoint0((i + 1u) % sc.shadow0_count);
+    let side = cross2(a, b, p);
+    let edgeLen = length(b - a);
+    occ = occ * edgeOcclusion(side, edgeLen, sc.shadow0_softness);
+  }
+  return occ;
+}
+
+fn shadowOcclusion1(p: vec2<f32>) -> f32 {
+  if (sc.shadow1_count < 3u) {
+    return 0.0;
+  }
+  var occ = 1.0;
+  for (var i: u32 = 0u; i < sc.shadow1_count; i = i + 1u) {
+    let a = shadowPoint1(i);
+    let b = shadowPoint1((i + 1u) % sc.shadow1_count);
+    let side = cross2(a, b, p);
+    let edgeLen = length(b - a);
+    occ = occ * edgeOcclusion(side, edgeLen, sc.shadow1_softness);
+  }
+  return occ;
 }
 
 @vertex
@@ -141,37 +230,39 @@ fn fs(i: Vout) -> @location(0) vec4f {
   let base = i.color.rgb;
   let a    = i.color.a * sc.alpha_mul;
   let t    = a;
-  let L    = normalize(sc.light_pos - i.world_pos);
   let V    = normalize(sc.cam_pos   - i.world_pos);
   var N    = normalize(i.normal);
   if (dot(N, V) < 0.0) {
     N = -N;
   }
-  let lc   = sc.light_color.rgb;
 
-  if (sc.light_model == 0u) {
-    // flat — vertex color only, no lighting
-    return vec4f(base * t, a);
-  } else if (sc.light_model == 1u) {
-    // lambert — ambient + diffuse
-    let ambient  = 0.28 * base;
-    let diff     = max(dot(N, L), 0.0);
-    let diffuse  = diff * lc * base;
-    let lit = ambient + diffuse;
-    return vec4f(lit * t, a);
-  } else {
-    // blinn_phong — ambient + diffuse + specular
-    let ambient  = 0.28 * base;
-    let diff     = max(dot(N, L), 0.0);
-    let diffuse  = diff * lc * base;
-    let H        = normalize(L + V);
-    let spec     = pow(max(dot(N, H), 0.0), 64.0);
-    // For translucent surfaces, reduce mirror-like highlights more aggressively.
-    // Without this, stacked alpha layers can look overly bright.
-    let specular = spec * lc * (0.5 * a);
-    let lit = (ambient + diffuse) * t + specular;
-    return vec4f(lit, a);
+  var diffuse = vec3f(0.0, 0.0, 0.0);
+  var specular = vec3f(0.0, 0.0, 0.0);
+  if (sc.light_count > 0u) {
+    let occ0 = shadowOcclusion0(i.world_pos.xy);
+    let vis0 = 1.0 - occ0;
+    let L0 = normalize(sc.light0_pos - i.world_pos);
+    let lc0 = sc.light0_color.rgb;
+    let diff0 = max(dot(N, L0), 0.0);
+    diffuse += (vis0 * diff0) * lc0 * base;
+    let H0 = normalize(L0 + V);
+    let spec0 = pow(max(dot(N, H0), 0.0), 40.0);
+    specular += (vis0 * spec0) * lc0 * (1.8 * a);
   }
+  if (sc.light_count > 1u) {
+    let occ1 = shadowOcclusion1(i.world_pos.xy);
+    let vis1 = 1.0 - occ1;
+    let L1 = normalize(sc.light1_pos - i.world_pos);
+    let lc1 = sc.light1_color.rgb;
+    let diff1 = max(dot(N, L1), 0.0);
+    diffuse += (vis1 * diff1) * lc1 * base;
+    let H1 = normalize(L1 + V);
+    let spec1 = pow(max(dot(N, H1), 0.0), 40.0);
+    specular += (vis1 * spec1) * lc1 * (1.8 * a);
+  }
+  let ambient2 = 0.10 * base;
+  let lit2 = (ambient2 + diffuse) * t + specular;
+  return vec4f(lit2, a);
 }
 `;
 
@@ -214,11 +305,11 @@ fn fs_pick() -> @location(0) vec2<u32> {
     return M;
   }
 
-  // Uniform buffer: 192 bytes
-  var UB_SIZE = 192;
+  // Uniform buffer: 496 bytes
+  var UB_SIZE = 496;
 
-  // light_model name -> int
-  var LIGHT_MODELS = { flat: 0, lambert: 1, blinn_phong: 2, phong: 2 };
+  // Legacy names all normalize to the single renderer lighting path.
+  var LIGHT_MODELS = { flat: 2, lambert: 2, blinn_phong: 2, phong: 2 };
 
   // ---------------------------------------------------------------------------
   // Shared device (one per page; requestDevice() limit in WebView2)
@@ -291,9 +382,17 @@ fn fs_pick() -> @location(0) vec2<u32> {
         });
         var plLayout = device.createPipelineLayout({ bindGroupLayouts: [bindLayout] });
 
-        var makeDesc = function (topo, cullMode, transparent, vertexEntry, buffers) {
+        var makeDesc = function (topo, cullMode, transparent, vertexEntry, buffers, blendMode) {
           var targets = [{ format: format }];
-          if (transparent) {
+          if (blendMode === "multiply") {
+            targets = [{
+              format: format,
+              blend: {
+                color: { srcFactor: "dst", dstFactor: "zero", operation: "add" },
+                alpha: { srcFactor: "zero", dstFactor: "one", operation: "add" },
+              },
+            }];
+          } else if (transparent) {
             targets = [{
               format: format,
               blend: {
@@ -309,7 +408,7 @@ fn fs_pick() -> @location(0) vec2<u32> {
             primitive: { topology: topo },
             multisample: { count: SAMPLE_COUNT },
             depthStencil: {
-              depthWriteEnabled: transparent ? false : true,
+              depthWriteEnabled: (transparent || blendMode === "multiply") ? false : true,
               depthCompare: "less",
               format: "depth24plus",
             },
@@ -318,11 +417,12 @@ fn fs_pick() -> @location(0) vec2<u32> {
           return d;
         };
 
-        var pipeTri, pipeLine, pipeTriAlpha, pipeTriAlphaDepth, pipeSphereInst, pipeCylinderInst;
+        var pipeTri, pipeLine, pipeTriAlpha, pipeTriAlphaDepth, pipeTriMultiply, pipeSphereInst, pipeCylinderInst;
         if (typeof device.createRenderPipelineAsync === "function") {
           pipeTri  = await device.createRenderPipelineAsync(makeDesc("triangle-list"));
           pipeLine = await device.createRenderPipelineAsync(makeDesc("line-list"));
           pipeTriAlpha = await device.createRenderPipelineAsync(makeDesc("triangle-list", null, true));
+          pipeTriMultiply = await device.createRenderPipelineAsync(makeDesc("triangle-list", null, false, null, null, "multiply"));
           pipeSphereInst = await device.createRenderPipelineAsync(
             makeDesc("triangle-list", null, false, "vs_sphere_instance", [vbufDesc, sphereInstDesc])
           );
@@ -347,6 +447,7 @@ fn fs_pick() -> @location(0) vec2<u32> {
           pipeTri  = device.createRenderPipeline(makeDesc("triangle-list"));
           pipeLine = device.createRenderPipeline(makeDesc("line-list"));
           pipeTriAlpha = device.createRenderPipeline(makeDesc("triangle-list", null, true));
+          pipeTriMultiply = device.createRenderPipeline(makeDesc("triangle-list", null, false, null, null, "multiply"));
           pipeSphereInst = device.createRenderPipeline(
             makeDesc("triangle-list", null, false, "vs_sphere_instance", [vbufDesc, sphereInstDesc])
           );
@@ -394,7 +495,7 @@ fn fs_pick() -> @location(0) vec2<u32> {
         }
         sharedWgpu = {
           device, format, bindLayout,
-          pipeTri, pipeLine, pipeTriAlpha, pipeTriAlphaDepth,
+          pipeTri, pipeLine, pipeTriAlpha, pipeTriAlphaDepth, pipeTriMultiply,
           pipeSphereInst, pipeCylinderInst,
           pipePick, pickBindLayout
         };
@@ -411,9 +512,9 @@ fn fs_pick() -> @location(0) vec2<u32> {
   }
 
   // ---------------------------------------------------------------------------
-  // Build scene uniform buffer (192 bytes)
+  // Build scene uniform buffer (496 bytes)
   // ---------------------------------------------------------------------------
-  function buildUniform(mvp, model, camera, lights, lightModel, alphaMul) {
+  function buildUniform(mvp, model, camera, lights, lightModel, alphaMul, meshLike) {
     var buf = new ArrayBuffer(UB_SIZE);
     var f32 = new Float32Array(buf);
     var u32 = new Uint32Array(buf);
@@ -426,18 +527,57 @@ fn fs_pick() -> @location(0) vec2<u32> {
     // cam_pos (3 f32 @ offset 32)
     f32[32] = camera[0]; f32[33] = camera[1]; f32[34] = camera[2]; f32[35] = 0;
 
-    // light_pos (3 f32 @ offset 36)
-    var lp = lights && lights.length ? lights[0].pos : [0, 10, 10];
-    f32[36] = lp[0]; f32[37] = lp[1]; f32[38] = lp[2]; f32[39] = 0;
+    // light0_pos (3 f32 @ offset 36)
+    var lp0 = lights && lights.length ? lights[0].pos : [0, 10, 10];
+    f32[36] = lp0[0]; f32[37] = lp0[1]; f32[38] = lp0[2]; f32[39] = 0;
 
-    // light_color (4 f32 @ offset 40)
-    var lc = lights && lights.length ? lights[0].color_f32 : [1, 1, 1, 1];
-    f32[40] = lc[0]; f32[41] = lc[1]; f32[42] = lc[2]; f32[43] = lc[3];
+    // light0_color (4 f32 @ offset 40)
+    var lc0 = lights && lights.length ? lights[0].color_f32 : [1, 1, 1, 1];
+    f32[40] = lc0[0]; f32[41] = lc0[1]; f32[42] = lc0[2]; f32[43] = lc0[3];
 
-    // light_model (u32 @ offset 44)
-    u32[44] = lightModel;
-    f32[45] = Number(alphaMul);
-    if (!Number.isFinite(f32[45])) { f32[45] = 1.0; }
+    // light1_pos (3 f32 @ offset 44)
+    var lp1 = lights && lights.length > 1 ? lights[1].pos : [0, 10, 10];
+    f32[44] = lp1[0]; f32[45] = lp1[1]; f32[46] = lp1[2]; f32[47] = 0;
+
+    // light1_color (4 f32 @ offset 48)
+    var lc1 = lights && lights.length > 1 ? lights[1].color_f32 : [0, 0, 0, 1];
+    f32[48] = lc1[0]; f32[49] = lc1[1]; f32[50] = lc1[2]; f32[51] = lc1[3];
+
+    // light_count, light_model, alpha_mul
+    u32[52] = Math.min(2, lights && lights.length ? lights.length : 1);
+    u32[53] = lightModel;
+    f32[54] = Number(alphaMul);
+    if (!Number.isFinite(f32[54])) { f32[54] = 1.0; }
+    var shadowHulls = meshLike && Array.isArray(meshLike.shadow_hulls)
+      ? meshLike.shadow_hulls
+      : [Array.isArray(meshLike && meshLike.shadow_hull) ? meshLike.shadow_hull : []];
+    var shadowSoftnesses = meshLike && Array.isArray(meshLike.shadow_softnesses)
+      ? meshLike.shadow_softnesses
+      : [Number(meshLike && meshLike.shadow_softness) || 0.0];
+    var shadowHull0 = Array.isArray(shadowHulls[0]) ? shadowHulls[0] : [];
+    var shadowHull1 = Array.isArray(shadowHulls[1]) ? shadowHulls[1] : [];
+    var shadowCount0 = Math.min(8, shadowHull0.length);
+    var shadowCount1 = Math.min(8, shadowHull1.length);
+    u32[55] = shadowCount0;
+    u32[56] = shadowCount1;
+    f32[57] = Math.max(0.0, Number(shadowSoftnesses[0]) || 0.0);
+    f32[58] = Math.max(0.0, Number(shadowSoftnesses[1]) || 0.0);
+    for (var si = 0; si < shadowCount0; si += 1) {
+      var p = shadowHull0[si];
+      var base = 60 + (si * 4);
+      f32[base] = Number(p[0]) || 0;
+      f32[base + 1] = Number(p[1]) || 0;
+      f32[base + 2] = 0;
+      f32[base + 3] = 0;
+    }
+    for (var sj = 0; sj < shadowCount1; sj += 1) {
+      var p1 = shadowHull1[sj];
+      var base1 = 92 + (sj * 4);
+      f32[base1] = Number(p1[0]) || 0;
+      f32[base1 + 1] = Number(p1[1]) || 0;
+      f32[base1 + 2] = 0;
+      f32[base1 + 3] = 0;
+    }
 
     return f32;
   }
@@ -569,6 +709,7 @@ fn fs_pick() -> @location(0) vec2<u32> {
     this._pipeTri    = null;
     this._pipeLine   = null;
     this._pipeTriAlpha = null;
+    this._pipeTriMultiply = null;
     this._pipeSphereInst = null;
     this._pipeCylinderInst = null;
     this._bindLayout = null;
@@ -1006,9 +1147,10 @@ fn fs_pick() -> @location(0) vec2<u32> {
           }
           var lmNamePart = partMesh.light_model || mesh.light_model || lightsNormPart[0].model || "blinn_phong";
           var lmIntPart = LIGHT_MODELS[lmNamePart] !== undefined ? LIGHT_MODELS[lmNamePart] : 2;
-          var ubPart = buildUniform(mvpPart, modelMatPart, posPart, lightsNormPart, lmIntPart, resolveAlphaMul(partMesh));
+          var ubPart = buildUniform(mvpPart, modelMatPart, posPart, lightsNormPart, lmIntPart, resolveAlphaMul(partMesh), partMesh);
           this._device.queue.writeBuffer(part.uniformBuf, 0, ubPart);
-          var isTransparentPart = !!partMesh.transparent && part.topology === "triangle-list";
+          var isMultiplyPart = part.topology === "triangle-list" && String(partMesh.blend_mode || "") === "multiply";
+          var isTransparentPart = !!partMesh.transparent && part.topology === "triangle-list" && !isMultiplyPart;
           var useTransparentDepthPart = isTransparentPart && !!partMesh.depth_write;
           var pipePart = part.instanceKind === "sphere-list"
             ? this._pipeSphereInst
@@ -1016,6 +1158,7 @@ fn fs_pick() -> @location(0) vec2<u32> {
                 part.instanceKind === "cylinder-list"
                   ? this._pipeCylinderInst
                   : (
+                      isMultiplyPart && this._pipeTriMultiply ? this._pipeTriMultiply :
                       part.topology === "line-list"
                         ? this._pipeLine
                         : (
@@ -1165,7 +1308,7 @@ fn fs_pick() -> @location(0) vec2<u32> {
       var lmInt  = LIGHT_MODELS[lmName] !== undefined ? LIGHT_MODELS[lmName] : 2;
 
       // --- Build + upload uniform ---
-      var ub = buildUniform(mvp, modelMat, pos, lightsNorm, lmInt, resolveAlphaMul(mesh));
+      var ub = buildUniform(mvp, modelMat, pos, lightsNorm, lmInt, resolveAlphaMul(mesh), mesh);
       this._device.queue.writeBuffer(this._uniformBuf, 0, ub);
       // --- Draw ---
       this._ensureDepth();
@@ -1186,11 +1329,13 @@ fn fs_pick() -> @location(0) vec2<u32> {
           depthStoreOp:    "store",
         },
       });
-      var isTransparent = !!mesh.transparent && this._topology === "triangle-list";
+      var isMultiply = this._topology === "triangle-list" && String(mesh.blend_mode || "") === "multiply";
+      var isTransparent = !!mesh.transparent && this._topology === "triangle-list" && !isMultiply;
       var useTransparentDepth = isTransparent && !!mesh.depth_write;
       var pipe = this._topology === "line-list"
         ? this._pipeLine
         : (
+            isMultiply && this._pipeTriMultiply ? this._pipeTriMultiply :
             useTransparentDepth && this._pipeTriAlphaDepth ? this._pipeTriAlphaDepth :
             (isTransparent && this._pipeTriAlpha ? this._pipeTriAlpha : this._pipeTri)
           );
@@ -1332,6 +1477,7 @@ fn fs_pick() -> @location(0) vec2<u32> {
     this._pipeLine   = sg.pipeLine;
     this._pipeTriAlpha = sg.pipeTriAlpha || null;
     this._pipeTriAlphaDepth = sg.pipeTriAlphaDepth || null;
+    this._pipeTriMultiply = sg.pipeTriMultiply || null;
     this._pipeSphereInst = sg.pipeSphereInst || null;
     this._pipeCylinderInst = sg.pipeCylinderInst || null;
     this._ctx = c.getContext("webgpu");

@@ -172,7 +172,7 @@
         height: Number(light.height || 3.2),
         theta: Number(light.theta || 0),
         angular_velocity: Number(light.angular_velocity || 0),
-        model: light.model || "flat",
+        model: light.model || "blinn_phong",
         color: light.color || "white"
       }],
       unified_renderer: true
