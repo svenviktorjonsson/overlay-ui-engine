@@ -80,6 +80,11 @@
     };
   }
 
+  function toVec2(value, fallback) {
+    if (!Array.isArray(value) || value.length !== 2) { return fallback.slice(); }
+    return [Number(value[0]), Number(value[1])];
+  }
+
   function pushVertex(out, p, normal, color) {
     out.push(
       Number(p[0]), Number(p[1]), Number(p[2]),
@@ -217,7 +222,7 @@
     pushVertex(verts, [cx - half, cy + half, z], [0, 0, 1], plane.color);
     return {
       type: "field_mesh",
-      id: "ground_plane",
+      id: String(plane.id || "ground_plane"),
       topology: "triangle-list",
       vertices: verts,
       indices: [0, 1, 2, 0, 2, 3],
@@ -246,6 +251,66 @@
     return hull.length >= 3 ? hull : null;
   }
 
+  function normalizeMeshSpec(mesh) {
+    var spec = mesh || {};
+    var kind = String(spec.kind || "");
+    if (kind !== "cube" && kind !== "quad") {
+      failFast("mesh.kind must be cube or quad");
+    }
+    if (kind === "cube") {
+      return {
+        id: String(spec.id || "cube"),
+        kind: "cube",
+        center: toVec3(spec.center, [0, 0, 1.1]),
+        size: Number(spec.size || 1.6),
+        face_color: toRgba(spec.face_color || spec.color, [0.96, 0.22, 0.16, 1.0])
+      };
+    }
+    return {
+      id: String(spec.id || "plane"),
+      kind: "quad",
+      center: toVec2(spec.center, [0.0, 0.0]),
+      size: Number(spec.size || 7.0),
+      z: Number(spec.z || 0.0),
+      color: toRgba(spec.color, [0.20, 0.22, 0.26, 1.0])
+    };
+  }
+
+  function buildMeshPayload(mesh, shadowHulls, shadowSoftnesses) {
+    if (mesh.kind === "cube") {
+      return cubeMesh(mesh, mesh.face_color);
+    }
+    return planeMesh(mesh, shadowHulls, shadowSoftnesses);
+  }
+
+  function projectOccludersHull(occluders, plane, lightPos, shadow) {
+    if (!shadow.enabled) { return null; }
+    var projected2d = [];
+    for (var i = 0; i < occluders.length; i += 1) {
+      var cube = occluders[i];
+      if (!cube || cube.kind !== "cube") { continue; }
+      var vertices = makeCubeVertices(cube.center, cube.size);
+      for (var v = 0; v < vertices.length; v += 1) {
+        var projected = projectPointToPlane(vertices[v], lightPos, plane.z);
+        if (projected) {
+          projected2d.push([projected[0], projected[1]]);
+        }
+      }
+    }
+    var hull = convexHull(projected2d);
+    return hull.length >= 3 ? hull : null;
+  }
+
+  function projectOccludersSoftness(light, occluders, plane, hull) {
+    var maxSoftness = 0.0;
+    for (var i = 0; i < occluders.length; i += 1) {
+      var cube = occluders[i];
+      if (!cube || cube.kind !== "cube") { continue; }
+      maxSoftness = Math.max(maxSoftness, shadowSoftness(light, cube, plane, hull));
+    }
+    return maxSoftness;
+  }
+
   function shadowSoftness(light, cube, plane, hull) {
     if (!light || !light.casts_shadow || !Array.isArray(hull) || hull.length < 3) {
       return 0.0;
@@ -271,33 +336,7 @@
   }
 
   function renderPayload(seconds) {
-    var cubeSpec = config.cube || {};
-    var planeSpec = config.plane || {};
-    var compareCubeSpec = config.compare_cube || null;
-    var comparePlaneSpec = config.compare_plane || null;
     var shadowSpec = config.shadow || {};
-    var cube = {
-      center: toVec3(cubeSpec.center, [0, 0, 1.1]),
-      size: Number(cubeSpec.size || 1.6),
-      face_color: toRgba(cubeSpec.face_color, [0.96, 0.22, 0.16, 1.0])
-    };
-    var plane = {
-      center: Array.isArray(planeSpec.center) ? [Number(planeSpec.center[0] || 0.0), Number(planeSpec.center[1] || 0.0)] : [0.0, 0.0],
-      size: Number(planeSpec.size || 7.0),
-      z: Number(planeSpec.z || 0.0),
-      color: toRgba(planeSpec.color, [0.20, 0.22, 0.26, 1.0])
-    };
-    var compareCube = !compareCubeSpec ? null : {
-      center: toVec3(compareCubeSpec.center, [3.4, 0.0, 1.8]),
-      size: Number(compareCubeSpec.size || cube.size || 1.6),
-      face_color: toRgba(compareCubeSpec.face_color, cube.face_color || [0.96, 0.22, 0.16, 1.0])
-    };
-    var comparePlane = !comparePlaneSpec ? null : {
-      center: Array.isArray(comparePlaneSpec.center) ? [Number(comparePlaneSpec.center[0] || 0.0), Number(comparePlaneSpec.center[1] || 0.0)] : [3.4, 0.0],
-      size: Number(comparePlaneSpec.size || plane.size || 7.0),
-      z: Number(comparePlaneSpec.z == null ? plane.z : comparePlaneSpec.z),
-      color: toRgba(comparePlaneSpec.color, plane.color || [0.20, 0.22, 0.26, 1.0])
-    };
     var shadow = {
       enabled: shadowSpec.enabled !== false,
       color: toRgba(shadowSpec.color, [0.0, 0.0, 0.0, 0.30]),
@@ -308,23 +347,45 @@
       ? config.lights
       : [config.light || {}];
     var lights = lightSpecs.map(function (entry) { return normalizeLight(entry, seconds); });
-    var shadowHulls = lights.map(function (light) {
-      return light.casts_shadow ? shadowHull(cube, plane, light.pos, shadow) : null;
-    });
-    var shadowSoftnesses = lights.map(function (light, index) {
-      return shadowSoftness(light, cube, plane, shadowHulls[index]);
-    });
-    var meshes = [planeMesh(plane, shadowHulls, shadowSoftnesses)];
-    meshes.push(cubeMesh(cube, cube.face_color));
-    if (compareCube && comparePlane) {
-      var compareShadowHulls = lights.map(function (light) {
-        return light.casts_shadow ? shadowHull(compareCube, comparePlane, light.pos, shadow) : null;
+    var meshSpecs = Array.isArray(config.meshes) ? config.meshes.map(normalizeMeshSpec) : [];
+    var receivers = Array.isArray(config.shadow_receivers) ? config.shadow_receivers : [];
+    var meshById = Object.create(null);
+    for (var meshIndex = 0; meshIndex < meshSpecs.length; meshIndex += 1) {
+      meshById[meshSpecs[meshIndex].id] = meshSpecs[meshIndex];
+    }
+    var meshes = [];
+    var receiverIds = Object.create(null);
+    for (var receiverIndex = 0; receiverIndex < receivers.length; receiverIndex += 1) {
+      var receiver = receivers[receiverIndex] || {};
+      var receiverMesh = meshById[String(receiver.receiver_mesh || "")];
+      if (!receiverMesh || receiverMesh.kind !== "quad") {
+        continue;
+      }
+      receiverIds[receiverMesh.id] = true;
+      var lightIds = Array.isArray(receiver.lights) ? receiver.lights.map(String) : [];
+      var occluders = Array.isArray(receiver.occluders)
+        ? receiver.occluders.map(function (id) { return meshById[String(id || "")]; }).filter(Boolean)
+        : [];
+      var shadowHulls = lights.map(function (lightSpec, lightIndex) {
+        var lightId = String((lightSpecs[lightIndex] && lightSpecs[lightIndex].id) || lightSpec.id || ("light_" + lightIndex));
+        if (lightIds.length && lightIds.indexOf(lightId) < 0) {
+          return null;
+        }
+        return lightSpec.casts_shadow ? projectOccludersHull(occluders, receiverMesh, lightSpec.pos, shadow) : null;
       });
-      var compareShadowSoftnesses = lights.map(function (light, index) {
-        return shadowSoftness(light, compareCube, comparePlane, compareShadowHulls[index]);
+      var shadowSoftnesses = lights.map(function (lightSpec, lightIndex) {
+        var lightId = String((lightSpecs[lightIndex] && lightSpecs[lightIndex].id) || lightSpec.id || ("light_" + lightIndex));
+        if (lightIds.length && lightIds.indexOf(lightId) < 0) {
+          return 0.0;
+        }
+        return projectOccludersSoftness(lightSpec, occluders, receiverMesh, shadowHulls[lightIndex]);
       });
-      meshes.push(planeMesh(comparePlane, compareShadowHulls, compareShadowSoftnesses));
-      meshes.push(cubeMesh(compareCube, compareCube.face_color));
+      meshes.push(buildMeshPayload(receiverMesh, shadowHulls, shadowSoftnesses));
+    }
+    for (var i = 0; i < meshSpecs.length; i += 1) {
+      var mesh = meshSpecs[i];
+      if (receiverIds[mesh.id]) { continue; }
+      meshes.push(buildMeshPayload(mesh, [], []));
     }
     var geom = {};
     geom[String(config.frame_id)] = {
