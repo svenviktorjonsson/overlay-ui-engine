@@ -58,30 +58,34 @@ struct Scene {
   light1_pos : vec3<f32>,     // 12 bytes  offset 176
   _pad2      : f32,           // 4 bytes   offset 188
   light1_color: vec4<f32>,    // 16 bytes  offset 192
-  light_count: u32,           // 4 bytes   offset 208
-  light_model: u32,           // 4 bytes   offset 212
-  alpha_mul  : f32,           // 4 bytes   offset 216
-  shadow0_count: u32,         // 4 bytes   offset 220
-  shadow1_count: u32,         // 4 bytes   offset 224
-  shadow0_softness: f32,      // 4 bytes   offset 228
-  shadow1_softness: f32,      // 4 bytes   offset 232
-  _pad3      : f32,           // 4 bytes   offset 236
-  shadow0_pts0 : vec4<f32>,   // 16 bytes  offset 240
-  shadow0_pts1 : vec4<f32>,   // 16 bytes  offset 256
-  shadow0_pts2 : vec4<f32>,   // 16 bytes  offset 272
-  shadow0_pts3 : vec4<f32>,   // 16 bytes  offset 288
-  shadow0_pts4 : vec4<f32>,   // 16 bytes  offset 304
-  shadow0_pts5 : vec4<f32>,   // 16 bytes  offset 320
-  shadow0_pts6 : vec4<f32>,   // 16 bytes  offset 336
-  shadow0_pts7 : vec4<f32>,   // 16 bytes  offset 352
-  shadow1_pts0 : vec4<f32>,   // 16 bytes  offset 368
-  shadow1_pts1 : vec4<f32>,   // 16 bytes  offset 384
-  shadow1_pts2 : vec4<f32>,   // 16 bytes  offset 400
-  shadow1_pts3 : vec4<f32>,   // 16 bytes  offset 416
-  shadow1_pts4 : vec4<f32>,   // 16 bytes  offset 432
-  shadow1_pts5 : vec4<f32>,   // 16 bytes  offset 448
-  shadow1_pts6 : vec4<f32>,   // 16 bytes  offset 464
-  shadow1_pts7 : vec4<f32>,   // 16 bytes  offset 480
+  light0_dir_intensity: vec4<f32>, // 16 bytes offset 208
+  light1_dir_intensity: vec4<f32>, // 16 bytes offset 224
+  light0_spot_params: vec4<f32>,   // 16 bytes offset 240
+  light1_spot_params: vec4<f32>,   // 16 bytes offset 256
+  light_count: u32,           // 4 bytes   offset 272
+  light_model: u32,           // 4 bytes   offset 276
+  alpha_mul  : f32,           // 4 bytes   offset 280
+  shadow0_count: u32,         // 4 bytes   offset 284
+  shadow1_count: u32,         // 4 bytes   offset 288
+  shadow0_softness: f32,      // 4 bytes   offset 292
+  shadow1_softness: f32,      // 4 bytes   offset 296
+  _pad3      : f32,           // 4 bytes   offset 300
+  shadow0_pts0 : vec4<f32>,   // 16 bytes  offset 304
+  shadow0_pts1 : vec4<f32>,   // 16 bytes  offset 320
+  shadow0_pts2 : vec4<f32>,   // 16 bytes  offset 336
+  shadow0_pts3 : vec4<f32>,   // 16 bytes  offset 352
+  shadow0_pts4 : vec4<f32>,   // 16 bytes  offset 368
+  shadow0_pts5 : vec4<f32>,   // 16 bytes  offset 384
+  shadow0_pts6 : vec4<f32>,   // 16 bytes  offset 400
+  shadow0_pts7 : vec4<f32>,   // 16 bytes  offset 416
+  shadow1_pts0 : vec4<f32>,   // 16 bytes  offset 432
+  shadow1_pts1 : vec4<f32>,   // 16 bytes  offset 448
+  shadow1_pts2 : vec4<f32>,   // 16 bytes  offset 464
+  shadow1_pts3 : vec4<f32>,   // 16 bytes  offset 480
+  shadow1_pts4 : vec4<f32>,   // 16 bytes  offset 496
+  shadow1_pts5 : vec4<f32>,   // 16 bytes  offset 512
+  shadow1_pts6 : vec4<f32>,   // 16 bytes  offset 528
+  shadow1_pts7 : vec4<f32>,   // 16 bytes  offset 544
 }
 @group(0) @binding(0) var<uniform> sc: Scene;
 
@@ -159,6 +163,29 @@ fn shadowOcclusion0(p: vec2<f32>) -> f32 {
     occ = occ * edgeOcclusion(side, edgeLen, sc.shadow0_softness);
   }
   return occ;
+}
+
+fn lightAttenuation(dist: f32, intensity: f32, range: f32) -> f32 {
+  let base = max(intensity, 0.0) / max(dist * dist, 1.0);
+  if (range <= 1e-6) {
+    return base;
+  }
+  if (dist >= range) {
+    return 0.0;
+  }
+  let x = clamp(dist / range, 0.0, 1.0);
+  let fade = 1.0 - (x * x);
+  return base * (fade * fade) / max(dist * dist, 1.0);
+}
+
+fn spotlightFactor(coneDir: vec3<f32>, pointDir: vec3<f32>, innerCos: f32, outerCos: f32, kindCode: f32) -> f32 {
+  if (kindCode < 0.5) {
+    return 1.0;
+  }
+  let c = dot(normalize(coneDir), normalize(pointDir));
+  let inner = max(innerCos, outerCos);
+  let outer = min(innerCos, outerCos);
+  return smoothstep(outer, inner, c);
 }
 
 fn shadowOcclusion1(p: vec2<f32>) -> f32 {
@@ -241,24 +268,34 @@ fn fs(i: Vout) -> @location(0) vec4f {
   if (sc.light_count > 0u) {
     let occ0 = shadowOcclusion0(i.world_pos.xy);
     let vis0 = 1.0 - occ0;
-    let L0 = normalize(sc.light0_pos - i.world_pos);
+    let toLight0 = sc.light0_pos - i.world_pos;
+    let dist0 = max(length(toLight0), 1e-6);
+    let L0 = toLight0 / dist0;
     let lc0 = sc.light0_color.rgb;
+    let atten0 = lightAttenuation(dist0, sc.light0_dir_intensity.w, sc.light0_spot_params.z);
+    let spot0 = spotlightFactor(sc.light0_dir_intensity.xyz, -L0, sc.light0_spot_params.x, sc.light0_spot_params.y, sc.light0_spot_params.w);
+    let litScale0 = vis0 * atten0 * spot0;
     let diff0 = max(dot(N, L0), 0.0);
-    diffuse += (vis0 * diff0) * lc0 * base;
+    diffuse += (litScale0 * diff0) * lc0 * base;
     let H0 = normalize(L0 + V);
     let spec0 = pow(max(dot(N, H0), 0.0), 40.0);
-    specular += (vis0 * spec0) * lc0 * (1.8 * a);
+    specular += (litScale0 * spec0) * lc0 * (1.8 * a);
   }
   if (sc.light_count > 1u) {
     let occ1 = shadowOcclusion1(i.world_pos.xy);
     let vis1 = 1.0 - occ1;
-    let L1 = normalize(sc.light1_pos - i.world_pos);
+    let toLight1 = sc.light1_pos - i.world_pos;
+    let dist1 = max(length(toLight1), 1e-6);
+    let L1 = toLight1 / dist1;
     let lc1 = sc.light1_color.rgb;
+    let atten1 = lightAttenuation(dist1, sc.light1_dir_intensity.w, sc.light1_spot_params.z);
+    let spot1 = spotlightFactor(sc.light1_dir_intensity.xyz, -L1, sc.light1_spot_params.x, sc.light1_spot_params.y, sc.light1_spot_params.w);
+    let litScale1 = vis1 * atten1 * spot1;
     let diff1 = max(dot(N, L1), 0.0);
-    diffuse += (vis1 * diff1) * lc1 * base;
+    diffuse += (litScale1 * diff1) * lc1 * base;
     let H1 = normalize(L1 + V);
     let spec1 = pow(max(dot(N, H1), 0.0), 40.0);
-    specular += (vis1 * spec1) * lc1 * (1.8 * a);
+    specular += (litScale1 * spec1) * lc1 * (1.8 * a);
   }
   let ambient2 = 0.10 * base;
   let lit2 = (ambient2 + diffuse) * t + specular;
@@ -305,8 +342,8 @@ fn fs_pick() -> @location(0) vec2<u32> {
     return M;
   }
 
-  // Uniform buffer: 496 bytes
-  var UB_SIZE = 496;
+  // Uniform buffer: 560 bytes
+  var UB_SIZE = 560;
 
   // Legacy names all normalize to the single renderer lighting path.
   var LIGHT_MODELS = { flat: 2, lambert: 2, blinn_phong: 2, phong: 2 };
@@ -512,7 +549,7 @@ fn fs_pick() -> @location(0) vec2<u32> {
   }
 
   // ---------------------------------------------------------------------------
-  // Build scene uniform buffer (496 bytes)
+  // Build scene uniform buffer (560 bytes)
   // ---------------------------------------------------------------------------
   function buildUniform(mvp, model, camera, lights, lightModel, alphaMul, meshLike) {
     var buf = new ArrayBuffer(UB_SIZE);
@@ -543,11 +580,33 @@ fn fs_pick() -> @location(0) vec2<u32> {
     var lc1 = lights && lights.length > 1 ? lights[1].color_f32 : [0, 0, 0, 1];
     f32[48] = lc1[0]; f32[49] = lc1[1]; f32[50] = lc1[2]; f32[51] = lc1[3];
 
+    // light0_dir_intensity (4 f32 @ offset 52)
+    var ld0 = lights && lights.length ? lights[0].direction_f32 : [0, 0, -1];
+    f32[52] = ld0[0]; f32[53] = ld0[1]; f32[54] = ld0[2];
+    f32[55] = lights && lights.length ? (Number(lights[0].intensity) || 0) : 0;
+
+    // light1_dir_intensity (4 f32 @ offset 56)
+    var ld1 = lights && lights.length > 1 ? lights[1].direction_f32 : [0, 0, -1];
+    f32[56] = ld1[0]; f32[57] = ld1[1]; f32[58] = ld1[2];
+    f32[59] = lights && lights.length > 1 ? (Number(lights[1].intensity) || 0) : 0;
+
+    // light0_spot_params (4 f32 @ offset 60)
+    f32[60] = lights && lights.length ? (Number(lights[0].inner_cone_cos) || -1) : -1;
+    f32[61] = lights && lights.length ? (Number(lights[0].outer_cone_cos) || -1) : -1;
+    f32[62] = lights && lights.length ? (Number(lights[0].range) || 0) : 0;
+    f32[63] = lights && lights.length ? (Number(lights[0].kind_code) || 0) : 0;
+
+    // light1_spot_params (4 f32 @ offset 64)
+    f32[64] = lights && lights.length > 1 ? (Number(lights[1].inner_cone_cos) || -1) : -1;
+    f32[65] = lights && lights.length > 1 ? (Number(lights[1].outer_cone_cos) || -1) : -1;
+    f32[66] = lights && lights.length > 1 ? (Number(lights[1].range) || 0) : 0;
+    f32[67] = lights && lights.length > 1 ? (Number(lights[1].kind_code) || 0) : 0;
+
     // light_count, light_model, alpha_mul
-    u32[52] = Math.min(2, lights && lights.length ? lights.length : 1);
-    u32[53] = lightModel;
-    f32[54] = Number(alphaMul);
-    if (!Number.isFinite(f32[54])) { f32[54] = 1.0; }
+    u32[68] = Math.min(2, lights && lights.length ? lights.length : 1);
+    u32[69] = lightModel;
+    f32[70] = Number(alphaMul);
+    if (!Number.isFinite(f32[70])) { f32[70] = 1.0; }
     var shadowHulls = meshLike && Array.isArray(meshLike.shadow_hulls)
       ? meshLike.shadow_hulls
       : [Array.isArray(meshLike && meshLike.shadow_hull) ? meshLike.shadow_hull : []];
@@ -558,13 +617,13 @@ fn fs_pick() -> @location(0) vec2<u32> {
     var shadowHull1 = Array.isArray(shadowHulls[1]) ? shadowHulls[1] : [];
     var shadowCount0 = Math.min(8, shadowHull0.length);
     var shadowCount1 = Math.min(8, shadowHull1.length);
-    u32[55] = shadowCount0;
-    u32[56] = shadowCount1;
-    f32[57] = Math.max(0.0, Number(shadowSoftnesses[0]) || 0.0);
-    f32[58] = Math.max(0.0, Number(shadowSoftnesses[1]) || 0.0);
+    u32[71] = shadowCount0;
+    u32[72] = shadowCount1;
+    f32[73] = Math.max(0.0, Number(shadowSoftnesses[0]) || 0.0);
+    f32[74] = Math.max(0.0, Number(shadowSoftnesses[1]) || 0.0);
     for (var si = 0; si < shadowCount0; si += 1) {
       var p = shadowHull0[si];
-      var base = 60 + (si * 4);
+      var base = 76 + (si * 4);
       f32[base] = Number(p[0]) || 0;
       f32[base + 1] = Number(p[1]) || 0;
       f32[base + 2] = 0;
@@ -572,7 +631,7 @@ fn fs_pick() -> @location(0) vec2<u32> {
     }
     for (var sj = 0; sj < shadowCount1; sj += 1) {
       var p1 = shadowHull1[sj];
-      var base1 = 92 + (sj * 4);
+      var base1 = 108 + (sj * 4);
       f32[base1] = Number(p1[0]) || 0;
       f32[base1 + 1] = Number(p1[1]) || 0;
       f32[base1 + 2] = 0;
@@ -661,6 +720,52 @@ fn fs_pick() -> @location(0) vec2<u32> {
     return fallback.slice();
   }
 
+  function normalizeVec3(v, fallback) {
+    var out = vec3Or(v, fallback);
+    var len = Math.sqrt((out[0] * out[0]) + (out[1] * out[1]) + (out[2] * out[2]));
+    if (!(len > 1e-9)) {
+      return fallback.slice();
+    }
+    return [out[0] / len, out[1] / len, out[2] / len];
+  }
+
+  function clampPositiveNumber(value, fallback) {
+    var n = Number(value);
+    if (!Number.isFinite(n)) { return fallback; }
+    return Math.max(0, n);
+  }
+
+  function normalizeLightKind(kind) {
+    var raw = String(kind == null ? "point" : kind).toLowerCase().trim();
+    if (raw === "spotlight") { return "spot"; }
+    if (raw !== "point" && raw !== "spot") { return "point"; }
+    return raw;
+  }
+
+  function radiansFromDegrees(value, fallbackDeg) {
+    var deg = Number(value);
+    if (!Number.isFinite(deg)) { deg = fallbackDeg; }
+    return deg * (Math.PI / 180.0);
+  }
+
+  function resolveLightDirection(light, pos) {
+    light = light || {};
+    if (Array.isArray(light.direction) && light.direction.length >= 3) {
+      return normalizeVec3(light.direction, [0, 0, -1]);
+    }
+    if (Array.isArray(light.dir) && light.dir.length >= 3) {
+      return normalizeVec3(light.dir, [0, 0, -1]);
+    }
+    if (Array.isArray(light.target) && light.target.length >= 3) {
+      return normalizeVec3([
+        Number(light.target[0]) - Number(pos[0]),
+        Number(light.target[1]) - Number(pos[1]),
+        Number(light.target[2]) - Number(pos[2])
+      ], [0, 0, -1]);
+    }
+    return [0, 0, -1];
+  }
+
   function resolveLightPosition(light, t) {
     light = light || {};
     var target = vec3Or(light.target, [0, 0, 0]);
@@ -690,10 +795,24 @@ fn fs_pick() -> @location(0) vec2<u32> {
 
   function normalizeLight(light, t) {
     light = light || {};
+    var pos = resolveLightPosition(light, t);
+    var kind = normalizeLightKind(light.kind);
+    var intensity = clampPositiveNumber(light.intensity != null ? light.intensity : light.power, 24.0);
+    var range = clampPositiveNumber(light.range, 0.0);
+    var innerRad = radiansFromDegrees(light.inner_cone_deg, 14.0);
+    var outerRad = radiansFromDegrees(light.outer_cone_deg, 22.0);
     return {
-      pos: resolveLightPosition(light, t),
+      pos: pos,
+      target: vec3Or(light.target, [0, 0, 0]),
       color_f32: parseColor(light.color || "white"),
       model: light.model || "blinn_phong",
+      intensity: intensity,
+      direction_f32: resolveLightDirection(light, pos),
+      kind: kind,
+      kind_code: kind === "spot" ? 1.0 : 0.0,
+      inner_cone_cos: Math.cos(Math.min(innerRad, outerRad)),
+      outer_cone_cos: Math.cos(Math.max(innerRad, outerRad)),
+      range: range,
     };
   }
 

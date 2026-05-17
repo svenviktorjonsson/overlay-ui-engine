@@ -55,6 +55,12 @@
   var lightTurnsPerCycle = Number(lightCfg.turns_per_cycle || 2.0);
   var lightModel = lightCfg.model || "blinn_phong";
   var lightColor = lightCfg.color || [1.0, 0.93, 0.78, 1.0];
+  var lightKind = String(lightCfg.kind || "point");
+  var lightDirection = Array.isArray(lightCfg.direction) ? [Number(lightCfg.direction[0]), Number(lightCfg.direction[1]), Number(lightCfg.direction[2])] : null;
+  var lightIntensity = Math.max(0.0, Number(lightCfg.intensity == null ? (lightCfg.power == null ? 24.0 : lightCfg.power) : lightCfg.intensity));
+  var lightInnerConeDeg = Number(lightCfg.inner_cone_deg == null ? 14.0 : lightCfg.inner_cone_deg);
+  var lightOuterConeDeg = Number(lightCfg.outer_cone_deg == null ? 22.0 : lightCfg.outer_cone_deg);
+  var lightRange = Math.max(0.0, Number(lightCfg.range == null ? 0.0 : lightCfg.range));
   var runtime = {
     running: false,
     lastFrameIndex: -1,
@@ -380,7 +386,13 @@
         pos: [0, 0, 0],
         target: lightTarget,
         model: lightModel,
-        color: lightColor
+        color: lightColor,
+        kind: lightKind,
+        direction: lightDirection,
+        intensity: lightIntensity,
+        inner_cone_deg: lightInnerConeDeg,
+        outer_cone_deg: lightOuterConeDeg,
+        range: lightRange
       };
       runtime.scene = {
         parts: runtime.geometryArena.parts(),

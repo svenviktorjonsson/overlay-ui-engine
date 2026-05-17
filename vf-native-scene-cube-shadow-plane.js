@@ -69,11 +69,19 @@
 
   function normalizeLight(light, seconds) {
     var resolved = light || {};
+    var target = toVec3(resolved.target, [0, 0, 0]);
+    var pos = currentLightPosition(resolved, seconds);
     return {
-      pos: currentLightPosition(resolved, seconds),
-      target: toVec3(resolved.target, [0, 0, 0]),
+      pos: pos,
+      target: target,
       model: String(resolved.model || "blinn_phong"),
       color: toRgba(resolved.color, [1.0, 0.95, 0.84, 1.0]),
+      kind: String(resolved.kind || "point"),
+      direction: Array.isArray(resolved.direction) ? toVec3(resolved.direction, [0, 0, -1]) : undefined,
+      intensity: Math.max(0.0, Number(resolved.intensity == null ? (resolved.power == null ? 24.0 : resolved.power) : resolved.intensity)),
+      inner_cone_deg: Number(resolved.inner_cone_deg == null ? 14.0 : resolved.inner_cone_deg),
+      outer_cone_deg: Number(resolved.outer_cone_deg == null ? 22.0 : resolved.outer_cone_deg),
+      range: Math.max(0.0, Number(resolved.range == null ? 0.0 : resolved.range)),
       casts_shadow: resolved.casts_shadow !== false,
       source_radius: Math.max(0.0, Number(resolved.source_radius || 0.0)),
       spread: Math.max(0.0, Number(resolved.spread == null ? 1.0 : resolved.spread))

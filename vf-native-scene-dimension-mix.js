@@ -59,12 +59,24 @@
     var target = toVec3(light.target, fallback.target);
     var model = String(light.model || fallback.model);
     var color = Array.isArray(light.color) ? toRgba(light.color, fallback.color) : (light.color || fallback.color);
+    var kind = String(light.kind || fallback.kind || "point");
+    var intensity = Math.max(0.0, Number(light.intensity == null ? (light.power == null ? (fallback.intensity == null ? 24.0 : fallback.intensity) : light.power) : light.intensity));
+    var direction = Array.isArray(light.direction) ? toVec3(light.direction, [0, 0, -1]) : (Array.isArray(fallback.direction) ? toVec3(fallback.direction, [0, 0, -1]) : undefined);
+    var innerConeDeg = Number(light.inner_cone_deg == null ? (fallback.inner_cone_deg == null ? 14.0 : fallback.inner_cone_deg) : light.inner_cone_deg);
+    var outerConeDeg = Number(light.outer_cone_deg == null ? (fallback.outer_cone_deg == null ? 22.0 : fallback.outer_cone_deg) : light.outer_cone_deg);
+    var range = Math.max(0.0, Number(light.range == null ? (fallback.range == null ? 0.0 : fallback.range) : light.range));
     if (light.pos) {
       return {
         pos: toVec3(light.pos, fallback.pos),
         target: target,
         model: model,
-        color: color
+        color: color,
+        kind: kind,
+        direction: direction,
+        intensity: intensity,
+        inner_cone_deg: innerConeDeg,
+        outer_cone_deg: outerConeDeg,
+        range: range
       };
     }
     var radius = Number(light.radius == null ? fallback.radius : light.radius);
@@ -76,7 +88,13 @@
       pos: [target[0] + (Math.cos(angle) * radius), target[1] + (Math.sin(angle) * radius), target[2] + height],
       target: target,
       model: model,
-      color: color
+      color: color,
+      kind: kind,
+      direction: direction,
+      intensity: intensity,
+      inner_cone_deg: innerConeDeg,
+      outer_cone_deg: outerConeDeg,
+      range: range
     };
   }
 
