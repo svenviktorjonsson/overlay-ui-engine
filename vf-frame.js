@@ -183,7 +183,7 @@
       const hitRegions = [];
       function paintPadDipForElement(el) {
         if (!(el instanceof HTMLElement)) return 2;
-        let pad = 2;
+        let pad = 24;
         try {
           const cs = globalThis.getComputedStyle ? globalThis.getComputedStyle(el) : null;
           const bs = cs && cs.boxShadow ? String(cs.boxShadow) : "";

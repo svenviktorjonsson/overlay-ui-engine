@@ -170,7 +170,7 @@
   flex: 1;
   min-height: 0;
   padding: 10px 12px 14px;
-  overflow: auto;
+  overflow: hidden;
   border-radius: 0 0 10px 10px;
   background: rgba(28, 28, 34, calc(0.92 * var(--vf-ui-alpha, 1)));
 }
@@ -365,6 +365,7 @@
   bottom: 0;
   width: 18px;
   height: 18px;
+  z-index: 10000;
   cursor: default;
   pointer-events: none;
   display: none;
