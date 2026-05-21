@@ -27,6 +27,25 @@
     var displayRefresh = options.displayRefresh || function() {};
     var isLegacyFallbackActive = options.isLegacyFallbackActive || function() { return false; };
 
+    function runtimeFail(message) {
+      var text = String(message || "runtime scene failure");
+      try { runtimeLog("error", text); } catch (_) {}
+      throw new Error(text);
+    }
+
+    function reapplySpecRect(panel, spec, phase) {
+      try {
+        applySpecRectToPanel(panel, spec);
+      } catch (error) {
+        runtimeFail(
+          "applySceneCommands: layout reapply failed during " +
+          String(phase || "layout") +
+          ": " +
+          (error && error.message ? error.message : String(error))
+        );
+      }
+    }
+
     function syncNativeLayout() {
       var deps = createRuntimeDependencies();
       var layer = getLayer();
@@ -65,6 +84,35 @@
       var availH = Math.max(1, parentH - padT - padB);
       var fw = Math.max(1, Math.round(w * availW));
       var fh = Math.max(1, Math.round(h * availH));
+      var aspect = String(
+        (panel && panel.root && panel.root.dataset && panel.root.dataset.vfAspect) ||
+        (spec && spec.aspect) ||
+        ""
+      ).trim().toLowerCase();
+      if (aspect === "equal") {
+        var rootEl = panel && panel.root ? panel.root : null;
+        var bodyEl = panel && panel.body ? panel.body : null;
+        var headerEl = rootEl ? rootEl.querySelector(".vf-frame__header") : null;
+        var headerH = 34;
+        var chromeExtra = 2;
+        if (headerEl && typeof headerEl.getBoundingClientRect === "function") {
+          headerH = Math.max(1, Math.round(headerEl.getBoundingClientRect().height || 34));
+        }
+        if (rootEl && bodyEl &&
+            typeof rootEl.getBoundingClientRect === "function" &&
+            typeof bodyEl.getBoundingClientRect === "function") {
+          var rootRect = rootEl.getBoundingClientRect();
+          var bodyRect = bodyEl.getBoundingClientRect();
+          var measuredChrome = Math.round((rootRect.height || 0) - (bodyRect.height || 0));
+          if (measuredChrome > 0) {
+            headerH = measuredChrome;
+            chromeExtra = 0;
+          }
+        }
+        var bodyFit = Math.max(1, Math.min(fw, Math.max(1, fh - headerH - chromeExtra)));
+        fw = bodyFit;
+        fh = bodyFit + headerH + chromeExtra;
+      }
       var v = k.charAt(0);
       var hz = k.charAt(1);
       var ax = padL + x * availW;
@@ -129,12 +177,10 @@
       var widgets = deps.widgets;
       var layer = getLayer();
       if (!Array.isArray(data)) {
-        runtimeLog("warn", "applySceneCommands: expected array");
-        return;
+        runtimeFail("applySceneCommands: expected array");
       }
       if (!layer || !frame) {
-        runtimeLog("warn", "applySceneCommands: runtime shell not booted");
-        return;
+        runtimeFail("applySceneCommands: runtime shell not booted");
       }
       var upsertCount = data.filter(function(c) { return c && c.kind === "frame_upsert"; }).length;
       runtimeLog("info", "applySceneCommands: " + data.length + " commands, " + upsertCount + " frame_upserts");
@@ -210,34 +256,18 @@
           advanced = true;
         }
         if (!advanced) {
-          for (var j = 0; j < nextPending.length; j++) {
-            var fallbackSpec = nextPending[j].payload.spec || {};
-            var fallbackId = fallbackSpec.id != null ? String(fallbackSpec.id) : "frame?";
-            var fallbackPanel = frame.mount(layer, {
-              id: fallbackId,
-              title: fallbackSpec.title != null ? String(fallbackSpec.title) : "",
-              titleAlign: "left",
-              inLayerDrag: true,
-              draggable: true,
-              dockable: true,
-              resizable: true,
-              closable: true,
-              alpha: frame._coerceAlpha(fallbackSpec.alpha, 1),
-              master: fallbackSpec.master === true,
-              dockLocation: "bl",
-              zIndexBase: 1000 + j * 2
-            });
-            panelById[fallbackId] = fallbackPanel;
-            applySpecRectToPanel(fallbackPanel, fallbackSpec);
-            mounted.push({ panel: fallbackPanel, spec: fallbackSpec });
-            if (fallbackSpec.body && Array.isArray(fallbackSpec.body) && fallbackSpec.body.length && widgets && widgets.mount) {
-              widgets.mount(fallbackPanel, fallbackId, fallbackSpec.body, fallbackSpec.body_layout);
-            }
-          }
-          break;
+          var unresolved = nextPending.map(function(cmd) {
+            var unresolvedSpec = cmd && cmd.payload && cmd.payload.spec ? cmd.payload.spec : {};
+            var unresolvedId = unresolvedSpec.id != null ? String(unresolvedSpec.id) : "frame?";
+            var unresolvedParent = unresolvedSpec.parent_id != null ? String(unresolvedSpec.parent_id) : "";
+            return unresolvedId + (unresolvedParent ? ' -> parent "' + unresolvedParent + '"' : "");
+          });
+          runtimeFail("applySceneCommands: unresolved parent frame references: " + unresolved.join(", "));
         }
         pending = nextPending;
-        if (pass > upserts.length + 2) { break; }
+        if (pass > upserts.length + 2) {
+          runtimeFail("applySceneCommands: exceeded frame resolution passes");
+        }
       }
       syncNativeLayout();
       if (isLegacyFallbackActive()) {
@@ -245,13 +275,13 @@
       }
       global.requestAnimationFrame(function() {
         for (var m = 0; m < mounted.length; m++) {
-          try { applySpecRectToPanel(mounted[m].panel, mounted[m].spec); } catch (_) {}
+          reapplySpecRect(mounted[m].panel, mounted[m].spec, "post-mount frame");
         }
       });
       global.requestAnimationFrame(function() {
         global.requestAnimationFrame(function() {
           for (var m = 0; m < mounted.length; m++) {
-            try { applySpecRectToPanel(mounted[m].panel, mounted[m].spec); } catch (_) {}
+            reapplySpecRect(mounted[m].panel, mounted[m].spec, "settled frame");
           }
           syncNativeLayout();
           if (isLegacyFallbackActive()) {

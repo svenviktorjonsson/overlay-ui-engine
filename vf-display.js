@@ -2276,6 +2276,122 @@
     });
   }
 
+  function mountOffscreenGeomFrame(fid, provider, width, height) {
+    if (typeof provider !== "function") {
+      throw new Error("mountOffscreenGeomFrame(" + String(fid) + "): provider must be a function");
+    }
+    var Ctor = global.VfGeomWgpu;
+    if (!Ctor) {
+      throw new Error("mountOffscreenGeomFrame(" + String(fid) + "): VfGeomWgpu not loaded");
+    }
+    var AdapterCtor = global.VfGeomFrameAdapter;
+    if (!AdapterCtor || typeof AdapterCtor.createAdapter !== "function") {
+      throw new Error("mountOffscreenGeomFrame(" + String(fid) + "): VfGeomFrameAdapter not loaded");
+    }
+    if (!frameRecs[fid]) { frameRecs[fid] = { entries: [] }; }
+    var rec = frameRecs[fid];
+    if (!rec.dynamicAdapter) {
+      rec.dynamicAdapter = AdapterCtor.createAdapter({
+        provider: provider,
+        buildScene: _buildDynamicGeomScene
+      });
+    } else {
+      rec.dynamicAdapter.replaceProvider(provider);
+    }
+    var targetW = Math.max(1, Math.round(Number(width || 1) || 1));
+    var targetH = Math.max(1, Math.round(Number(height || 1) || 1));
+    rec.offscreenWidth = targetW;
+    rec.offscreenHeight = targetH;
+    if (!rec.offscreenCanvas) {
+      var canvas = document.createElement("canvas");
+      canvas.width = targetW;
+      canvas.height = targetH;
+      canvas.style.position = "fixed";
+      canvas.style.left = "-10000px";
+      canvas.style.top = "-10000px";
+      canvas.style.width = targetW + "px";
+      canvas.style.height = targetH + "px";
+      canvas.style.pointerEvents = "none";
+      canvas.setAttribute("aria-hidden", "true");
+      document.body.appendChild(canvas);
+      rec.offscreenCanvas = canvas;
+    } else {
+      rec.offscreenCanvas.width = targetW;
+      rec.offscreenCanvas.height = targetH;
+      rec.offscreenCanvas.style.width = targetW + "px";
+      rec.offscreenCanvas.style.height = targetH + "px";
+    }
+    if (rec.entries.length > 0 && rec.entries[0] && rec.entries[0].renderer) {
+      var existing = rec.entries[0].renderer;
+      global.__vfFrameRenderers[String(fid)] = existing;
+      if (rec.dynamicAdapter) {
+        rec.dynamicAdapter.onHostResize(rec.offscreenWidth, rec.offscreenHeight);
+        rec.dynamicAdapter.markDirty();
+      }
+      if (existing && existing._device && typeof existing.onResize === "function") {
+        existing.onResize();
+      }
+      return;
+    }
+    var entry = { renderer: null, ref: null, _logCount: 0, resizeObserver: null, resizeRaf: 0, canvas: rec.offscreenCanvas };
+    rec.entries = [entry];
+    var refHolder = {
+      get mesh() {
+        if (!rec.dynamicAdapter) { return null; }
+        try {
+          return rec.dynamicAdapter.currentScene();
+        } catch (err) {
+          vlog("error", err && err.message ? err.message : String(err));
+          return null;
+        }
+      }
+    };
+    entry.ref = refHolder;
+    var r = new Ctor(rec.offscreenCanvas, function() { return refHolder.mesh; });
+    entry.renderer = r;
+    r._frameId = String(fid);
+    r._offscreenFrame = true;
+    r._debugSetFrameTextureTargetSize = function (w, h) {
+      var nextW = Math.max(1, Math.round(Number(w || 1) || 1));
+      var nextH = Math.max(1, Math.round(Number(h || 1) || 1));
+      if (rec.offscreenWidth === nextW && rec.offscreenHeight === nextH) {
+        return;
+      }
+      rec.offscreenWidth = nextW;
+      rec.offscreenHeight = nextH;
+      if (rec.offscreenCanvas) {
+        rec.offscreenCanvas.width = nextW;
+        rec.offscreenCanvas.height = nextH;
+        rec.offscreenCanvas.style.width = nextW + "px";
+        rec.offscreenCanvas.style.height = nextH + "px";
+      }
+      if (rec.dynamicAdapter) {
+        rec.dynamicAdapter.onHostResize(nextW, nextH);
+      }
+      if (r && r._device && typeof r.onResize === "function") {
+        r.onResize();
+      }
+    };
+    global.__vfFrameRenderers[String(fid)] = r;
+    r.init().then(function(ok) {
+      if (!ok) {
+        entry.initError = global.__vfGeomWgpuLastError || "renderer init returned false";
+        vlog("error", "mountOffscreenGeomFrame [" + fid + "]: renderer init FAILED");
+        return;
+      }
+      entry.initError = "";
+      vlog("info", "mountOffscreenGeomFrame [" + fid + "]: renderer init OK, starting render loop");
+      prewarmGeomRenderer(r);
+      if (rec.dynamicAdapter) {
+        rec.dynamicAdapter.onHostResize(rec.offscreenWidth, rec.offscreenHeight);
+      }
+      r.start();
+    }).catch(function(err) {
+      entry.initError = (err && err.message ? err.message : String(err));
+      vlog("error", "mountOffscreenGeomFrame [" + fid + "]: renderer init threw: " + (err && err.message ? err.message : String(err)));
+    });
+  }
+
   var LINKED_TEXTURE_SHADER = `
 struct Flip {
   flip_u : f32,
@@ -2850,6 +2966,7 @@ fn fsMain(in : VOut) -> @location(0) vec4<f32> {
     applyRuntimePacket: applyRuntimePacket,
     redrawCurrentDisplay: redrawCurrentDisplay,
     mountDynamicGeomFrame: mountDynamicGeomFrame,
+    mountOffscreenGeomFrame: mountOffscreenGeomFrame,
     mountLinkedMirrorTextureFrame: mountLinkedMirrorTextureFrame,
     mountLedgerGeomFrame: mountLedgerGeomFrame,
     requestDynamicGeomFrameUpdate: requestDynamicGeomFrameUpdate,

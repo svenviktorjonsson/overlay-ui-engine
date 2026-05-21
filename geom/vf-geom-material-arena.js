@@ -54,6 +54,39 @@
     ]);
   }
 
+  function normalizeTexture(source) {
+    if (!source || typeof source !== "object") {
+      return null;
+    }
+    var kind = String(source.kind || "").toLowerCase().trim();
+    if (kind !== "checker" && kind !== "stripes" && kind !== "dice" && kind !== "face_cube") {
+      fail("texture kind must be 'checker', 'stripes', 'dice', or 'face_cube'");
+    }
+    var defaultScale = kind === "face_cube" ? [1, 1] : [8, 8];
+    var scale = Array.isArray(source.scale) ? source.scale : defaultScale;
+    var sx = Number(scale[0]);
+    var sy = Number(scale[1]);
+    if (!(sx > 0)) { sx = defaultScale[0]; }
+    if (!(sy > 0)) { sy = defaultScale[1]; }
+    var rotation = Array.isArray(source.rotation) ? source.rotation : [0, 0, 0];
+    var rx = Number(rotation[0]);
+    var ry = Number(rotation[1]);
+    var rz = Number(rotation[2]);
+    if (!isFinite(rx)) { rx = 0; }
+    if (!isFinite(ry)) { ry = 0; }
+    if (!isFinite(rz)) { rz = 0; }
+    return {
+      kind: kind,
+      space: "triplanar",
+      scale: [sx, sy],
+      color_a: Array.prototype.slice.call(toColorArray(source.color_a, [0.18, 0.22, 0.30, 1.0])),
+      color_b: Array.prototype.slice.call(toColorArray(source.color_b, [0.90, 0.92, 0.98, 1.0])),
+      rotation: [rx, ry, rz],
+      graph_test: source.graph_test === true,
+      graph_width_px: Math.max(0, Number(source.graph_width_px || 0))
+    };
+  }
+
   function normalizeMaterial(id, spec) {
     var source = spec || {};
     var baseColor = toColorArray(source.base_color || source.color, [1, 1, 1, 1]);
@@ -65,7 +98,8 @@
       alpha: alpha,
       transparent: source.transparent === true || alpha < 0.999,
       depth_write: source.depth_write === true,
-      light_model: normalizeLightModel(source.light_model)
+      light_model: normalizeLightModel(source.light_model),
+      texture: normalizeTexture(source.texture)
     };
   }
 
@@ -117,6 +151,9 @@
       }
       if (resolved.color == null) {
         resolved.color = Array.prototype.slice.call(material.base_color);
+      }
+      if (resolved.texture == null && material.texture != null) {
+        resolved.texture = material.texture;
       }
       return resolved;
     }
