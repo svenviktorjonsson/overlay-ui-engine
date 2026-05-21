@@ -138,6 +138,8 @@ fn fs_blit(in : VOut) -> @location(0) vec4<f32> {
         args = args && typeof args === "object" ? args : {};
         var part = args.part || null;
         var surfaceCamera = args.surfaceCamera || null;
+        var viewerPos = Array.isArray(args.viewerPos) ? vec3Or(args.viewerPos, [0.0, 0.0, 0.0]) : null;
+        var clipToMirrorPlane = args.clipToMirrorPlane === true;
         var timeMs = Number(args.timeMs || 0.0) || 0.0;
         var targetAspect = Math.max(1e-4, Number(args.targetAspect || 1.0) || 1.0);
         var math = args.math || getMath();
@@ -152,13 +154,17 @@ fn fs_blit(in : VOut) -> @location(0) vec4<f32> {
           plane,
           Array.isArray(plane.points) ? plane.points : [],
           normalizeVec3(surfaceCamera.up || [0, 0, 1], [0, 0, 1]),
-          normalizeVec3(subVec3(surfaceCamera.target, surfaceCamera.pos), [0, 1, 0])
+          null
         );
         var near = 0.05;
         var far = 500.0;
         var eye = vec3Or(surfaceCamera.pos, [0.0, 0.0, 0.0]);
         var mirrorCorners = mirrorWorldCorners(plane);
-        var basis = orientMirrorBasisForEye(mirrorCorners, eye);
+        var basis = orientMirrorBasisForEye(
+          mirrorCorners,
+          eye,
+          normalizeVec3(surfaceCamera.up || [0, 0, 1], [0, 0, 1])
+        );
         var va = subVec3(basis.bottomLeft, eye);
         var vb = subVec3(basis.bottomRight, eye);
         var vc = subVec3(basis.topLeft, eye);
@@ -173,36 +179,31 @@ fn fs_blit(in : VOut) -> @location(0) vec4<f32> {
         if (!(Math.abs(right - left) > 1e-6) || !(Math.abs(top - bottom) > 1e-6)) {
           failFast("mirror aperture camera computed a collapsed off-axis frustum");
         }
-        var currentWidth = Math.abs(right - left);
-        var currentHeight = Math.abs(top - bottom);
-        var currentAspect = currentWidth / Math.max(1e-6, currentHeight);
-        if (Math.abs(currentAspect - targetAspect) > 1e-6) {
-          if (currentAspect < targetAspect) {
-            var cx = 0.5 * (left + right);
-            var halfW = 0.5 * currentHeight * targetAspect;
-            left = cx - halfW;
-            right = cx + halfW;
-          } else {
-            var cy = 0.5 * (bottom + top);
-            var halfH = 0.5 * currentWidth / targetAspect;
-            bottom = cy - halfH;
-            top = cy + halfH;
-          }
-        }
-        var returnedUp = basis.up.slice();
-        var returnedForward = scaleVec3(basis.backward, -1.0);
-        if (Math.abs(dotVec3(returnedForward, returnedUp)) > 0.999) {
-          returnedUp = orthogonalUnitVector(returnedForward);
-        }
-        var target = addVec3(eye, returnedForward);
+        void targetAspect;
+        var returnedUp = [0.0, 0.0, 1.0];
+        var target = plane.point.slice();
         var view = mat4FromCameraBasis(eye, basis.right, basis.up, basis.backward);
         var projection = mat4FrustumOffCenterZ01(left, right, bottom, top, near, far);
+        if (clipToMirrorPlane === true) {
+          var frontNormalWorld = plane.normal.slice();
+          if (viewerPos && dotVec3(frontNormalWorld, subVec3(viewerPos, plane.point)) < 0.0) {
+            frontNormalWorld = scaleVec3(frontNormalWorld, -1.0);
+          }
+          var clipPlanePointWorld = addVec3(plane.point, scaleVec3(frontNormalWorld, 1e-3));
+          var clipNormalWorld = frontNormalWorld.slice();
+          if (dotVec3(clipNormalWorld, subVec3(eye, clipPlanePointWorld)) > 0.0) {
+            clipNormalWorld = scaleVec3(clipNormalWorld, -1.0);
+          }
+          var clipPlaneCamera = planeEquationInCameraSpace(view, clipPlanePointWorld, clipNormalWorld);
+          projection = applyObliqueNearPlaneZ01(projection, clipPlaneCamera);
+        }
         var viewProjection = math.mat4Mul(projection, view);
         return {
           pos: eye.slice(),
           target: target.slice(),
           up: returnedUp,
           fov: Number(surfaceCamera.fov == null ? 45.0 : surfaceCamera.fov) || 45.0,
+          flip_x: surfaceCamera.flip_x === true,
           view_matrix: Array.prototype.slice.call(view),
           projection_matrix: Array.prototype.slice.call(projection),
           _mirrorViewProjection: Array.prototype.slice.call(viewProjection),
@@ -233,15 +234,20 @@ fn fs_blit(in : VOut) -> @location(0) vec4<f32> {
           plane,
           Array.isArray(plane.points) ? plane.points : [],
           normalizeVec3(surfaceCamera.up || [0, 0, 1], [0, 0, 1]),
-          normalizeVec3(subVec3(surfaceCamera.target, surfaceCamera.pos), [0, 1, 0])
+          null
         );
         var near = 0.05;
         var far = 500.0;
+        var clipEpsilon = 1e-3;
         var reflectedPos = reflectPointAcrossPlane(surfaceCamera.pos, plane.point, plane.normal);
         var reflectedTarget = reflectPointAcrossPlane(surfaceCamera.target, plane.point, plane.normal);
         var reflectedUp = normalizeVec3(reflectDirAcrossPlane(surfaceCamera.up || [0, 0, 1], plane.normal), [0, 0, 1]);
         var mirrorCorners = mirrorWorldCorners(plane);
-        var basis = orientMirrorBasisForEye(mirrorCorners, reflectedPos);
+        var basis = orientMirrorBasisForEye(
+          mirrorCorners,
+          reflectedPos,
+          normalizeVec3(surfaceCamera.up || [0, 0, 1], [0, 0, 1])
+        );
         var va = subVec3(basis.bottomLeft, reflectedPos);
         var vb = subVec3(basis.bottomRight, reflectedPos);
         var vc = subVec3(basis.topLeft, reflectedPos);
@@ -256,19 +262,21 @@ fn fs_blit(in : VOut) -> @location(0) vec4<f32> {
         if (!(Math.abs(right - left) > 1e-6) || !(Math.abs(top - bottom) > 1e-6)) {
           failFast("mirror surface_system computed a collapsed off-axis frustum");
         }
-        var reflectedForward = scaleVec3(basis.backward, -1.0);
-        var returnedUp = basis.up.slice();
-        if (Math.abs(dotVec3(reflectedForward, returnedUp)) > 0.999) {
-          returnedUp = orthogonalUnitVector(reflectedForward);
-        }
-        var returnedTarget = addVec3(reflectedPos, reflectedForward);
+        void targetAspect;
+        var returnedUp = [0.0, 0.0, 1.0];
+        var returnedTarget = plane.point.slice();
         var view = mat4FromCameraBasis(reflectedPos, basis.right, basis.up, basis.backward);
         var projection = mat4FrustumOffCenterZ01(left, right, bottom, top, near, far);
-        var clipNormalWorld = plane.normal.slice();
-        if (dotVec3(clipNormalWorld, subVec3(reflectedPos, plane.point)) > 0.0) {
+        var frontNormalWorld = plane.normal.slice();
+        if (dotVec3(frontNormalWorld, subVec3(surfaceCamera.pos, plane.point)) < 0.0) {
+          frontNormalWorld = scaleVec3(frontNormalWorld, -1.0);
+        }
+        var clipPlanePointWorld = addVec3(plane.point, scaleVec3(frontNormalWorld, clipEpsilon));
+        var clipNormalWorld = frontNormalWorld.slice();
+        if (dotVec3(clipNormalWorld, subVec3(reflectedPos, clipPlanePointWorld)) > 0.0) {
           clipNormalWorld = scaleVec3(clipNormalWorld, -1.0);
         }
-        var clipPlaneCamera = planeEquationInCameraSpace(view, plane.point, clipNormalWorld);
+        var clipPlaneCamera = planeEquationInCameraSpace(view, clipPlanePointWorld, clipNormalWorld);
         projection = applyObliqueNearPlaneZ01(projection, clipPlaneCamera);
         var viewProjection = math.mat4Mul(projection, view);
         return {
@@ -276,6 +284,7 @@ fn fs_blit(in : VOut) -> @location(0) vec4<f32> {
           target: returnedTarget,
           up: returnedUp,
           fov: Number(surfaceCamera.fov == null ? 45.0 : surfaceCamera.fov) || 45.0,
+          flip_x: surfaceCamera.flip_x === true,
           view_matrix: Array.prototype.slice.call(view),
           projection_matrix: Array.prototype.slice.call(projection),
           _mirrorViewProjection: Array.prototype.slice.call(viewProjection),
@@ -284,6 +293,8 @@ fn fs_blit(in : VOut) -> @location(0) vec4<f32> {
           _mirrorDebug: {
             planePoint: plane.point.slice(),
             planeNormal: plane.normal.slice(),
+            mirrorFrontNormal: frontNormalWorld.slice(),
+            clipPlanePoint: clipPlanePointWorld.slice(),
             reflectedTarget: reflectedTarget.slice(),
             clipPlaneCamera: clipPlaneCamera.slice(),
             frustum: { left: left, right: right, bottom: bottom, top: top, screenDistance: screenDistance }
@@ -300,6 +311,7 @@ fn fs_blit(in : VOut) -> @location(0) vec4<f32> {
   // ---------------------------------------------------------------------------
   var MAX_SHADOW_POINTS = 32;
   var MAX_SURFACE_TRIANGLES = 192;
+  var MAX_LIGHT_APERTURE_POINTS = 8;
 
   var SHADER = `
 struct Scene {
@@ -338,10 +350,28 @@ struct Scene {
   surface_tri_c             : array<vec4<f32>, 192>,
   surface_tri_color         : array<vec4<f32>, 192>,
   surface_projector         : mat4x4<f32>,
+  light0_aperture_plane     : vec4<f32>,
+  light0_aperture_normal    : vec4<f32>,
+  light0_aperture_u         : vec4<f32>,
+  light0_aperture_v         : vec4<f32>,
+  light0_aperture_meta      : vec4<f32>,
+  light1_aperture_plane     : vec4<f32>,
+  light1_aperture_normal    : vec4<f32>,
+  light1_aperture_u         : vec4<f32>,
+  light1_aperture_v         : vec4<f32>,
+  light1_aperture_meta      : vec4<f32>,
+  light0_aperture_pts       : array<vec4<f32>, 8>,
+  light1_aperture_pts       : array<vec4<f32>, 8>,
+  shadow_vp0                : mat4x4<f32>,
+  shadow_vp1                : mat4x4<f32>,
+  shadow_meta               : vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> sc: Scene;
 @group(0) @binding(1) var surfaceSampler: sampler;
 @group(0) @binding(2) var surfaceTex: texture_2d<f32>;
+@group(0) @binding(3) var shadowSampler: sampler_comparison;
+@group(0) @binding(4) var shadowTex0: texture_depth_2d;
+@group(0) @binding(5) var shadowTex1: texture_depth_2d;
 
 struct Vin {
   @location(0) pos   : vec3<f32>,
@@ -385,27 +415,20 @@ fn shadowPoint1(idx: u32) -> vec2<f32> {
   return sc.shadow1_pts[idx].xy;
 }
 
+fn lightAperturePoint0(idx: u32) -> vec2<f32> {
+  return sc.light0_aperture_pts[idx].xy;
+}
+
+fn lightAperturePoint1(idx: u32) -> vec2<f32> {
+  return sc.light1_aperture_pts[idx].xy;
+}
+
 fn edgeOcclusion(side: f32, edgeLen: f32, softness: f32) -> f32 {
   let sd = side / max(edgeLen, 1e-6);
   if (softness <= 1e-6) {
     return select(0.0, 1.0, sd >= 0.0);
   }
   return smoothstep(-softness, softness, sd);
-}
-
-fn shadowOcclusion0(p: vec2<f32>) -> f32 {
-  if (sc.shadow0_count < 3u) {
-    return 0.0;
-  }
-  var occ = 1.0;
-  for (var i: u32 = 0u; i < sc.shadow0_count; i = i + 1u) {
-    let a = shadowPoint0(i);
-    let b = shadowPoint0((i + 1u) % sc.shadow0_count);
-    let side = cross2(a, b, p);
-    let edgeLen = length(b - a);
-    occ = occ * edgeOcclusion(side, edgeLen, sc.shadow0_softness);
-  }
-  return occ;
 }
 
 fn lightAttenuation(dist: f32, intensity: f32, range: f32) -> f32 {
@@ -422,7 +445,7 @@ fn lightAttenuation(dist: f32, intensity: f32, range: f32) -> f32 {
 }
 
 fn spotlightFactor(coneDir: vec3<f32>, pointDir: vec3<f32>, innerCos: f32, outerCos: f32, kindCode: f32) -> f32 {
-  if (kindCode < 0.5) {
+  if (kindCode < 0.5 || kindCode > 1.5) {
     return 1.0;
   }
   let c = dot(normalize(coneDir), normalize(pointDir));
@@ -431,19 +454,154 @@ fn spotlightFactor(coneDir: vec3<f32>, pointDir: vec3<f32>, innerCos: f32, outer
   return smoothstep(outer, inner, c);
 }
 
-fn shadowOcclusion1(p: vec2<f32>) -> f32 {
-  if (sc.shadow1_count < 3u) {
+fn projectedApertureFactor0(worldPos: vec3<f32>, lightPos: vec3<f32>, kindCode: f32) -> f32 {
+  if (kindCode < 1.5) {
+    return 1.0;
+  }
+  let apertureCount = u32(sc.light0_aperture_meta.z + 0.5);
+  if (apertureCount < 3u) {
     return 0.0;
   }
+  let planePoint = sc.light0_aperture_plane.xyz;
+  let planeNormal = normalize(sc.light0_aperture_normal.xyz);
+  let ray = worldPos - lightPos;
+  let denom = dot(planeNormal, ray);
+  if (abs(denom) <= 1e-6) {
+    return 0.0;
+  }
+  let t = dot(planePoint - lightPos, planeNormal) / denom;
+  if (t <= 1e-4 || t >= (1.0 - 1e-4)) {
+    return 0.0;
+  }
+  let hit = lightPos + (t * ray);
+  let rel = hit - planePoint;
+  let local = vec2<f32>(
+    dot(rel, normalize(sc.light0_aperture_u.xyz)),
+    dot(rel, normalize(sc.light0_aperture_v.xyz))
+  );
+  let lightToPlane = max(abs(dot(planePoint - lightPos, planeNormal)), 1e-4);
+  let lightSide = dot(lightPos - planePoint, planeNormal);
+  let pointSide = dot(worldPos - planePoint, planeNormal);
+  let receiverSide = -sign(lightSide) * pointSide;
+  if (receiverSide <= sc.light0_aperture_meta.w) {
+    return 0.0;
+  }
+  let receiverGap = max(0.0, receiverSide - sc.light0_aperture_meta.w);
+  let softness = sc.light0_aperture_meta.x * (receiverGap / lightToPlane) * sc.light0_aperture_meta.y;
   var occ = 1.0;
-  for (var i: u32 = 0u; i < sc.shadow1_count; i = i + 1u) {
-    let a = shadowPoint1(i);
-    let b = shadowPoint1((i + 1u) % sc.shadow1_count);
-    let side = cross2(a, b, p);
+  for (var i: u32 = 0u; i < apertureCount; i = i + 1u) {
+    let a = lightAperturePoint0(i);
+    let b = lightAperturePoint0((i + 1u) % apertureCount);
+    let side = cross2(a, b, local);
     let edgeLen = length(b - a);
-    occ = occ * edgeOcclusion(side, edgeLen, sc.shadow1_softness);
+    occ = occ * edgeOcclusion(side, edgeLen, softness);
   }
   return occ;
+}
+
+fn projectedApertureFactor1(worldPos: vec3<f32>, lightPos: vec3<f32>, kindCode: f32) -> f32 {
+  if (kindCode < 1.5) {
+    return 1.0;
+  }
+  let apertureCount = u32(sc.light1_aperture_meta.z + 0.5);
+  if (apertureCount < 3u) {
+    return 0.0;
+  }
+  let planePoint = sc.light1_aperture_plane.xyz;
+  let planeNormal = normalize(sc.light1_aperture_normal.xyz);
+  let ray = worldPos - lightPos;
+  let denom = dot(planeNormal, ray);
+  if (abs(denom) <= 1e-6) {
+    return 0.0;
+  }
+  let t = dot(planePoint - lightPos, planeNormal) / denom;
+  if (t <= 1e-4 || t >= (1.0 - 1e-4)) {
+    return 0.0;
+  }
+  let hit = lightPos + (t * ray);
+  let rel = hit - planePoint;
+  let local = vec2<f32>(
+    dot(rel, normalize(sc.light1_aperture_u.xyz)),
+    dot(rel, normalize(sc.light1_aperture_v.xyz))
+  );
+  let lightToPlane = max(abs(dot(planePoint - lightPos, planeNormal)), 1e-4);
+  let lightSide = dot(lightPos - planePoint, planeNormal);
+  let pointSide = dot(worldPos - planePoint, planeNormal);
+  let receiverSide = -sign(lightSide) * pointSide;
+  if (receiverSide <= sc.light1_aperture_meta.w) {
+    return 0.0;
+  }
+  let receiverGap = max(0.0, receiverSide - sc.light1_aperture_meta.w);
+  let softness = sc.light1_aperture_meta.x * (receiverGap / lightToPlane) * sc.light1_aperture_meta.y;
+  var occ = 1.0;
+  for (var i: u32 = 0u; i < apertureCount; i = i + 1u) {
+    let a = lightAperturePoint1(i);
+    let b = lightAperturePoint1((i + 1u) % apertureCount);
+    let side = cross2(a, b, local);
+    let edgeLen = length(b - a);
+    occ = occ * edgeOcclusion(side, edgeLen, softness);
+  }
+  return occ;
+}
+
+fn shadowMapVisibility0(worldPos: vec3<f32>, normal: vec3<f32>) -> f32 {
+  if (sc.shadow_meta.x < 0.5) {
+    return 1.0;
+  }
+  let lightDir = normalize(sc.light0_pos.xyz - worldPos);
+  let n = normalize(normal);
+  let cosNl = clamp(dot(n, lightDir), 0.0, 1.0);
+  let clip = sc.shadow_vp0 * vec4<f32>(worldPos, 1.0);
+  if (abs(clip.w) <= 1e-6) {
+    return 1.0;
+  }
+  let ndc = clip.xyz / clip.w;
+  let uv = vec2<f32>((ndc.x * 0.5) + 0.5, (-ndc.y * 0.5) + 0.5);
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z < 0.0 || ndc.z > 1.0) {
+    return 1.0;
+  }
+  let dims = vec2<f32>(textureDimensions(shadowTex0));
+  let texel = vec2<f32>(1.0 / max(dims.x, 1.0), 1.0 / max(dims.y, 1.0));
+  let refDepth = ndc.z - (sc.shadow_meta.y + 0.00045);
+  var vis = 0.0;
+  for (var oy: i32 = -2; oy <= 2; oy = oy + 1) {
+    for (var ox: i32 = -2; ox <= 2; ox = ox + 1) {
+      let w = select(1.0, 2.0, abs(ox) + abs(oy) <= 1);
+      let offset = vec2<f32>(f32(ox) * texel.x, f32(oy) * texel.y);
+      vis = vis + (textureSampleCompareLevel(shadowTex0, shadowSampler, uv + offset, refDepth) * w);
+    }
+  }
+  return vis / 29.0;
+}
+
+fn shadowMapVisibility1(worldPos: vec3<f32>, normal: vec3<f32>) -> f32 {
+  if (sc.shadow_meta.z < 0.5) {
+    return 1.0;
+  }
+  let lightDir = normalize(sc.light1_pos.xyz - worldPos);
+  let n = normalize(normal);
+  let cosNl = clamp(dot(n, lightDir), 0.0, 1.0);
+  let clip = sc.shadow_vp1 * vec4<f32>(worldPos, 1.0);
+  if (abs(clip.w) <= 1e-6) {
+    return 1.0;
+  }
+  let ndc = clip.xyz / clip.w;
+  let uv = vec2<f32>((ndc.x * 0.5) + 0.5, (-ndc.y * 0.5) + 0.5);
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z < 0.0 || ndc.z > 1.0) {
+    return 1.0;
+  }
+  let dims = vec2<f32>(textureDimensions(shadowTex1));
+  let texel = vec2<f32>(1.0 / max(dims.x, 1.0), 1.0 / max(dims.y, 1.0));
+  let refDepth = ndc.z - (sc.shadow_meta.w + 0.00045);
+  var vis = 0.0;
+  for (var oy: i32 = -2; oy <= 2; oy = oy + 1) {
+    for (var ox: i32 = -2; ox <= 2; ox = ox + 1) {
+      let w = select(1.0, 2.0, abs(ox) + abs(oy) <= 1);
+      let offset = vec2<f32>(f32(ox) * texel.x, f32(oy) * texel.y);
+      vis = vis + (textureSampleCompareLevel(shadowTex1, shadowSampler, uv + offset, refDepth) * w);
+    }
+  }
+  return vis / 29.0;
 }
 
 fn checkerValue(p: vec2<f32>) -> f32 {
@@ -848,12 +1006,13 @@ fn litSurfaceTriangleColor(baseColor: vec3<f32>, hitPos: vec3<f32>, a: vec3<f32>
     let L0 = toLight0 / dist0;
     let atten0 = lightAttenuation(dist0, sc.light0_dir_intensity.w, sc.light0_spot_params.z);
     let spot0 = spotlightFactor(sc.light0_dir_intensity.xyz, -L0, sc.light0_spot_params.x, sc.light0_spot_params.y, sc.light0_spot_params.w);
+    let proj0 = projectedApertureFactor0(hitPos, sc.light0_pos, sc.light0_spot_params.w);
     let diff0 = max(dot(facingNormal, L0), 0.0);
-    diffuse += (atten0 * spot0 * diff0) * sc.light0_color.rgb * baseColor;
-    if (diff0 > 0.0) {
+    diffuse += (atten0 * spot0 * proj0 * diff0) * sc.light0_color.rgb * baseColor;
+    if (diff0 > 0.0 && sc.light0_spot_params.w < 1.5) {
       let half0 = normalize(L0 + viewDir);
       let spec0 = pow(max(dot(facingNormal, half0), 0.0), 28.0);
-      specular += (atten0 * spot0 * spec0) * sc.light0_color.rgb * 0.22;
+      specular += (atten0 * spot0 * proj0 * spec0) * sc.light0_color.rgb * 0.22;
     }
   }
   if (sc.light_count > 1u) {
@@ -862,12 +1021,13 @@ fn litSurfaceTriangleColor(baseColor: vec3<f32>, hitPos: vec3<f32>, a: vec3<f32>
     let L1 = toLight1 / dist1;
     let atten1 = lightAttenuation(dist1, sc.light1_dir_intensity.w, sc.light1_spot_params.z);
     let spot1 = spotlightFactor(sc.light1_dir_intensity.xyz, -L1, sc.light1_spot_params.x, sc.light1_spot_params.y, sc.light1_spot_params.w);
+    let proj1 = projectedApertureFactor1(hitPos, sc.light1_pos, sc.light1_spot_params.w);
     let diff1 = max(dot(facingNormal, L1), 0.0);
-    diffuse += (atten1 * spot1 * diff1) * sc.light1_color.rgb * baseColor;
-    if (diff1 > 0.0) {
+    diffuse += (atten1 * spot1 * proj1 * diff1) * sc.light1_color.rgb * baseColor;
+    if (diff1 > 0.0 && sc.light1_spot_params.w < 1.5) {
       let half1 = normalize(L1 + viewDir);
       let spec1 = pow(max(dot(facingNormal, half1), 0.0), 28.0);
-      specular += (atten1 * spot1 * spec1) * sc.light1_color.rgb * 0.22;
+      specular += (atten1 * spot1 * proj1 * spec1) * sc.light1_color.rgb * 0.22;
     }
   }
   if (sc.light_count == 0u) {
@@ -897,42 +1057,19 @@ fn surfaceWorldSceneColor(base: vec3<f32>, localPos: vec3<f32>, worldPos: vec3<f
     return mix(base, sc.texture_color_b.rgb, frameAlpha);
   }
   let viewerDirWorld = normalize(sc.cam_pos - worldPos);
-  let reverseFacing = sc.texture_params.w > 0.5;
+  let screenFlags = i32(sc.texture_params.w + 0.5);
+  let reverseFacing = (screenFlags & 1) != 0;
   let facing = dot(normalize(hostNormal), viewerDirWorld) * select(1.0, -1.0, reverseFacing);
   if (facing <= 1e-4) {
     return base;
   }
-  if (sc.texture_params.x > 4.5) {
-    let clip = sc.surface_projector * vec4f(worldPos, 1.0);
-    if (abs(clip.w) <= 1e-5) {
-      return vec3<f32>(0.0, 0.0, 0.0);
-    }
-    let ndc = clip.xyz / clip.w;
-    if (ndc.z < -1e-4 || ndc.z > 1.0001) {
-      return vec3<f32>(0.0, 0.0, 0.0);
-    }
-    var mirrorUv = vec2<f32>(
-      (ndc.x * 0.5) + 0.5,
-      1.0 - ((ndc.y * 0.5) + 0.5)
-    );
-    let mirrorFlipCode = i32(sc.texture_params.w + 0.5);
-    if ((mirrorFlipCode & 1) != 0) {
-      mirrorUv.x = 1.0 - mirrorUv.x;
-    }
-    if ((mirrorFlipCode & 2) != 0) {
-      mirrorUv.y = 1.0 - mirrorUv.y;
-    }
-    if (mirrorUv.x < -1e-4 || mirrorUv.x > 1.0001 || mirrorUv.y < -1e-4 || mirrorUv.y > 1.0001) {
-      return vec3<f32>(0.0, 0.0, 0.0);
-    }
-    mirrorUv = clamp(mirrorUv, vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));
-    let mirrorColor = textureSampleLevel(surfaceTex, surfaceSampler, mirrorUv, 0.0);
-    return mirrorColor.rgb;
+  var uv = vec2<f32>(
+    clamp(surfaceUv.x, 0.0, 1.0),
+    clamp(surfaceUv.y, 0.0, 1.0)
+  );
+  if ((screenFlags & 2) != 0) {
+    uv.x = 1.0 - uv.x;
   }
-    var uv = vec2<f32>(
-      clamp(surfaceUv.x, 0.0, 1.0),
-      clamp(surfaceUv.y, 0.0, 1.0)
-    );
   let sampleColor = textureSampleLevel(surfaceTex, surfaceSampler, uv, 0.0);
   if (sc.texture_params.x > 3.5) {
     return sampleColor.rgb;
@@ -951,9 +1088,6 @@ fn proceduralTexture(base: vec3<f32>, localPos: vec3<f32>, worldPos: vec3<f32>, 
   let kindCode = sc.texture_params.x;
   if (kindCode < 0.5) {
     return base;
-  }
-  if (kindCode > 4.5) {
-    return surfaceWorldSceneColor(base, localPos, worldPos, normal, surfaceProjPos, false);
   }
   if (kindCode > 3.5) {
     return surfaceWorldSceneColor(base, localPos, worldPos, normal, surfaceProjPos, true);
@@ -1056,36 +1190,36 @@ fn fs(i: Vout) -> @location(0) vec4f {
   var diffuse = vec3f(0.0, 0.0, 0.0);
   var specular = vec3f(0.0, 0.0, 0.0);
   if (sc.light_count > 0u) {
-    let occ0 = shadowOcclusion0(i.world_pos.xy);
-    let vis0 = 1.0 - occ0;
+    let vis0 = shadowMapVisibility0(i.world_pos, N);
     let toLight0 = sc.light0_pos - i.world_pos;
     let dist0 = max(length(toLight0), 1e-6);
     let L0 = toLight0 / dist0;
     let lc0 = sc.light0_color.rgb;
     let atten0 = lightAttenuation(dist0, sc.light0_dir_intensity.w, sc.light0_spot_params.z);
     let spot0 = spotlightFactor(sc.light0_dir_intensity.xyz, -L0, sc.light0_spot_params.x, sc.light0_spot_params.y, sc.light0_spot_params.w);
-    let litScale0 = vis0 * atten0 * spot0;
+    let proj0 = projectedApertureFactor0(i.world_pos, sc.light0_pos, sc.light0_spot_params.w);
+    let litScale0 = vis0 * atten0 * spot0 * proj0;
     let diff0 = max(dot(N, L0), 0.0);
     diffuse += (litScale0 * diff0) * lc0 * base;
-    if (!suppressSpecular) {
+    if (!suppressSpecular && sc.light0_spot_params.w < 1.5) {
       let H0 = normalize(L0 + V);
       let spec0 = pow(max(dot(N, H0), 0.0), 40.0);
       specular += (litScale0 * spec0) * lc0 * (1.8 * a);
     }
   }
   if (sc.light_count > 1u) {
-    let occ1 = shadowOcclusion1(i.world_pos.xy);
-    let vis1 = 1.0 - occ1;
+    let vis1 = shadowMapVisibility1(i.world_pos, N);
     let toLight1 = sc.light1_pos - i.world_pos;
     let dist1 = max(length(toLight1), 1e-6);
     let L1 = toLight1 / dist1;
     let lc1 = sc.light1_color.rgb;
     let atten1 = lightAttenuation(dist1, sc.light1_dir_intensity.w, sc.light1_spot_params.z);
     let spot1 = spotlightFactor(sc.light1_dir_intensity.xyz, -L1, sc.light1_spot_params.x, sc.light1_spot_params.y, sc.light1_spot_params.w);
-    let litScale1 = vis1 * atten1 * spot1;
+    let proj1 = projectedApertureFactor1(i.world_pos, sc.light1_pos, sc.light1_spot_params.w);
+    let litScale1 = vis1 * atten1 * spot1 * proj1;
     let diff1 = max(dot(N, L1), 0.0);
     diffuse += (litScale1 * diff1) * lc1 * base;
-    if (!suppressSpecular) {
+    if (!suppressSpecular && sc.light1_spot_params.w < 1.5) {
       let H1 = normalize(L1 + V);
       let spec1 = pow(max(dot(N, H1), 0.0), 40.0);
       specular += (litScale1 * spec1) * lc1 * (1.8 * a);
@@ -1126,6 +1260,80 @@ fn vs_pick(v: PVin) -> @builtin(position) vec4<f32> {
 @fragment
 fn fs_pick() -> @location(0) vec2<u32> {
   return vec2<u32>(pk.object_id, 0u);
+}
+`;
+
+var SHADOW_SHADER = `
+struct Scene {
+  mvp        : mat4x4<f32>,
+  model      : mat4x4<f32>,
+  cam_pos    : vec3<f32>,
+  _pad0      : f32,
+  light0_pos : vec3<f32>,
+  _pad1      : f32,
+  light0_color: vec4<f32>,
+  light1_pos : vec3<f32>,
+  _pad2      : f32,
+  light1_color: vec4<f32>,
+  light0_dir_intensity: vec4<f32>,
+  light1_dir_intensity: vec4<f32>,
+  light0_spot_params: vec4<f32>,
+  light1_spot_params: vec4<f32>,
+  light_count: u32,
+  light_model: u32,
+  alpha_mul  : f32,
+  shadow0_count: u32,
+  shadow1_count: u32,
+  shadow0_softness: f32,
+  shadow1_softness: f32,
+  _pad3      : f32,
+  shadow0_pts : array<vec4<f32>, 32>,
+  shadow1_pts : array<vec4<f32>, 32>,
+  texture_color_a : vec4<f32>,
+  texture_color_b : vec4<f32>,
+  texture_params  : vec4<f32>,
+  texture_extra   : vec4<f32>,
+  surface_cam_forward_count : vec4<f32>,
+  surface_cam_up_pad        : vec4<f32>,
+  surface_tri_a             : array<vec4<f32>, 192>,
+  surface_tri_b             : array<vec4<f32>, 192>,
+  surface_tri_c             : array<vec4<f32>, 192>,
+  surface_tri_color         : array<vec4<f32>, 192>,
+  surface_projector         : mat4x4<f32>,
+  light0_aperture_plane     : vec4<f32>,
+  light0_aperture_normal    : vec4<f32>,
+  light0_aperture_u         : vec4<f32>,
+  light0_aperture_v         : vec4<f32>,
+  light0_aperture_meta      : vec4<f32>,
+  light1_aperture_plane     : vec4<f32>,
+  light1_aperture_normal    : vec4<f32>,
+  light1_aperture_u         : vec4<f32>,
+  light1_aperture_v         : vec4<f32>,
+  light1_aperture_meta      : vec4<f32>,
+  light0_aperture_pts       : array<vec4<f32>, 8>,
+  light1_aperture_pts       : array<vec4<f32>, 8>,
+  shadow_vp0                : mat4x4<f32>,
+  shadow_vp1                : mat4x4<f32>,
+  shadow_meta               : vec4<f32>,
+}
+@group(0) @binding(0) var<uniform> sc: Scene;
+
+struct Vin {
+  @location(0) pos   : vec3<f32>,
+  @location(1) normal: vec3<f32>,
+  @location(2) color : vec4<f32>,
+}
+
+@vertex
+fn vs_shadow0(v: Vin) -> @builtin(position) vec4<f32> {
+  let wp = (sc.model * vec4<f32>(v.pos, 1.0)).xyz;
+  return sc.shadow_vp0 * vec4<f32>(wp, 1.0);
+}
+
+@vertex
+fn vs_shadow1(v: Vin) -> @builtin(position) vec4<f32> {
+  let wp = (sc.model * vec4<f32>(v.pos, 1.0)).xyz;
+  return sc.shadow_vp1 * vec4<f32>(wp, 1.0);
 }
 `;
 
@@ -1289,13 +1497,8 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     return [cx / cw, cy / cw];
   }
 
-  function screenEdgeFadeNdc(ndcX, ndcY) {
-    var edge = Math.max(Math.abs(Number(ndcX)), Math.abs(Number(ndcY)));
-    return 1.0 - smoothstep(0.72, 1.0, edge);
-  }
-
   // Uniform buffer: scene + shadows + procedural texture params.
-  var UB_SIZE = 14336;
+  var UB_SIZE = 14848;
 
   // Legacy names all normalize to the single renderer lighting path.
   var LIGHT_MODELS = { flat: 2, lambert: 2, blinn_phong: 2, phong: 2 };
@@ -1417,10 +1620,33 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
               binding: 2,
               visibility: GPUShaderStage.FRAGMENT,
               texture: { sampleType: "float" },
+            },
+            {
+              binding: 3,
+              visibility: GPUShaderStage.FRAGMENT,
+              sampler: { type: "comparison" },
+            },
+            {
+              binding: 4,
+              visibility: GPUShaderStage.FRAGMENT,
+              texture: { sampleType: "depth" },
+            },
+            {
+              binding: 5,
+              visibility: GPUShaderStage.FRAGMENT,
+              texture: { sampleType: "depth" },
             }
           ],
         });
         var plLayout = device.createPipelineLayout({ bindGroupLayouts: [bindLayout] });
+        var shadowBindLayout = device.createBindGroupLayout({
+          entries: [{
+            binding: 0,
+            visibility: GPUShaderStage.VERTEX,
+            buffer: { type: "uniform" }
+          }]
+        });
+        var shadowPlLayout = device.createPipelineLayout({ bindGroupLayouts: [shadowBindLayout] });
         var flareLayout = device.createPipelineLayout({ bindGroupLayouts: [] });
 
         var makeDesc = function (topo, cullMode, transparent, vertexEntry, buffers, blendMode) {
@@ -1466,7 +1692,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
           return d;
         };
 
-        var pipeTri, pipeLine, pipeTriAlpha, pipeTriAlphaDepth, pipeTriMultiply, pipeTriAdditive, pipeSphereInst, pipeCylinderInst, pipeFlare;
+        var pipeTri, pipeLine, pipeTriAlpha, pipeTriAlphaDepth, pipeTriMultiply, pipeTriAdditive, pipeSphereInst, pipeCylinderInst, pipeFlare, pipeShadow0, pipeShadow1;
         pipeTri  = device.createRenderPipeline(makeDesc("triangle-list"));
         pipeLine = device.createRenderPipeline(makeDesc("line-list"));
         pipeTriAlpha = device.createRenderPipeline(makeDesc("triangle-list", null, true));
@@ -1508,6 +1734,34 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
         // Picking pipeline — writes rg32uint (object_id, prim_index)
         var pickMod = device.createShaderModule({ code: PICK_SHADER, label: "vf-geom-pick" });
         logShaderCompilationInfo(pickMod, "vf-geom-pick");
+        var shadowMod = device.createShaderModule({ code: SHADOW_SHADER, label: "vf-geom-shadow" });
+        logShaderCompilationInfo(shadowMod, "vf-geom-shadow");
+        pipeShadow0 = device.createRenderPipeline({
+          layout: shadowPlLayout,
+          vertex: { module: shadowMod, entryPoint: "vs_shadow0", buffers: [vbufDesc] },
+          primitive: { topology: "triangle-list", cullMode: "none" },
+          depthStencil: {
+            depthWriteEnabled: true,
+            depthCompare: "less",
+            format: "depth32float",
+            depthBias: 3,
+            depthBiasSlopeScale: 1.5,
+            depthBiasClamp: 0.0
+          }
+        });
+        pipeShadow1 = device.createRenderPipeline({
+          layout: shadowPlLayout,
+          vertex: { module: shadowMod, entryPoint: "vs_shadow1", buffers: [vbufDesc] },
+          primitive: { topology: "triangle-list", cullMode: "none" },
+          depthStencil: {
+            depthWriteEnabled: true,
+            depthCompare: "less",
+            format: "depth32float",
+            depthBias: 3,
+            depthBiasSlopeScale: 1.5,
+            depthBiasClamp: 0.0
+          }
+        });
         var pickBindLayout = device.createBindGroupLayout({
           entries: [{
             binding: 0,
@@ -1555,6 +1809,19 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
           { width: 1, height: 1, depthOrArrayLayers: 1 }
         );
         var defaultSurfaceView = defaultSurfaceTex.createView();
+        var shadowSampler = device.createSampler({
+          compare: "less-equal",
+          magFilter: "linear",
+          minFilter: "linear",
+          addressModeU: "clamp-to-edge",
+          addressModeV: "clamp-to-edge"
+        });
+        var defaultShadowTex = device.createTexture({
+          size: { width: 1, height: 1, depthOrArrayLayers: 1 },
+          format: "depth32float",
+          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+        });
+        var defaultShadowView = defaultShadowTex.createView();
         var frameBlitBindLayout = device.createBindGroupLayout({
           entries: [
             { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } },
@@ -1574,7 +1841,8 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
           device, format, bindLayout,
           pipeTri, pipeLine, pipeTriAlpha, pipeTriAlphaDepth, pipeTriMultiply, pipeTriAdditive,
           pipeSphereInst, pipeCylinderInst, pipeFlare, flareQuadBuf,
-          surfaceSampler, defaultSurfaceView,
+          surfaceSampler, defaultSurfaceView, shadowSampler, defaultShadowView,
+          pipeShadow0, pipeShadow1, shadowBindLayout,
           pipePick, pickBindLayout,
           frameBlitBindLayout, pipeFrameBlit
         };
@@ -1649,36 +1917,10 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     u32[69] = lightModel;
     f32[70] = Number(alphaMul);
     if (!Number.isFinite(f32[70])) { f32[70] = 1.0; }
-    var shadowHulls = meshLike && Array.isArray(meshLike.shadow_hulls)
-      ? meshLike.shadow_hulls
-      : [Array.isArray(meshLike && meshLike.shadow_hull) ? meshLike.shadow_hull : []];
-    var shadowSoftnesses = meshLike && Array.isArray(meshLike.shadow_softnesses)
-      ? meshLike.shadow_softnesses
-      : [Number(meshLike && meshLike.shadow_softness) || 0.0];
-    var shadowHull0 = Array.isArray(shadowHulls[0]) ? shadowHulls[0] : [];
-    var shadowHull1 = Array.isArray(shadowHulls[1]) ? shadowHulls[1] : [];
-    var shadowCount0 = Math.min(MAX_SHADOW_POINTS, shadowHull0.length);
-    var shadowCount1 = Math.min(MAX_SHADOW_POINTS, shadowHull1.length);
-    u32[71] = shadowCount0;
-    u32[72] = shadowCount1;
-    f32[73] = Math.max(0.0, Number(shadowSoftnesses[0]) || 0.0);
-    f32[74] = Math.max(0.0, Number(shadowSoftnesses[1]) || 0.0);
-    for (var si = 0; si < shadowCount0; si += 1) {
-      var p = shadowHull0[si];
-      var base = 76 + (si * 4);
-      f32[base] = Number(p[0]) || 0;
-      f32[base + 1] = Number(p[1]) || 0;
-      f32[base + 2] = 0;
-      f32[base + 3] = 0;
-    }
-    for (var sj = 0; sj < shadowCount1; sj += 1) {
-      var p1 = shadowHull1[sj];
-      var base1 = 76 + (MAX_SHADOW_POINTS * 4) + (sj * 4);
-      f32[base1] = Number(p1[0]) || 0;
-      f32[base1 + 1] = Number(p1[1]) || 0;
-      f32[base1 + 2] = 0;
-      f32[base1 + 3] = 0;
-    }
+    u32[71] = 0;
+    u32[72] = 0;
+    f32[73] = 0.0;
+    f32[74] = 0.0;
     var surfaceSystem = meshLike && meshLike.surface_system && typeof meshLike.surface_system === "object"
       ? meshLike.surface_system
       : null;
@@ -1692,8 +1934,6 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       var runtimeTextureReady = surfaceSystem._runtime_texture_ready !== false;
       if (surfaceKind === "screen" && runtimeTextureReady) {
         textureKind = 4.0;
-      } else if (surfaceKind === "mirror") {
-        textureKind = 5.0;
       }
     } else if (texture) {
       var rawKind = String(texture.kind || "").toLowerCase().trim();
@@ -1752,14 +1992,11 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       f32[341] = sx;
       f32[342] = sy;
       f32[343] = graphWidthPx;
-      if (textureKind > 3.5 && textureKind < 4.5 && surfaceSystem && surfaceSystem.reverse_facing === true) {
-        f32[343] = 1.0;
-      }
-      if (textureKind > 4.5) {
-        var mirrorFlipCode = 0.0;
-        if (surfaceSystem && surfaceSystem._renderFlipU === true) { mirrorFlipCode += 1.0; }
-        if (surfaceSystem && surfaceSystem._renderFlipV === true) { mirrorFlipCode += 2.0; }
-        f32[343] = mirrorFlipCode;
+      if (textureKind > 3.5 && surfaceSystem) {
+        var screenFlags = 0.0;
+        if (surfaceSystem.reverse_facing === true) { screenFlags += 1.0; }
+        if (surfaceSystem.flip_x === true) { screenFlags += 2.0; }
+        f32[343] = screenFlags;
       }
     if (hasSurfaceTriangles) {
       var surfaceCamera = surfaceSystem && surfaceSystem.camera && typeof surfaceSystem.camera === "object"
@@ -1838,23 +2075,6 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       f32[353] = Number(surfaceBounds.vAxis && surfaceBounds.vAxis[1] || 0.0);
       f32[354] = Number(surfaceBounds.vAxis && surfaceBounds.vAxis[2] || 0.0);
       f32[355] = meshLike && meshLike.no_backface_specular === true ? 1.0 : 0.0;
-      if (textureKind > 4.5) {
-        mirrorDebugLog(
-          "attach-" + String(meshLike && meshLike.id || "surface"),
-          "attach shader=viewport-mirror textureKind=" + dbgNum(textureKind) +
-            " id=" + String(meshLike && meshLike.id || "surface") +
-            " bounds=[min=" + dbgVec([surfaceBounds.minX, surfaceBounds.minY]) +
-            " span=" + dbgVec([surfaceBounds.spanX, surfaceBounds.spanY]) + "]" +
-            " flipViewportX=" + String(surfaceSystem && surfaceSystem._renderFlipU === true) +
-            " sample=reflected-viewport ready=" + String(surfaceTextureReady),
-          1000
-        );
-      }
-      if (textureKind > 4.5) {
-        if (!surfaceSystem || !Array.isArray(surfaceSystem._renderViewProjection) || surfaceSystem._renderViewProjection.length !== 16) {
-          failFast("mirror surface_system requires a projective view-projection matrix");
-        }
-      }
     } else {
       f32[344] = rx;
       f32[345] = ry;
@@ -1871,12 +2091,63 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     }
 
     var projectorBase = 356 + (MAX_SURFACE_TRIANGLES * 4 * 4);
-    var projector = textureKind > 4.5 && surfaceSystem && Array.isArray(surfaceSystem._renderViewProjection)
-      ? surfaceSystem._renderViewProjection
-      : null;
     for (var pi = 0; pi < 16; pi += 1) {
-      f32[projectorBase + pi] = projector ? Number(projector[pi] || 0.0) : (pi % 5 === 0 ? 1.0 : 0.0);
+      f32[projectorBase + pi] = (pi % 5 === 0 ? 1.0 : 0.0);
     }
+    var lightApertureBase = projectorBase + 16;
+    function writeLightAperture(lightIndex, lightValue) {
+      var base = lightApertureBase + (lightIndex * (20 + (MAX_LIGHT_APERTURE_POINTS * 4)));
+      for (var clear = 0; clear < (20 + (MAX_LIGHT_APERTURE_POINTS * 4)); clear += 1) {
+        f32[base + clear] = 0.0;
+      }
+      f32[base + 16] = Math.max(0.0, Number(lightValue && lightValue.source_radius || 0.0) || 0.0);
+      f32[base + 17] = Math.max(0.0, Number(lightValue ? (lightValue.spread == null ? 1.0 : lightValue.spread) : 1.0) || 0.0);
+      if (!lightValue || lightValue.kind_code < 1.5 || !lightValue.projected_aperture) {
+        return;
+      }
+      var aperture = lightValue.projected_aperture;
+      var planePoint = Array.isArray(aperture.plane_point) ? aperture.plane_point : [0.0, 0.0, 0.0];
+      var planeNormal = Array.isArray(aperture.plane_normal) ? aperture.plane_normal : [0.0, 0.0, 1.0];
+      var uAxis = Array.isArray(aperture.u_axis) ? aperture.u_axis : [1.0, 0.0, 0.0];
+      var vAxis = Array.isArray(aperture.v_axis) ? aperture.v_axis : [0.0, 1.0, 0.0];
+      var points = Array.isArray(aperture.points) ? aperture.points : [];
+      var count = Math.min(MAX_LIGHT_APERTURE_POINTS, points.length);
+      f32[base + 0] = Number(planePoint[0]) || 0.0;
+      f32[base + 1] = Number(planePoint[1]) || 0.0;
+      f32[base + 2] = Number(planePoint[2]) || 0.0;
+      f32[base + 4] = Number(planeNormal[0]) || 0.0;
+      f32[base + 5] = Number(planeNormal[1]) || 0.0;
+      f32[base + 6] = Number(planeNormal[2]) || 1.0;
+      f32[base + 8] = Number(uAxis[0]) || 0.0;
+      f32[base + 9] = Number(uAxis[1]) || 0.0;
+      f32[base + 10] = Number(uAxis[2]) || 0.0;
+      f32[base + 12] = Number(vAxis[0]) || 0.0;
+      f32[base + 13] = Number(vAxis[1]) || 0.0;
+      f32[base + 14] = Number(vAxis[2]) || 0.0;
+      f32[base + 18] = count;
+      f32[base + 19] = Math.max(0.0, Number(aperture.clip_epsilon || 0.0) || 0.0);
+      var ptsBase = base + 20;
+      for (var pointIndex = 0; pointIndex < count; pointIndex += 1) {
+        var point = Array.isArray(points[pointIndex]) ? points[pointIndex] : [0.0, 0.0];
+        var pointBase = ptsBase + (pointIndex * 4);
+        f32[pointBase + 0] = Number(point[0]) || 0.0;
+        f32[pointBase + 1] = Number(point[1]) || 0.0;
+      }
+    }
+    writeLightAperture(0, lights && lights.length ? lights[0] : null);
+    writeLightAperture(1, lights && lights.length > 1 ? lights[1] : null);
+    var shadowBase = lightApertureBase + (2 * (20 + (MAX_LIGHT_APERTURE_POINTS * 4)));
+    function writeShadowMatrix(offset, matrix) {
+      for (var mi = 0; mi < 16; mi += 1) {
+        f32[offset + mi] = matrix && matrix.length === 16 ? Number(matrix[mi]) || 0.0 : (mi % 5 === 0 ? 1.0 : 0.0);
+      }
+    }
+    writeShadowMatrix(shadowBase + 0, meshLike && meshLike.shadow_viewproj0);
+    writeShadowMatrix(shadowBase + 16, meshLike && meshLike.shadow_viewproj1);
+    f32[shadowBase + 32] = meshLike && meshLike.shadow_enabled0 ? 1.0 : 0.0;
+    f32[shadowBase + 33] = Math.max(0.0, Number(meshLike && meshLike.shadow_bias0 || 0.0) || 0.0);
+    f32[shadowBase + 34] = meshLike && meshLike.shadow_enabled1 ? 1.0 : 0.0;
+    f32[shadowBase + 35] = Math.max(0.0, Number(meshLike && meshLike.shadow_bias1 || 0.0) || 0.0);
 
     return f32;
   }
@@ -2359,29 +2630,31 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     };
   }
 
-  function orientMirrorBasisForEye(corners, eye) {
+  function orientMirrorBasisForEye(corners, eye, preferredUp) {
+    void preferredUp;
     var bottomLeft = corners.bottomLeft;
     var bottomRight = corners.bottomRight;
     var topLeft = corners.topLeft;
-    var topRight = corners.topRight;
-    var right = normalizeVec3(subVec3(bottomRight, bottomLeft), [1.0, 0.0, 0.0]);
-    var up = normalizeVec3(subVec3(topLeft, bottomLeft), [0.0, 1.0, 0.0]);
-    var backward = normalizeVec3(crossVec3(right, up), [0.0, 0.0, 1.0]);
-    if (dotVec3(backward, subVec3(eye, bottomLeft)) < 0.0) {
+    function buildBasis() {
+      var rightLocal = normalizeVec3(subVec3(bottomRight, bottomLeft), [1.0, 0.0, 0.0]);
+      var upLocal = normalizeVec3(subVec3(topLeft, bottomLeft), [0.0, 1.0, 0.0]);
+      var backwardLocal = normalizeVec3(crossVec3(rightLocal, upLocal), [0.0, 0.0, 1.0]);
+      return { right: rightLocal, up: upLocal, backward: backwardLocal };
+    }
+    var basis = buildBasis();
+    if (dotVec3(basis.backward, subVec3(eye, bottomLeft)) < 0.0) {
       bottomLeft = corners.bottomRight;
       bottomRight = corners.bottomLeft;
       topLeft = corners.topRight;
-      right = normalizeVec3(subVec3(bottomRight, bottomLeft), [1.0, 0.0, 0.0]);
-      up = normalizeVec3(subVec3(topLeft, bottomLeft), [0.0, 1.0, 0.0]);
-      backward = normalizeVec3(crossVec3(right, up), [0.0, 0.0, 1.0]);
+      basis = buildBasis();
     }
     return {
       bottomLeft: bottomLeft,
       bottomRight: bottomRight,
       topLeft: topLeft,
-      right: right,
-      up: up,
-      backward: backward
+      right: basis.right,
+      up: basis.up,
+      backward: basis.backward
     };
   }
 
@@ -2503,7 +2776,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
   function normalizeLightKind(kind) {
     var raw = String(kind == null ? "point" : kind).toLowerCase().trim();
     if (raw === "spotlight") { return "spot"; }
-    if (raw !== "point" && raw !== "spot") { return "point"; }
+    if (raw !== "point" && raw !== "spot" && raw !== "projected") { return "point"; }
     return raw;
   }
 
@@ -2562,6 +2835,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     light = light || {};
     var pos = resolveLightPosition(light, t);
     var kind = normalizeLightKind(light.kind);
+    var defaultShowMarker = kind === "projected" ? false : true;
     var intensity = clampPositiveNumber(light.intensity != null ? light.intensity : light.power, 24.0);
     var range = clampPositiveNumber(light.range, 0.0);
     var innerRad = radiansFromDegrees(light.inner_cone_deg, 14.0);
@@ -2574,10 +2848,90 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       intensity: intensity,
       direction_f32: resolveLightDirection(light, pos),
       kind: kind,
-      kind_code: kind === "spot" ? 1.0 : 0.0,
+      kind_code: kind === "spot" ? 1.0 : (kind === "projected" ? 2.0 : 0.0),
       inner_cone_cos: Math.cos(Math.min(innerRad, outerRad)),
       outer_cone_cos: Math.cos(Math.max(innerRad, outerRad)),
       range: range,
+      casts_shadow: light.casts_shadow !== false,
+      show_marker: light.show_marker !== undefined ? light.show_marker !== false : defaultShowMarker,
+      source_radius: clampPositiveNumber(light.source_radius, 0.0),
+      spread: clampPositiveNumber(light.spread, 1.0),
+      projected_aperture: light && light.projected_aperture && typeof light.projected_aperture === "object"
+        ? light.projected_aperture
+        : null,
+    };
+  }
+
+  function chooseShadowUp(direction) {
+    var dir = normalizeVec3(direction, [0.0, 0.0, -1.0]);
+    var worldUp = [0.0, 0.0, 1.0];
+    if (Math.abs(dotVec3(dir, worldUp)) > 0.95) {
+      worldUp = [0.0, 1.0, 0.0];
+    }
+    return normalizeVec3(worldUp, [0.0, 0.0, 1.0]);
+  }
+
+  function collectShadowWorldPoints(parts, t, MmLocal) {
+    var points = [];
+    if (!Array.isArray(parts)) { return points; }
+    for (var i = 0; i < parts.length; i += 1) {
+      var part = parts[i];
+      var mesh = part && part.mesh;
+      if (!mesh || part.topology !== "triangle-list") { continue; }
+      if (mesh.visible === false) { continue; }
+      if (mesh.pickable === false && mesh.no_lighting === true) { continue; }
+      if (String(mesh.blend_mode || "") === "additive") { continue; }
+      if (mesh.transparent === true && mesh.depth_write !== true) { continue; }
+      var model = resolveAnimatedModelMatrix(
+        mesh,
+        t,
+        mesh.center || [0, 0, 0],
+        mesh.rotation || [0, 0, 0],
+        mesh.scale || [1, 1, 1],
+        MmLocal
+      ) || (mesh._modelMatrix || MmLocal.mat4Identity());
+      var verts = mesh.vertices;
+      if (!verts || verts.length < 30) { continue; }
+      for (var vi = 0; vi + 9 < verts.length; vi += 10) {
+        points.push(transformPointMat4(model, [verts[vi], verts[vi + 1], verts[vi + 2]]));
+      }
+    }
+    return points;
+  }
+
+  function fitShadowViewProjection(light, worldPoints, MmLocal) {
+    if (!light || !Array.isArray(worldPoints) || !worldPoints.length) { return null; }
+    var eye = vec3Or(light.pos, [0.0, 0.0, 0.0]);
+    var target = Array.isArray(light.target) ? vec3Or(light.target, [0.0, 0.0, 0.0]) : addVec3(eye, vec3Or(light.direction_f32, [0.0, 0.0, -1.0]));
+    var forward = normalizeVec3(subVec3(target, eye), [0.0, 0.0, -1.0]);
+    var up = chooseShadowUp(forward);
+    var view = mat4LookAt(eye, target, up);
+    var minDist = Infinity;
+    var maxDist = 0.0;
+    var maxTanX = 0.0;
+    var maxTanY = 0.0;
+    for (var i = 0; i < worldPoints.length; i += 1) {
+      var pView = transformPointMat4(view, worldPoints[i]);
+      var dist = -Number(pView[2] || 0.0);
+      if (!(dist > 1e-4)) { continue; }
+      if (dist < minDist) { minDist = dist; }
+      if (dist > maxDist) { maxDist = dist; }
+      maxTanX = Math.max(maxTanX, Math.abs(Number(pView[0] || 0.0)) / dist);
+      maxTanY = Math.max(maxTanY, Math.abs(Number(pView[1] || 0.0)) / dist);
+    }
+    if (!(maxDist > 1e-3) || !(minDist < Infinity)) { return null; }
+    var near = Math.max(0.05, minDist * 0.8);
+    var far = Math.max(near + 1.0, maxDist * 1.1);
+    maxTanX = Math.max(maxTanX, 1e-3);
+    maxTanY = Math.max(maxTanY, 1e-3);
+    var aspect = Math.max(1e-3, maxTanX / maxTanY);
+    var fovY = 2.0 * Math.atan(maxTanY);
+    var proj = MmLocal.mat4PerspectiveZ01(fovY, aspect, near, far);
+    return {
+      view: view,
+      projection: proj,
+      viewProjection: MmLocal.mat4Mul(proj, view),
+      bias: Math.max(0.0008, Math.min(0.0035, 0.0010 + ((far - near) * 0.00002)))
     };
   }
 
@@ -3103,16 +3457,37 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     _ensurePartBindGroup: function (part) {
       if (!part || !this._device || !this._bindLayout || !sharedWgpu) { return; }
       var surfaceView = part.surfaceExternalView || part.surfaceColorView || sharedWgpu.defaultSurfaceView;
-      if (part.bindGroup && part._boundSurfaceView === surfaceView) { return; }
+      var shadowView0 = this._shadowDepthView0 || sharedWgpu.defaultShadowView;
+      var shadowView1 = this._shadowDepthView1 || sharedWgpu.defaultShadowView;
+      if (part.bindGroup &&
+          part._boundSurfaceView === surfaceView &&
+          part._boundShadowView0 === shadowView0 &&
+          part._boundShadowView1 === shadowView1) { return; }
       part.bindGroup = this._device.createBindGroup({
         layout: this._bindLayout,
         entries: [
           { binding: 0, resource: { buffer: part.uniformBuf } },
           { binding: 1, resource: sharedWgpu.surfaceSampler },
-          { binding: 2, resource: surfaceView }
+          { binding: 2, resource: surfaceView },
+          { binding: 3, resource: sharedWgpu.shadowSampler },
+          { binding: 4, resource: shadowView0 },
+          { binding: 5, resource: shadowView1 }
         ]
       });
       part._boundSurfaceView = surfaceView;
+      part._boundShadowView0 = shadowView0;
+      part._boundShadowView1 = shadowView1;
+    },
+
+    _ensurePartShadowBindGroup: function (part) {
+      if (!part || !this._device || !sharedWgpu || !sharedWgpu.shadowBindLayout) { return; }
+      if (part.shadowBindGroup) { return; }
+      part.shadowBindGroup = this._device.createBindGroup({
+        layout: sharedWgpu.shadowBindLayout,
+        entries: [
+          { binding: 0, resource: { buffer: part.uniformBuf } }
+        ]
+      });
     },
 
     _ensureSurfaceTarget: function (part, width, height) {
@@ -3179,18 +3554,6 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       return { width: w, height: h };
     },
 
-    _mirrorTargetDimsForPart: function (part, frameWidth, frameHeight) {
-      var dims = createPlanarMirrorAdapter().targetDims(frameWidth, frameHeight, part);
-      if (
-        !dims ||
-        !(Number(dims.width || 0) > 0) ||
-        !(Number(dims.height || 0) > 0)
-      ) {
-        failFast("mirror targetDims must return positive width and height");
-      }
-      return liveSurfaceTargetDims(dims.width, dims.height);
-    },
-
     _buildPlanarSurfaceRenderCamera: function (part, surfaceCamera, t, targetAspect) {
       return createPlanarMirrorAdapter().buildRenderCamera({
         part: part,
@@ -3199,6 +3562,163 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
         targetAspect: targetAspect,
         math: getMath()
       });
+    },
+
+    _ensureShadowTarget: function (slot, width, height) {
+      if (!this._device) { return; }
+      var w = Math.max(256, width | 0);
+      var h = Math.max(256, height | 0);
+      var texKey = slot === 1 ? "_shadowDepthTex1" : "_shadowDepthTex0";
+      var viewKey = slot === 1 ? "_shadowDepthView1" : "_shadowDepthView0";
+      var wKey = slot === 1 ? "_shadowDepthW1" : "_shadowDepthW0";
+      var hKey = slot === 1 ? "_shadowDepthH1" : "_shadowDepthH0";
+      if (this[texKey] && this[wKey] === w && this[hKey] === h) { return; }
+      if (this[texKey]) { try { this[texKey].destroy(); } catch (_) {} }
+      this[wKey] = w;
+      this[hKey] = h;
+      this[texKey] = this._device.createTexture({
+        size: { width: w, height: h, depthOrArrayLayers: 1 },
+        format: "depth32float",
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+      });
+      this[viewKey] = this[texKey].createView();
+    },
+
+    _applyShadowStateToMesh: function (meshLike, shadowData0, shadowData1) {
+      if (!meshLike || typeof meshLike !== "object") { return; }
+      meshLike.shadow_viewproj0 = shadowData0 ? Array.prototype.slice.call(shadowData0.viewProjection) : null;
+      meshLike.shadow_viewproj1 = shadowData1 ? Array.prototype.slice.call(shadowData1.viewProjection) : null;
+      meshLike.shadow_enabled0 = !!shadowData0;
+      meshLike.shadow_enabled1 = !!shadowData1;
+      meshLike.shadow_bias0 = shadowData0 ? Number(shadowData0.bias || 0.001) : 0.0;
+      meshLike.shadow_bias1 = shadowData1 ? Number(shadowData1.bias || 0.001) : 0.0;
+    },
+
+    _prepareShadowMapsForScene: function (enc, mesh, t, frameWidth, frameHeight) {
+      if (!mesh || !Array.isArray(this._parts) || !this._parts.length || !sharedWgpu) { return [null, null]; }
+      var MmLocal = getMath();
+      var sceneLights = (mesh.lights || []).map(function (l) { return normalizeLight(l, t); });
+      var activeLights = [];
+      for (var li = 0; li < sceneLights.length && activeLights.length < 2; li += 1) {
+        if (sceneLights[li] && sceneLights[li].casts_shadow !== false) {
+          activeLights.push(sceneLights[li]);
+        }
+      }
+      var worldPoints = collectShadowWorldPoints(this._parts, t, MmLocal);
+      var shadow0 = activeLights[0] ? fitShadowViewProjection(activeLights[0], worldPoints, MmLocal) : null;
+      var shadow1 = activeLights[1] ? fitShadowViewProjection(activeLights[1], worldPoints, MmLocal) : null;
+      var shadowSize = Math.max(512, Math.min(2048, Math.max(frameWidth | 0, frameHeight | 0, 1024)));
+      if (shadow0) { this._ensureShadowTarget(0, shadowSize, shadowSize); }
+      if (shadow1) { this._ensureShadowTarget(1, shadowSize, shadowSize); }
+      for (var pi = 0; pi < this._parts.length; pi += 1) {
+        this._applyShadowStateToMesh(this._parts[pi] && this._parts[pi].mesh, shadow0, shadow1);
+      }
+      var drawShadowPass = function (renderer, slot, shadowData) {
+        if (!shadowData) { return; }
+        var depthView = slot === 1 ? renderer._shadowDepthView1 : renderer._shadowDepthView0;
+        var pipe = slot === 1 ? sharedWgpu.pipeShadow1 : sharedWgpu.pipeShadow0;
+        if (!depthView || !pipe) { return; }
+        var pass = enc.beginRenderPass({
+          colorAttachments: [],
+          depthStencilAttachment: {
+            view: depthView,
+            depthClearValue: 1.0,
+            depthLoadOp: "clear",
+            depthStoreOp: "store"
+          }
+        });
+        pass.setPipeline(pipe);
+        for (var i = 0; i < renderer._parts.length; i += 1) {
+          var part = renderer._parts[i];
+          var partMesh = part && part.mesh;
+          if (!part || !partMesh || part.topology !== "triangle-list") { continue; }
+          if (partMesh.visible === false) { continue; }
+          if (partMesh.no_lighting === true) { continue; }
+          if (String(partMesh.blend_mode || "") === "additive") { continue; }
+          if (partMesh.transparent === true && partMesh.depth_write !== true) { continue; }
+          var model = resolveAnimatedModelMatrix(
+            partMesh,
+            t,
+            partMesh.center || [0, 0, 0],
+            partMesh.rotation || [0, 0, 0],
+            partMesh.scale || [1, 1, 1],
+            MmLocal
+          ) || (partMesh._modelMatrix || MmLocal.mat4Identity());
+          var ub = buildUniform(MmLocal.mat4Identity(), model, [0, 0, 0], [], 0, 1.0, partMesh);
+          renderer._device.queue.writeBuffer(part.uniformBuf, 0, ub);
+          renderer._ensurePartShadowBindGroup(part);
+          pass.setBindGroup(0, part.shadowBindGroup);
+          pass.setVertexBuffer(0, part.vb);
+          pass.setIndexBuffer(part.ib, "uint32");
+          pass.drawIndexed(part.ibCount, 1, 0, 0, 0);
+        }
+        pass.end();
+      };
+      drawShadowPass(this, 0, shadow0);
+      drawShadowPass(this, 1, shadow1);
+      return [shadow0, shadow1];
+    },
+
+    _buildPlanarSurfaceApertureCamera: function (part, surfaceCamera, t, targetAspect) {
+      return createPlanarMirrorAdapter().buildApertureCamera({
+        part: part,
+        surfaceCamera: surfaceCamera,
+        timeMs: t,
+        targetAspect: targetAspect,
+        math: getMath()
+      });
+    },
+
+    _buildMirrorEyeLockedCamera: function (viewerCamera, hostMesh, baseCamera, t) {
+      var MmLocal = getMath();
+      var model = resolveAnimatedModelMatrix(
+        hostMesh,
+        Number(t || 0.0) || 0.0,
+        hostMesh && hostMesh.center ? hostMesh.center : [0.0, 0.0, 0.0],
+        hostMesh && hostMesh.rotation ? hostMesh.rotation : [0.0, 0.0, 0.0],
+        hostMesh && hostMesh.scale ? hostMesh.scale : [1.0, 1.0, 1.0],
+        MmLocal
+      ) || (MmLocal && typeof MmLocal.mat4Identity === "function" ? MmLocal.mat4Identity() : null);
+      var planePoint = model ? transformPointMat4(model, [0.0, 0.0, 0.0]) : [0.0, 0.0, 0.0];
+      return {
+        pos: vec3Or(viewerCamera && viewerCamera.pos, [4.0, -5.0, 3.5]),
+        target: planePoint,
+        up: [0.0, 0.0, 1.0],
+        fov: Number(viewerCamera && viewerCamera.fov || 34.0) || 34.0,
+        flip_x: (baseCamera && baseCamera.flip_x === true) || (viewerCamera && viewerCamera.flip_x === true)
+      };
+    },
+
+    _resolveScreenRenderCamera: function (part, sceneMesh, surfaceCamera, t, targetAspect) {
+      if (!surfaceCamera || typeof surfaceCamera !== "object") {
+        return sceneMesh.camera || null;
+      }
+      var mirrorMeshId = String(surfaceCamera.reflect_mirror_mesh_id || "").trim();
+      if (!mirrorMeshId) {
+        return surfaceCamera;
+      }
+      var sourceFrameId = String(surfaceCamera.reflect_of_frame_id || "").trim();
+      var sourceCamera = null;
+      if (!sourceFrameId || sourceFrameId === "current") {
+        sourceCamera = sceneMesh && sceneMesh.camera ? sceneMesh.camera : null;
+      } else if (global.__vfNativeSceneLiveCameras && typeof global.__vfNativeSceneLiveCameras === "object") {
+        sourceCamera = global.__vfNativeSceneLiveCameras[sourceFrameId] || null;
+      }
+      if (!sourceCamera || !Array.isArray(sourceCamera.pos) || !Array.isArray(sourceCamera.target)) {
+        return null;
+      }
+      var cameraSeed = sourceCamera;
+      if (surfaceCamera.reflect_eye_only === true || surfaceCamera.lock_aperture_camera === true) {
+        cameraSeed = this._buildMirrorEyeLockedCamera(sourceCamera, part.mesh, surfaceCamera, t);
+      }
+      var reflectedCamera = this._buildPlanarSurfaceRenderCamera(part, cameraSeed, t, targetAspect);
+      if (surfaceCamera.lock_aperture_camera === true) {
+        reflectedCamera = this._buildPlanarSurfaceApertureCamera(part, reflectedCamera, t, targetAspect);
+      }
+      if (reflectedCamera && typeof reflectedCamera === "object" && surfaceCamera.flip_x === true) {
+        reflectedCamera.flip_x = true;
+      }
+      return reflectedCamera;
     },
 
     _drawSingleScenePart: function (pass, sceneMesh, part, t, aspect, overrideCamera, MmBatch, renderWidth, renderHeight) {
@@ -3228,6 +3748,12 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
           var fovRadPart = fovPart * Math.PI / 180;
           projMatPart = MmBatch.mat4PerspectiveZ01(fovRadPart, aspect, 0.05, 500);
         }
+        if (camPart && camPart.flip_x === true) {
+          projMatPart[0] = -projMatPart[0];
+          projMatPart[4] = -projMatPart[4];
+          projMatPart[8] = -projMatPart[8];
+          projMatPart[12] = -projMatPart[12];
+        }
         if (camPart && Array.isArray(camPart.view_matrix) && camPart.view_matrix.length === 16) {
           viewMatPart = new Float32Array(camPart.view_matrix);
         } else if (!overrideCamera && !partMesh.camera && !sceneMesh.camera) {
@@ -3241,7 +3767,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
         }
         mvpPart = MmBatch.mat4Mul(projMatPart, viewMatPart);
       }
-      var rawLightsPart = partMesh.lights || sceneMesh.lights || [];
+      var rawLightsPart = partMesh.no_lighting === true ? [] : (partMesh.lights || sceneMesh.lights || []);
       var lightsNormPart = rawLightsPart.map(function (l) { return normalizeLight(l, t); });
       var lmNamePart = partMesh.light_model || sceneMesh.light_model || (lightsNormPart[0] && lightsNormPart[0].model) || "blinn_phong";
       var lmIntPart = LIGHT_MODELS[lmNamePart] !== undefined ? LIGHT_MODELS[lmNamePart] : 2;
@@ -3446,7 +3972,10 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
           continue;
         }
         var surfaceKind = String(surfaceSystem.kind || "").toLowerCase().trim();
-        if (surfaceKind !== "screen" && surfaceKind !== "mirror") {
+        if (surfaceKind === "mirror") {
+          failFast("mirror surfaces must be lowered to screen surfaces before vf-geom-wgpu render");
+        }
+        if (surfaceKind !== "screen") {
           partMesh._surfaceTextureReady = false;
           part.surfaceExternalView = null;
           part.surfaceColorView = null;
@@ -3455,12 +3984,20 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
         }
         if (surfaceKind === "screen" && surfaceSystem && String(surfaceSystem.frame_ref || "").trim()) {
           var sourceFrameId = String(surfaceSystem.frame_ref || "").trim();
+          var wantedDims = this._surfaceTargetDimsForPart(part, width, height);
           var frameRenderers = global.__vfFrameRenderers && typeof global.__vfFrameRenderers === "object"
             ? global.__vfFrameRenderers
             : null;
           var sourceRenderer = frameRenderers ? frameRenderers[sourceFrameId] : null;
           if (!sourceRenderer || typeof sourceRenderer._debugGetFrameTextureRef !== "function") {
-            failFast('screen surface_system frame_ref "' + sourceFrameId + '" has no live frame renderer');
+            surfaceSystem._runtime_texture_ready = false;
+            part.surfaceExternalView = null;
+            partMesh._surfaceTextureReady = false;
+            this._ensurePartBindGroup(part);
+            continue;
+          }
+          if (sourceRenderer._offscreenFrame === true && typeof sourceRenderer._debugSetFrameTextureTargetSize === "function") {
+            sourceRenderer._debugSetFrameTextureTargetSize(wantedDims.width, wantedDims.height);
           }
           var frameTextureRef = sourceRenderer._debugGetFrameTextureRef();
           if (!frameTextureRef || !frameTextureRef.view) {
@@ -3483,56 +4020,28 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
           surfaceSystem._runtime_texture_ready = true;
         }
         part.surfaceExternalView = null;
-        var targetDims = surfaceKind === "mirror"
-          ? this._mirrorTargetDimsForPart(part, width, height)
-          : this._surfaceTargetDimsForPart(part, width, height);
+        var targetDims = this._surfaceTargetDimsForPart(part, width, height);
         var surfaceCamera = surfaceSystem.camera && typeof surfaceSystem.camera === "object"
           ? surfaceSystem.camera
           : (sceneMesh.camera || null);
-        var renderCamera = surfaceCamera;
-        if (surfaceKind === "mirror") {
-          renderCamera = sceneMesh.camera || surfaceCamera;
-          if (!renderCamera || !Array.isArray(renderCamera.pos)) {
-            failFast("mirror surface_system requires the active scene camera");
-          }
-          renderCamera = this._buildPlanarSurfaceRenderCamera(part, renderCamera, t, targetDims.width / Math.max(1, targetDims.height));
-          surfaceSystem._renderFlipU = renderCamera._mirrorFlipU === true;
-          surfaceSystem._renderFlipV = renderCamera._mirrorFlipV === true;
-          surfaceSystem._renderViewProjection = renderCamera._mirrorViewProjection;
-          try {
-            var mirrorFrame = derivePlanarSurfaceWorldFrame(part, t, getMath());
-            logMirrorIntersectionLine(
-              renderCamera._mirrorViewProjection,
-              mirrorFrame,
-              renderCamera._mirrorFlipU === true,
-              "a4f2-mirror-line-" + String(partMesh && partMesh.id || "surface"),
-              250
-            );
-          } catch (_) {}
-          mirrorDebugLog(
-            "a4f2-mirror-camera-" + String(partMesh && partMesh.id || "surface"),
-            "[DEBUG-a4f2] mirror camera eye=" + dbgVec(renderCamera.pos || []) +
-              " target=" + dbgVec(renderCamera.target || []) +
-              " srcEye=" + dbgVec((sceneMesh.camera && sceneMesh.camera.pos) || []) +
-              " srcTarget=" + dbgVec((sceneMesh.camera && sceneMesh.camera.target) || []) +
-              " frustum=" + JSON.stringify(renderCamera._mirrorDebug && renderCamera._mirrorDebug.frustum || {}),
-            250,
-          );
-        }
-        var partBackups = null;
-        if (surfaceKind === "mirror") {
-          var rebuiltMeshes = this._rebuildUnifiedSourceMeshesForCamera(sceneMesh, renderCamera, targetDims.height);
-          if (rebuiltMeshes) {
-            partBackups = this._swapScenePartsMeshes(rebuiltMeshes);
-          }
+        var renderCamera = this._resolveScreenRenderCamera(
+          part,
+          sceneMesh,
+          surfaceCamera,
+          t,
+          Math.max(1e-4, targetDims.width / Math.max(1, targetDims.height))
+        );
+        if (!renderCamera) {
+          surfaceSystem._runtime_texture_ready = false;
+          part.surfaceExternalView = null;
+          partMesh._surfaceTextureReady = false;
+          this._ensurePartBindGroup(part);
+          continue;
         }
         this._ensureSurfaceTarget(part, targetDims.width, targetDims.height);
         partMesh._surfaceTextureReady = true;
         var world = surfaceSystem.world && typeof surfaceSystem.world === "object" ? surfaceSystem.world : {};
         var bg = parseColor(world.background || [0.0, 0.0, 0.0, 1.0]);
-        if (surfaceKind === "mirror" && !(bg[3] > 0.0)) {
-          bg = [0.02, 0.025, 0.03, 1.0];
-        }
         this._encodeScenePartsColorPass(
           enc,
           sceneMesh,
@@ -3548,9 +4057,6 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
           true,
           {}
         );
-        if (partBackups) {
-          this._restoreScenePartsMeshes(partBackups);
-        }
         this._ensurePartBindGroup(part);
       }
     },
@@ -3864,6 +4370,11 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
         this._ensureMsaaColor();
         this._ensureFrameColorTarget();
         this._ensureFrameSceneColorTarget();
+        var shadowEncBatch = this._device.createCommandEncoder();
+        var preparedShadows = this._prepareShadowMapsForScene(shadowEncBatch, mesh, t, wBatch, hBatch);
+        if ((preparedShadows[0] || preparedShadows[1])) {
+          this._device.queue.submit([shadowEncBatch.finish()]);
+        }
         var encBatch = this._device.createCommandEncoder();
         var sceneSourceBackups = this._swapSelfReferencedScreensToPlain(this._frameId);
         this._encodeScenePartsColorPass(
@@ -3878,7 +4389,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
           { r: 0, g: 0, b: 0, a: 0 },
           null,
           0,
-          false
+          true
         );
         this._restoreScenePartsMeshes(sceneSourceBackups);
         this._renderSurfacePasses(encBatch, mesh, t, wBatch, hBatch);
@@ -4038,7 +4549,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       }
 
       // --- Lights ---
-      var rawLights = mesh.lights || [];
+      var rawLights = mesh.no_lighting === true ? [] : (mesh.lights || []);
       var lightsNorm = rawLights.map(function (l) { return normalizeLight(l, t); });
       var lmName = mesh.light_model || (lightsNorm[0] && lightsNorm[0].model) || "blinn_phong";
       var lmInt  = LIGHT_MODELS[lmName] !== undefined ? LIGHT_MODELS[lmName] : 2;
@@ -4167,13 +4678,12 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       var baseSizeWorld = Math.max(0.02, Number(flareCfg.size || 0.18));
       for (var i = 0; i < lightsNorm.length; i += 1) {
         var light = lightsNorm[i];
+        if (light && light.show_marker === false) { continue; }
         var lightPos = light.pos || [0, 0, 0];
         var ndc = projectWorldToNdc(mvp, lightPos);
         if (!ndc) { continue; }
         if (Math.abs(ndc[0]) > 1.02 || Math.abs(ndc[1]) > 1.02) { continue; }
         if (lightOccludedByBoxes(cameraPos, lightPos, occluders)) { continue; }
-        var edgeFade = screenEdgeFadeNdc(ndc[0], ndc[1]);
-        if (!(edgeFade > 0.001)) { continue; }
         var intensity = Math.max(0.0, Number(light.intensity || 24.0));
         var toCam = [
           Number(cameraPos[0]) - Number(lightPos[0]),
@@ -4188,7 +4698,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
           facing = Math.max(0.0, (beamDir[0] * toCam[0]) + (beamDir[1] * toCam[1]) + (beamDir[2] * toCam[2]));
         }
         var baseAlpha = Math.min(1.0, 0.30 + Math.min(0.70, intensity / 170.0));
-        var flareAlpha = Math.max(0.0, Math.min(1.0, baseAlpha * (0.30 + (0.70 * facing)) * edgeFade));
+        var flareAlpha = Math.max(0.0, Math.min(1.0, baseAlpha * (0.30 + (0.70 * facing))));
         if (!(flareAlpha > 0.001)) { continue; }
         var pxSize = Math.max(72, 96 + (intensity * 0.55) + (72 * facing));
         var sizeNdcX = (pxSize / Math.max(1, width));
@@ -4199,7 +4709,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
         instances.push(
           ndc[0], ndc[1], sizeNdcX, sizeNdcY,
           Number((light.color_f32 || [1, 1, 1, 1])[0]), Number((light.color_f32 || [1, 1, 1, 1])[1]), Number((light.color_f32 || [1, 1, 1, 1])[2]), 1.0,
-          pxSize, flareAlpha, facing, edgeFade,
+          pxSize, flareAlpha, facing, 1.0,
           Math.cos(axisAngle), Math.sin(axisAngle), 0.0, 0.0
         );
       }
@@ -4281,6 +4791,10 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       this._frameBlitSourceView = null;
       if (this._uniformBuf){ try { this._uniformBuf.destroy(); } catch(_){} this._uniformBuf = null; }
       if (this._flareInstBuf){ try { this._flareInstBuf.destroy(); } catch(_){} this._flareInstBuf = null; this._flareInstBufSize = 0; }
+      if (this._shadowDepthTex0) { try { this._shadowDepthTex0.destroy(); } catch(_){} this._shadowDepthTex0 = null; }
+      if (this._shadowDepthTex1) { try { this._shadowDepthTex1.destroy(); } catch(_){} this._shadowDepthTex1 = null; }
+      this._shadowDepthView0 = null;
+      this._shadowDepthView1 = null;
       if (this._ctx)       { try { this._ctx.unconfigure(); } catch(_){} }
       if (this._pickTex)      { try { this._pickTex.destroy();      } catch(_){} this._pickTex      = null; }
       if (this._pickDepthTex) { try { this._pickDepthTex.destroy(); } catch(_){} this._pickDepthTex = null; }
@@ -4336,7 +4850,10 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
         entries: [
           { binding: 0, resource: { buffer: this._uniformBuf } },
           { binding: 1, resource: sg.surfaceSampler },
-          { binding: 2, resource: sg.defaultSurfaceView }
+          { binding: 2, resource: sg.defaultSurfaceView },
+          { binding: 3, resource: sg.shadowSampler },
+          { binding: 4, resource: sg.defaultShadowView },
+          { binding: 5, resource: sg.defaultShadowView }
         ],
       });
       this._ensureDepth();
