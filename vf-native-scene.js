@@ -1170,8 +1170,35 @@
       spread: Math.max(0.0, resolveTrackedNumber(resolved, "spread", framePos, Number(entityProp(resolved, "spread", 1.0) == null ? 1.0 : entityProp(resolved, "spread", 1.0)))),
       power: Math.max(0.0, resolveTrackedNumber(resolved, "power", framePos, Number(entityProp(resolved, "power", 0.0) || 0.0))),
       aperture_mesh_id: String(entityProp(resolved, "aperture_mesh_id", "") || ""),
+      reflect_of_light_id: String(entityProp(resolved, "reflect_of_light_id", "") || ""),
+      reflect_mirror_mesh_id: String(entityProp(resolved, "reflect_mirror_mesh_id", "") || ""),
       clip_epsilon: Math.max(0.0, resolveTrackedNumber(resolved, "clip_epsilon", framePos, Number(entityProp(resolved, "clip_epsilon", 1e-3) == null ? 1e-3 : entityProp(resolved, "clip_epsilon", 1e-3))))
     };
+  }
+
+  function resolveLinkedMirrorLight(lightSpec, sourceLightsById, meshById) {
+    var reflectOfId = String(lightSpec && lightSpec.reflect_of_light_id || "").trim();
+    var mirrorMeshId = String(lightSpec && lightSpec.reflect_mirror_mesh_id || "").trim();
+    if (!reflectOfId && !mirrorMeshId) { return lightSpec; }
+    if (!reflectOfId || !mirrorMeshId) { return lightSpec; }
+    var sourceLight = sourceLightsById && sourceLightsById[reflectOfId];
+    var mirrorMesh = meshById && meshById[mirrorMeshId];
+    if (!sourceLight || !mirrorMesh) { return lightSpec; }
+    var aperture = quadApertureFrame(mirrorMesh);
+    if (!aperture) { return lightSpec; }
+    var reflectedPos = reflectPointAcrossPlane(sourceLight.pos, aperture.center, aperture.normal);
+    var reflectedTarget = Array.isArray(sourceLight.target)
+      ? reflectPointAcrossPlane(sourceLight.target, aperture.center, aperture.normal)
+      : sourceLight.target;
+    var resolved = Object.assign({}, lightSpec, {
+      pos: reflectedPos,
+      target: reflectedTarget,
+      motion: "linked_reflection"
+    });
+    if (!resolved.aperture_mesh_id) {
+      resolved.aperture_mesh_id = mirrorMeshId;
+    }
+    return resolved;
   }
 
   function toVec2(value, fallback) {
@@ -1728,6 +1755,12 @@
       signedArea += (Number(a[0]) * Number(b[1])) - (Number(b[0]) * Number(a[1]));
     }
     if (signedArea < 0.0) {
+      localPts.reverse();
+    }
+    var reverseFacing = !!(mesh && mesh.surface_system && mesh.surface_system.reverse_facing === true);
+    if (reverseFacing) {
+      normal = [-normal[0], -normal[1], -normal[2]];
+      vAxis = [-vAxis[0], -vAxis[1], -vAxis[2]];
       localPts.reverse();
     }
     return {
@@ -2755,13 +2788,23 @@
     var lightSpecs = Array.isArray(config.lights)
       ? config.lights
       : (config.light ? [config.light] : []);
-    var lights = lightSpecs.map(function (entry) { return normalizeLight(entry, seconds); });
     var meshSpecs = Array.isArray(config.meshes) ? config.meshes.map(function (mesh) { return normalizeMeshSpec(mesh, seconds, camera); }) : [];
     var receivers = Array.isArray(config.shadow_receivers) ? config.shadow_receivers.map(normalizeShadowReceiverSpec) : [];
     var meshById = Object.create(null);
     for (var meshIndex = 0; meshIndex < meshSpecs.length; meshIndex += 1) {
       meshById[meshSpecs[meshIndex].id] = meshSpecs[meshIndex];
     }
+    var lights = lightSpecs.map(function (entry) { return normalizeLight(entry, seconds); });
+    var sourceLightsById = Object.create(null);
+    for (var lightIndex = 0; lightIndex < lights.length; lightIndex += 1) {
+      var sourceLight = lights[lightIndex];
+      if (sourceLight && sourceLight.id) {
+        sourceLightsById[String(sourceLight.id)] = sourceLight;
+      }
+    }
+    lights = lights.map(function (lightSpec) {
+      return resolveLinkedMirrorLight(lightSpec, sourceLightsById, meshById);
+    });
     lights = lights.map(function (lightSpec) {
       return resolveProjectedLightSpec(lightSpec, meshById);
     });

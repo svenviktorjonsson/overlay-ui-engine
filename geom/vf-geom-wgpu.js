@@ -91,32 +91,6 @@ fn fs_blit(in : VOut) -> @location(0) vec4<f32> {
 }
 `;
 
-  function dbgNum(value) {
-    var n = Number(value);
-    if (!Number.isFinite(n)) { return String(value); }
-    return n.toFixed(4);
-  }
-
-  function dbgVec(value) {
-    if (!value || typeof value.length !== "number") { return "[]"; }
-    var out = [];
-    for (var i = 0; i < value.length; i += 1) {
-      out.push(dbgNum(value[i]));
-    }
-    return "[" + out.join(",") + "]";
-  }
-
-  function mirrorDebugLog(key, message, intervalMs) {
-    try {
-      var now = Date.now();
-      if (!global.__vfMirrorDebugLast) { global.__vfMirrorDebugLast = Object.create(null); }
-      var last = Number(global.__vfMirrorDebugLast[key] || 0);
-      if (now - last < Math.max(0, Number(intervalMs || 1000))) { return; }
-      global.__vfMirrorDebugLast[key] = now;
-      wlog("warn", "[DEBUG-mirror-norm] " + String(message));
-    } catch (_) {}
-  }
-
   var PLANAR_MIRROR_SEAM_MESSAGE =
     "mirror surface_system is intentionally unimplemented in vf-geom-wgpu. " +
     "Install a planar mirror adapter behind createPlanarMirrorAdapter() before rendering mirrors.";
@@ -488,15 +462,33 @@ fn projectedApertureFactor0(worldPos: vec3<f32>, lightPos: vec3<f32>, kindCode: 
   }
   let receiverGap = max(0.0, receiverSide - sc.light0_aperture_meta.w);
   let softness = sc.light0_aperture_meta.x * (receiverGap / lightToPlane) * sc.light0_aperture_meta.y;
-  var occ = 1.0;
+  if (apertureCount == 4u) {
+    var minX = 1e9;
+    var maxX = -1e9;
+    var minY = 1e9;
+    var maxY = -1e9;
+    for (var qi: u32 = 0u; qi < apertureCount; qi = qi + 1u) {
+      let p = lightAperturePoint0(qi);
+      minX = min(minX, p.x);
+      maxX = max(maxX, p.x);
+      minY = min(minY, p.y);
+      maxY = max(maxY, p.y);
+    }
+    let insideX = smoothstep(minX - softness, minX + softness, local.x) * (1.0 - smoothstep(maxX - softness, maxX + softness, local.x));
+    let insideY = smoothstep(minY - softness, minY + softness, local.y) * (1.0 - smoothstep(maxY - softness, maxY + softness, local.y));
+    return insideX * insideY;
+  }
+  var occPos = 1.0;
+  var occNeg = 1.0;
   for (var i: u32 = 0u; i < apertureCount; i = i + 1u) {
     let a = lightAperturePoint0(i);
     let b = lightAperturePoint0((i + 1u) % apertureCount);
     let side = cross2(a, b, local);
     let edgeLen = length(b - a);
-    occ = occ * edgeOcclusion(side, edgeLen, softness);
+    occPos = occPos * edgeOcclusion(side, edgeLen, softness);
+    occNeg = occNeg * edgeOcclusion(-side, edgeLen, softness);
   }
-  return occ;
+  return max(occPos, occNeg);
 }
 
 fn projectedApertureFactor1(worldPos: vec3<f32>, lightPos: vec3<f32>, kindCode: f32) -> f32 {
@@ -533,15 +525,33 @@ fn projectedApertureFactor1(worldPos: vec3<f32>, lightPos: vec3<f32>, kindCode: 
   }
   let receiverGap = max(0.0, receiverSide - sc.light1_aperture_meta.w);
   let softness = sc.light1_aperture_meta.x * (receiverGap / lightToPlane) * sc.light1_aperture_meta.y;
-  var occ = 1.0;
+  if (apertureCount == 4u) {
+    var minX = 1e9;
+    var maxX = -1e9;
+    var minY = 1e9;
+    var maxY = -1e9;
+    for (var qi: u32 = 0u; qi < apertureCount; qi = qi + 1u) {
+      let p = lightAperturePoint1(qi);
+      minX = min(minX, p.x);
+      maxX = max(maxX, p.x);
+      minY = min(minY, p.y);
+      maxY = max(maxY, p.y);
+    }
+    let insideX = smoothstep(minX - softness, minX + softness, local.x) * (1.0 - smoothstep(maxX - softness, maxX + softness, local.x));
+    let insideY = smoothstep(minY - softness, minY + softness, local.y) * (1.0 - smoothstep(maxY - softness, maxY + softness, local.y));
+    return insideX * insideY;
+  }
+  var occPos = 1.0;
+  var occNeg = 1.0;
   for (var i: u32 = 0u; i < apertureCount; i = i + 1u) {
     let a = lightAperturePoint1(i);
     let b = lightAperturePoint1((i + 1u) % apertureCount);
     let side = cross2(a, b, local);
     let edgeLen = length(b - a);
-    occ = occ * edgeOcclusion(side, edgeLen, softness);
+    occPos = occPos * edgeOcclusion(side, edgeLen, softness);
+    occNeg = occNeg * edgeOcclusion(-side, edgeLen, softness);
   }
-  return occ;
+  return max(occPos, occNeg);
 }
 
 fn shadowMapVisibility0(worldPos: vec3<f32>, normal: vec3<f32>) -> f32 {
@@ -1005,7 +1015,11 @@ fn litSurfaceTriangleColor(baseColor: vec3<f32>, hitPos: vec3<f32>, a: vec3<f32>
     let dist0 = max(length(toLight0), 1e-6);
     let L0 = toLight0 / dist0;
     let atten0 = lightAttenuation(dist0, sc.light0_dir_intensity.w, sc.light0_spot_params.z);
-    let spot0 = spotlightFactor(sc.light0_dir_intensity.xyz, -L0, sc.light0_spot_params.x, sc.light0_spot_params.y, sc.light0_spot_params.w);
+    let spot0 = select(
+      spotlightFactor(sc.light0_dir_intensity.xyz, -L0, sc.light0_spot_params.x, sc.light0_spot_params.y, sc.light0_spot_params.w),
+      1.0,
+      sc.light0_spot_params.w >= 1.5
+    );
     let proj0 = projectedApertureFactor0(hitPos, sc.light0_pos, sc.light0_spot_params.w);
     let diff0 = max(dot(facingNormal, L0), 0.0);
     diffuse += (atten0 * spot0 * proj0 * diff0) * sc.light0_color.rgb * baseColor;
@@ -1020,7 +1034,11 @@ fn litSurfaceTriangleColor(baseColor: vec3<f32>, hitPos: vec3<f32>, a: vec3<f32>
     let dist1 = max(length(toLight1), 1e-6);
     let L1 = toLight1 / dist1;
     let atten1 = lightAttenuation(dist1, sc.light1_dir_intensity.w, sc.light1_spot_params.z);
-    let spot1 = spotlightFactor(sc.light1_dir_intensity.xyz, -L1, sc.light1_spot_params.x, sc.light1_spot_params.y, sc.light1_spot_params.w);
+    let spot1 = select(
+      spotlightFactor(sc.light1_dir_intensity.xyz, -L1, sc.light1_spot_params.x, sc.light1_spot_params.y, sc.light1_spot_params.w),
+      1.0,
+      sc.light1_spot_params.w >= 1.5
+    );
     let proj1 = projectedApertureFactor1(hitPos, sc.light1_pos, sc.light1_spot_params.w);
     let diff1 = max(dot(facingNormal, L1), 0.0);
     diffuse += (atten1 * spot1 * proj1 * diff1) * sc.light1_color.rgb * baseColor;
@@ -1190,13 +1208,17 @@ fn fs(i: Vout) -> @location(0) vec4f {
   var diffuse = vec3f(0.0, 0.0, 0.0);
   var specular = vec3f(0.0, 0.0, 0.0);
   if (sc.light_count > 0u) {
-    let vis0 = shadowMapVisibility0(i.world_pos, N);
+    let vis0 = select(shadowMapVisibility0(i.world_pos, N), 1.0, sc.light0_spot_params.w >= 1.5);
     let toLight0 = sc.light0_pos - i.world_pos;
     let dist0 = max(length(toLight0), 1e-6);
     let L0 = toLight0 / dist0;
     let lc0 = sc.light0_color.rgb;
     let atten0 = lightAttenuation(dist0, sc.light0_dir_intensity.w, sc.light0_spot_params.z);
-    let spot0 = spotlightFactor(sc.light0_dir_intensity.xyz, -L0, sc.light0_spot_params.x, sc.light0_spot_params.y, sc.light0_spot_params.w);
+    let spot0 = select(
+      spotlightFactor(sc.light0_dir_intensity.xyz, -L0, sc.light0_spot_params.x, sc.light0_spot_params.y, sc.light0_spot_params.w),
+      1.0,
+      sc.light0_spot_params.w >= 1.5
+    );
     let proj0 = projectedApertureFactor0(i.world_pos, sc.light0_pos, sc.light0_spot_params.w);
     let litScale0 = vis0 * atten0 * spot0 * proj0;
     let diff0 = max(dot(N, L0), 0.0);
@@ -1208,13 +1230,17 @@ fn fs(i: Vout) -> @location(0) vec4f {
     }
   }
   if (sc.light_count > 1u) {
-    let vis1 = shadowMapVisibility1(i.world_pos, N);
+    let vis1 = select(shadowMapVisibility1(i.world_pos, N), 1.0, sc.light1_spot_params.w >= 1.5);
     let toLight1 = sc.light1_pos - i.world_pos;
     let dist1 = max(length(toLight1), 1e-6);
     let L1 = toLight1 / dist1;
     let lc1 = sc.light1_color.rgb;
     let atten1 = lightAttenuation(dist1, sc.light1_dir_intensity.w, sc.light1_spot_params.z);
-    let spot1 = spotlightFactor(sc.light1_dir_intensity.xyz, -L1, sc.light1_spot_params.x, sc.light1_spot_params.y, sc.light1_spot_params.w);
+    let spot1 = select(
+      spotlightFactor(sc.light1_dir_intensity.xyz, -L1, sc.light1_spot_params.x, sc.light1_spot_params.y, sc.light1_spot_params.w),
+      1.0,
+      sc.light1_spot_params.w >= 1.5
+    );
     let proj1 = projectedApertureFactor1(i.world_pos, sc.light1_pos, sc.light1_spot_params.w);
     let litScale1 = vis1 * atten1 * spot1 * proj1;
     let diff1 = max(dot(N, L1), 0.0);
@@ -2095,10 +2121,17 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       f32[projectorBase + pi] = (pi % 5 === 0 ? 1.0 : 0.0);
     }
     var lightApertureBase = projectorBase + 16;
+    var lightApertureHeaderStride = 20;
+    var lightAperturePointsStride = MAX_LIGHT_APERTURE_POINTS * 4;
+    var lightAperturePointsBase = lightApertureBase + (2 * lightApertureHeaderStride);
     function writeLightAperture(lightIndex, lightValue) {
-      var base = lightApertureBase + (lightIndex * (20 + (MAX_LIGHT_APERTURE_POINTS * 4)));
-      for (var clear = 0; clear < (20 + (MAX_LIGHT_APERTURE_POINTS * 4)); clear += 1) {
+      var base = lightApertureBase + (lightIndex * lightApertureHeaderStride);
+      var ptsBase = lightAperturePointsBase + (lightIndex * lightAperturePointsStride);
+      for (var clear = 0; clear < lightApertureHeaderStride; clear += 1) {
         f32[base + clear] = 0.0;
+      }
+      for (var clearPt = 0; clearPt < lightAperturePointsStride; clearPt += 1) {
+        f32[ptsBase + clearPt] = 0.0;
       }
       f32[base + 16] = Math.max(0.0, Number(lightValue && lightValue.source_radius || 0.0) || 0.0);
       f32[base + 17] = Math.max(0.0, Number(lightValue ? (lightValue.spread == null ? 1.0 : lightValue.spread) : 1.0) || 0.0);
@@ -2126,7 +2159,6 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       f32[base + 14] = Number(vAxis[2]) || 0.0;
       f32[base + 18] = count;
       f32[base + 19] = Math.max(0.0, Number(aperture.clip_epsilon || 0.0) || 0.0);
-      var ptsBase = base + 20;
       for (var pointIndex = 0; pointIndex < count; pointIndex += 1) {
         var point = Array.isArray(points[pointIndex]) ? points[pointIndex] : [0.0, 0.0];
         var pointBase = ptsBase + (pointIndex * 4);
@@ -2136,7 +2168,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     }
     writeLightAperture(0, lights && lights.length ? lights[0] : null);
     writeLightAperture(1, lights && lights.length > 1 ? lights[1] : null);
-    var shadowBase = lightApertureBase + (2 * (20 + (MAX_LIGHT_APERTURE_POINTS * 4)));
+    var shadowBase = lightAperturePointsBase + (2 * lightAperturePointsStride);
     function writeShadowMatrix(offset, matrix) {
       for (var mi = 0; mi < 16; mi += 1) {
         f32[offset + mi] = matrix && matrix.length === 16 ? Number(matrix[mi]) || 0.0 : (mi % 5 === 0 ? 1.0 : 0.0);
@@ -2747,32 +2779,6 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     };
   }
 
-  function logMirrorIntersectionLine(viewProjection, frame, flipU, key, intervalMs) {
-    if (!frame || !Array.isArray(frame.point) || !Array.isArray(frame.uAxis) || !Array.isArray(frame.vAxis)) { return; }
-    var minU = Number(frame.minU || 0.0);
-    var maxU = Number(frame.maxU == null ? (minU + Number(frame.spanU || 0.0)) : frame.maxU);
-    var minV = Number(frame.minV || 0.0);
-    var p0 = addVec3(frame.point, addVec3(scaleVec3(frame.uAxis, minU), scaleVec3(frame.vAxis, minV)));
-    var p1 = addVec3(frame.point, addVec3(scaleVec3(frame.uAxis, (minU + maxU) * 0.5), scaleVec3(frame.vAxis, minV)));
-    var p2 = addVec3(frame.point, addVec3(scaleVec3(frame.uAxis, maxU), scaleVec3(frame.vAxis, minV)));
-    var s0 = projectMirrorWorldPointToUv(viewProjection, p0, flipU);
-    var s1 = projectMirrorWorldPointToUv(viewProjection, p1, flipU);
-    var s2 = projectMirrorWorldPointToUv(viewProjection, p2, flipU);
-    mirrorDebugLog(
-      key,
-      "[DEBUG-a4f2-line] p0=" + dbgVec(p0) +
-        " uv0=" + dbgVec(s0 && s0.uv || []) +
-        " ndc0=" + dbgVec(s0 && s0.ndc || []) +
-        " p1=" + dbgVec(p1) +
-        " uv1=" + dbgVec(s1 && s1.uv || []) +
-        " ndc1=" + dbgVec(s1 && s1.ndc || []) +
-        " p2=" + dbgVec(p2) +
-        " uv2=" + dbgVec(s2 && s2.uv || []) +
-        " ndc2=" + dbgVec(s2 && s2.ndc || []),
-      intervalMs
-    );
-  }
-
   function normalizeLightKind(kind) {
     var raw = String(kind == null ? "point" : kind).toLowerCase().trim();
     if (raw === "spotlight") { return "spot"; }
@@ -2826,9 +2832,184 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     var angle = theta + angularVelocity * seconds;
     return [
       target[0] + Math.cos(angle) * radius,
-      target[1] + height,
-      target[2] + Math.sin(angle) * radius,
+      target[1] + Math.sin(angle) * radius,
+      target[2] + height,
     ];
+  }
+
+  function planarFrameCenter(frame) {
+    if (!frame) { return [0.0, 0.0, 0.0]; }
+    var midU = 0.5 * (Number(frame.minU || 0.0) + Number(frame.maxU == null ? (Number(frame.minU || 0.0) + Number(frame.spanU || 0.0)) : frame.maxU));
+    var midV = 0.5 * (Number(frame.minV || 0.0) + Number(frame.maxV == null ? (Number(frame.minV || 0.0) + Number(frame.spanV || 0.0)) : frame.maxV));
+    return addVec3(frame.point, addVec3(scaleVec3(frame.uAxis, midU), scaleVec3(frame.vAxis, midV)));
+  }
+
+  function mirrorFrameForLightMesh(meshLike, t) {
+    if (!meshLike) { return null; }
+    var modelMatrix = resolveAnimatedModelMatrix(
+      meshLike,
+      t,
+      meshLike.center || [0, 0, 0],
+      meshLike.rotation || [0, 0, 0],
+      meshLike.scale || [1, 1, 1],
+      getMath()
+    ) || (meshLike._modelMatrix || getMath().mat4Identity());
+    var points = null;
+    if (meshLike.vertices && meshLike.vertices.length >= 30) {
+      var expectedCenter = Array.isArray(meshLike.center) ? vec3Or(meshLike.center, [0.0, 0.0, 0.0]) : null;
+      var rawPoints = planarPointsFromMeshVertices(meshLike, null);
+      var transformedPoints = planarPointsFromMeshVertices(meshLike, modelMatrix);
+      if (expectedCenter) {
+        var rawFrame = derivePlanarFrameFromPoints(rawPoints);
+        var transformedFrame = derivePlanarFrameFromPoints(transformedPoints);
+        var rawCenter = planarFrameCenter(rawFrame);
+        var transformedCenter = planarFrameCenter(transformedFrame);
+        var rawErr = dotVec3(subVec3(rawCenter, expectedCenter), subVec3(rawCenter, expectedCenter));
+        var transformedErr = dotVec3(subVec3(transformedCenter, expectedCenter), subVec3(transformedCenter, expectedCenter));
+        points = rawErr <= transformedErr ? rawPoints : transformedPoints;
+      } else {
+        points = transformedPoints;
+      }
+    } else {
+      points = planarPointsFromQuadSpec(meshLike, modelMatrix);
+    }
+    if (!Array.isArray(points) || points.length < 3) { return null; }
+    var frame = derivePlanarFrameFromPoints(points);
+    if (meshLike.surface_system && meshLike.surface_system.reverse_facing === true) {
+      frame.normal = scaleVec3(frame.normal, -1.0);
+      frame.vAxis = scaleVec3(frame.vAxis, -1.0);
+      var flippedMinV = -Number(frame.maxV || 0.0);
+      var flippedMaxV = -Number(frame.minV || 0.0);
+      frame.minV = flippedMinV;
+      frame.maxV = flippedMaxV;
+      frame.spanV = frame.maxV - frame.minV;
+    }
+    return frame;
+  }
+
+  function resolveLinkedMirrorLight(lightSpec, sourceLightsById, meshById, t) {
+    var reflectOfId = String(lightSpec && lightSpec.reflect_of_light_id || "").trim();
+    var mirrorMeshId = String(lightSpec && lightSpec.reflect_mirror_mesh_id || "").trim();
+    if (!reflectOfId && !mirrorMeshId) { return lightSpec; }
+    if (!reflectOfId || !mirrorMeshId) { return lightSpec; }
+    var sourceLight = sourceLightsById && sourceLightsById[reflectOfId];
+    var mirrorMesh = meshById && meshById[mirrorMeshId];
+    if (!sourceLight || !mirrorMesh) { return lightSpec; }
+    var frame = mirrorFrameForLightMesh(mirrorMesh, t);
+    if (!frame) { return lightSpec; }
+    var planePoint = planarFrameCenter(frame);
+    var planeNormal = normalizeVec3(frame.normal, [0.0, 1.0, 0.0]);
+    var clipEpsilon = clampPositiveNumber(lightSpec.clip_epsilon, 1e-3);
+    var sourceSide = dotVec3(subVec3(sourceLight.pos, planePoint), planeNormal);
+    var resolved = Object.assign({}, lightSpec, {
+      pos: reflectPointAcrossPlane(sourceLight.pos, planePoint, planeNormal),
+      target: reflectPointAcrossPlane(sourceLight.target, planePoint, planeNormal),
+      motion: "linked_reflection"
+    });
+    if (!(sourceSide > clipEpsilon)) {
+      resolved.intensity = 0.0;
+      resolved.power = 0.0;
+      resolved.casts_shadow = false;
+    }
+    if (!resolved.aperture_mesh_id) {
+      resolved.aperture_mesh_id = mirrorMeshId;
+    }
+    if (normalizeLightKind(resolved.kind) === "projected") {
+      var corners = mirrorWorldCorners(frame);
+      var center = planePoint.slice();
+      function localPointFromCenter(worldPoint) {
+        var rel = subVec3(worldPoint, center);
+        return [
+          dotVec3(rel, frame.uAxis),
+          dotVec3(rel, frame.vAxis)
+        ];
+      }
+      resolved.projected_aperture = {
+        mesh_id: mirrorMeshId,
+        plane_point: center.slice(),
+        plane_normal: planeNormal.slice(),
+        u_axis: frame.uAxis.slice(),
+        v_axis: frame.vAxis.slice(),
+        points: [
+          localPointFromCenter(corners.bottomLeft),
+          localPointFromCenter(corners.bottomRight),
+          localPointFromCenter(corners.topRight),
+          localPointFromCenter(corners.topLeft)
+        ],
+          clip_epsilon: clipEpsilon
+      };
+    }
+    return resolved;
+  }
+
+  function resolveProjectedLightFromMeshId(lightSpec, meshById, t) {
+    if (!lightSpec || normalizeLightKind(lightSpec.kind) !== "projected") { return lightSpec; }
+    if (lightSpec.projected_aperture && typeof lightSpec.projected_aperture === "object") { return lightSpec; }
+    var apertureMeshId = String(lightSpec.aperture_mesh_id || "").trim();
+    if (!apertureMeshId) { return lightSpec; }
+    var apertureMesh = meshById && meshById[apertureMeshId];
+    if (!apertureMesh) { return lightSpec; }
+    var frame = mirrorFrameForLightMesh(apertureMesh, t);
+    if (!frame) { return lightSpec; }
+    var corners = mirrorWorldCorners(frame);
+    var center = addVec3(
+      corners.bottomLeft,
+      scaleVec3(addVec3(subVec3(corners.topRight, corners.bottomLeft), [0.0, 0.0, 0.0]), 0.5)
+    );
+    function localPointFromCenter(worldPoint) {
+      var rel = subVec3(worldPoint, center);
+      return [
+        dotVec3(rel, frame.uAxis),
+        dotVec3(rel, frame.vAxis)
+      ];
+    }
+    return Object.assign({}, lightSpec, {
+      projected_aperture: {
+        mesh_id: apertureMeshId,
+        plane_point: center.slice(),
+        plane_normal: frame.normal.slice(),
+        u_axis: frame.uAxis.slice(),
+        v_axis: frame.vAxis.slice(),
+        points: [
+          localPointFromCenter(corners.bottomLeft),
+          localPointFromCenter(corners.bottomRight),
+          localPointFromCenter(corners.topRight),
+          localPointFromCenter(corners.topLeft)
+        ],
+        clip_epsilon: clampPositiveNumber(lightSpec.clip_epsilon, 1e-3)
+      }
+    });
+  }
+
+  function resolveSceneLights(rawLights, meshLike, t) {
+    var baseLights = (rawLights || []).map(function (l) { return normalizeLight(l, t); });
+    var sourceLightsById = Object.create(null);
+    for (var i = 0; i < baseLights.length; i += 1) {
+      var sourceLight = baseLights[i];
+      if (sourceLight && rawLights[i] && rawLights[i].id) {
+        sourceLightsById[String(rawLights[i].id)] = sourceLight;
+      }
+    }
+    var meshById = Object.create(null);
+    var sourceSpecs = Array.isArray(meshLike && meshLike.source_specs) ? meshLike.source_specs : [];
+    for (var si = 0; si < sourceSpecs.length; si += 1) {
+      var sourceSpec = sourceSpecs[si];
+      if (sourceSpec && sourceSpec.id) {
+        meshById[String(sourceSpec.id)] = sourceSpec;
+      }
+    }
+    var partSpecs = Array.isArray(meshLike && meshLike.parts) ? meshLike.parts : [];
+    for (var pi = 0; pi < partSpecs.length; pi += 1) {
+      var partMesh = partSpecs[pi];
+      if (partMesh && partMesh.id && !meshById[String(partMesh.id)]) {
+        meshById[String(partMesh.id)] = partMesh;
+      }
+    }
+    return baseLights.map(function (lightSpec, index) {
+      var resolved = resolveLinkedMirrorLight(lightSpec, sourceLightsById, meshById, t);
+      resolved = resolveProjectedLightFromMeshId(resolved, meshById, t);
+      return resolved;
+    });
   }
 
   function normalizeLight(light, t) {
@@ -2841,6 +3022,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     var innerRad = radiansFromDegrees(light.inner_cone_deg, 14.0);
     var outerRad = radiansFromDegrees(light.outer_cone_deg, 22.0);
     return {
+      id: String(light.id || ""),
       pos: pos,
       target: vec3Or(light.target, [0, 0, 0]),
       color_f32: parseColor(light.color || "white"),
@@ -2856,6 +3038,10 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       show_marker: light.show_marker !== undefined ? light.show_marker !== false : defaultShowMarker,
       source_radius: clampPositiveNumber(light.source_radius, 0.0),
       spread: clampPositiveNumber(light.spread, 1.0),
+      aperture_mesh_id: String(light.aperture_mesh_id || ""),
+      reflect_of_light_id: String(light.reflect_of_light_id || ""),
+      reflect_mirror_mesh_id: String(light.reflect_mirror_mesh_id || ""),
+      clip_epsilon: clampPositiveNumber(light.clip_epsilon, 1e-3),
       projected_aperture: light && light.projected_aperture && typeof light.projected_aperture === "object"
         ? light.projected_aperture
         : null,
@@ -2879,9 +3065,9 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       var mesh = part && part.mesh;
       if (!mesh || part.topology !== "triangle-list") { continue; }
       if (mesh.visible === false) { continue; }
+      if (mesh.casts_shadow === false) { continue; }
       if (mesh.pickable === false && mesh.no_lighting === true) { continue; }
       if (String(mesh.blend_mode || "") === "additive") { continue; }
-      if (mesh.transparent === true && mesh.depth_write !== true) { continue; }
       var model = resolveAnimatedModelMatrix(
         mesh,
         t,
@@ -2902,6 +3088,93 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
   function fitShadowViewProjection(light, worldPoints, MmLocal) {
     if (!light || !Array.isArray(worldPoints) || !worldPoints.length) { return null; }
     var eye = vec3Or(light.pos, [0.0, 0.0, 0.0]);
+    var aperture = light && light.projected_aperture && typeof light.projected_aperture === "object"
+      ? light.projected_aperture
+      : null;
+    if (aperture) {
+      var planePoint = vec3Or(aperture.plane_point, [0.0, 0.0, 0.0]);
+      var planeNormal = normalizeVec3(vec3Or(aperture.plane_normal, [0.0, 0.0, 1.0]), [0.0, 0.0, 1.0]);
+      var uAxis = normalizeVec3(vec3Or(aperture.u_axis, [1.0, 0.0, 0.0]), [1.0, 0.0, 0.0]);
+      var vAxis = normalizeVec3(vec3Or(aperture.v_axis, [0.0, 1.0, 0.0]), [0.0, 1.0, 0.0]);
+      var aperturePts = Array.isArray(aperture.points) ? aperture.points : [];
+      var clipEpsilon = Math.max(0.0, Number(aperture.clip_epsilon || 0.0) || 0.0);
+      var lightSide = dotVec3(subVec3(eye, planePoint), planeNormal);
+      var targetProj = subVec3(planePoint, scaleVec3(planeNormal, lightSide));
+      var target = addVec3(targetProj, scaleVec3(planeNormal, -Math.max(1.0, Math.abs(lightSide))));
+      var forwardA = normalizeVec3(subVec3(target, eye), [0.0, 0.0, -1.0]);
+      var upA = chooseShadowUp(forwardA);
+      var viewA = mat4LookAt(eye, target, upA);
+      function localSide(a, b, p) {
+        return ((b[0] - a[0]) * (p[1] - a[1])) - ((b[1] - a[1]) * (p[0] - a[0]));
+      }
+      function pointInApertureLocal(local) {
+        if (!Array.isArray(aperturePts) || aperturePts.length < 3) { return false; }
+        var sign = 0.0;
+        for (var ai = 0; ai < aperturePts.length; ai += 1) {
+          var a = aperturePts[ai];
+          var b = aperturePts[(ai + 1) % aperturePts.length];
+          var side = localSide(a, b, local);
+          if (Math.abs(side) <= 1e-6) { continue; }
+          if (sign === 0.0) {
+            sign = side > 0.0 ? 1.0 : -1.0;
+            continue;
+          }
+          if ((side > 0.0 ? 1.0 : -1.0) !== sign) { return false; }
+        }
+        return true;
+      }
+      function projectedPointAccepted(worldPoint) {
+        var pointSide = dotVec3(subVec3(worldPoint, planePoint), planeNormal);
+        var receiverSide = (-Math.sign(lightSide || 1.0)) * pointSide;
+        if (!(receiverSide > clipEpsilon)) { return false; }
+        var ray = subVec3(worldPoint, eye);
+        var denom = dotVec3(planeNormal, ray);
+        if (Math.abs(denom) <= 1e-6) { return false; }
+        var tHit = dotVec3(subVec3(planePoint, eye), planeNormal) / denom;
+        if (!(tHit > 1e-4 && tHit < (1.0 - 1e-4))) { return false; }
+        var hit = addVec3(eye, scaleVec3(ray, tHit));
+        var rel = subVec3(hit, planePoint);
+        var local = [dotVec3(rel, uAxis), dotVec3(rel, vAxis)];
+        return pointInApertureLocal(local);
+      }
+      var candidatePoints = [];
+      for (var pi = 0; pi < aperturePts.length; pi += 1) {
+        var apt = aperturePts[pi];
+        candidatePoints.push(addVec3(planePoint, addVec3(scaleVec3(uAxis, Number(apt[0]) || 0.0), scaleVec3(vAxis, Number(apt[1]) || 0.0))));
+      }
+      for (var wi = 0; wi < worldPoints.length; wi += 1) {
+        if (projectedPointAccepted(worldPoints[wi])) {
+          candidatePoints.push(worldPoints[wi]);
+        }
+      }
+      var minDistA = Infinity;
+      var maxDistA = 0.0;
+      var maxTanXA = 0.0;
+      var maxTanYA = 0.0;
+      for (var ci = 0; ci < candidatePoints.length; ci += 1) {
+        var pViewA = transformPointMat4(viewA, candidatePoints[ci]);
+        var distA = -Number(pViewA[2] || 0.0);
+        if (!(distA > 1e-4)) { continue; }
+        if (distA < minDistA) { minDistA = distA; }
+        if (distA > maxDistA) { maxDistA = distA; }
+        maxTanXA = Math.max(maxTanXA, Math.abs(Number(pViewA[0] || 0.0)) / distA);
+        maxTanYA = Math.max(maxTanYA, Math.abs(Number(pViewA[1] || 0.0)) / distA);
+      }
+      if (!(maxDistA > 1e-3) || !(minDistA < Infinity)) { return null; }
+      var nearA = Math.max(0.05, minDistA * 0.98);
+      var farA = Math.max(nearA + 1.0, maxDistA * 1.04);
+      maxTanXA = Math.max(maxTanXA, 1e-3);
+      maxTanYA = Math.max(maxTanYA, 1e-3);
+      var aspectA = Math.max(1e-3, maxTanXA / maxTanYA);
+      var fovYA = 2.0 * Math.atan(maxTanYA);
+      var projA = MmLocal.mat4PerspectiveZ01(fovYA, aspectA, nearA, farA);
+      return {
+        view: viewA,
+        projection: projA,
+        viewProjection: MmLocal.mat4Mul(projA, viewA),
+        bias: Math.max(0.0008, Math.min(0.0035, 0.0010 + ((farA - nearA) * 0.00002)))
+      };
+    }
     var target = Array.isArray(light.target) ? vec3Or(light.target, [0.0, 0.0, 0.0]) : addVec3(eye, vec3Or(light.direction_f32, [0.0, 0.0, -1.0]));
     var forward = normalizeVec3(subVec3(target, eye), [0.0, 0.0, -1.0]);
     var up = chooseShadowUp(forward);
@@ -3597,7 +3870,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     _prepareShadowMapsForScene: function (enc, mesh, t, frameWidth, frameHeight) {
       if (!mesh || !Array.isArray(this._parts) || !this._parts.length || !sharedWgpu) { return [null, null]; }
       var MmLocal = getMath();
-      var sceneLights = (mesh.lights || []).map(function (l) { return normalizeLight(l, t); });
+      var sceneLights = resolveSceneLights(mesh.lights || [], mesh, t);
       var activeLights = [];
       for (var li = 0; li < sceneLights.length && activeLights.length < 2; li += 1) {
         if (sceneLights[li] && sceneLights[li].casts_shadow !== false) {
@@ -3628,14 +3901,19 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
           }
         });
         pass.setPipeline(pipe);
+        var shadowLight = slot === 1 ? activeLights[1] : activeLights[0];
+        var apertureCasterId = shadowLight && shadowLight.projected_aperture && shadowLight.projected_aperture.mesh_id
+          ? String(shadowLight.projected_aperture.mesh_id)
+          : "";
         for (var i = 0; i < renderer._parts.length; i += 1) {
           var part = renderer._parts[i];
           var partMesh = part && part.mesh;
           if (!part || !partMesh || part.topology !== "triangle-list") { continue; }
           if (partMesh.visible === false) { continue; }
+          if (partMesh.casts_shadow === false) { continue; }
+          if (apertureCasterId && String(partMesh.id || "") === apertureCasterId) { continue; }
           if (partMesh.no_lighting === true) { continue; }
           if (String(partMesh.blend_mode || "") === "additive") { continue; }
-          if (partMesh.transparent === true && partMesh.depth_write !== true) { continue; }
           var model = resolveAnimatedModelMatrix(
             partMesh,
             t,
@@ -3768,7 +4046,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
         mvpPart = MmBatch.mat4Mul(projMatPart, viewMatPart);
       }
       var rawLightsPart = partMesh.no_lighting === true ? [] : (partMesh.lights || sceneMesh.lights || []);
-      var lightsNormPart = rawLightsPart.map(function (l) { return normalizeLight(l, t); });
+      var lightsNormPart = resolveSceneLights(rawLightsPart, sceneMesh, t);
       var lmNamePart = partMesh.light_model || sceneMesh.light_model || (lightsNormPart[0] && lightsNormPart[0].model) || "blinn_phong";
       var lmIntPart = LIGHT_MODELS[lmNamePart] !== undefined ? LIGHT_MODELS[lmNamePart] : 2;
       var ubPart = buildUniform(mvpPart, modelMatPart, posPart, lightsNormPart, lmIntPart, resolveAlphaMul(partMesh), partMesh);
@@ -4422,7 +4700,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
           sceneView = mat4LookAt(scenePos, sceneTarget, sceneUp);
         }
         var sceneMvp = MmBatch.mat4Mul(sceneProj, sceneView);
-        var sceneLights = (mesh.lights || []).map(function (l) { return normalizeLight(l, t); });
+        var sceneLights = resolveSceneLights(mesh.lights || [], mesh, t);
         this._drawGpuLightFlares(encBatch, mesh, sceneMvp, scenePos, sceneLights, wBatch, hBatch, this._frameColorView);
 
         var sgBatch = sharedWgpu;
@@ -4550,7 +4828,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
 
       // --- Lights ---
       var rawLights = mesh.no_lighting === true ? [] : (mesh.lights || []);
-      var lightsNorm = rawLights.map(function (l) { return normalizeLight(l, t); });
+      var lightsNorm = resolveSceneLights(rawLights, mesh, t);
       var lmName = mesh.light_model || (lightsNorm[0] && lightsNorm[0].model) || "blinn_phong";
       var lmInt  = LIGHT_MODELS[lmName] !== undefined ? LIGHT_MODELS[lmName] : 2;
 
