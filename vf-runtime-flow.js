@@ -213,14 +213,12 @@
         .then(function(packets) {
           var applied = 0;
           if (!Array.isArray(packets)) {
-            runtimeLog("info", "loadRuntimePackets: no packet array");
             return {
               applied: applied,
               nextPollDelayMs: getNextPacketPollDelay(),
               packetRuntimeState: getPacketRuntimeState()
             };
           }
-          runtimeLog("info", "loadRuntimePackets: fetched=" + packets.length + " lastSeq=" + state.lastRuntimePacketSeq);
           for (var i = 0; i < packets.length; i++) {
             var packet = packets[i];
             var seq = Number(packet && packet.seq);
@@ -241,7 +239,6 @@
             if (state.runtimePacketsSeen) {
               state.packetIdlePolls = Number(state.packetIdlePolls || 0) + 1;
             }
-            runtimeLog("info", "loadRuntimePackets: applied=0");
           }
           return {
             applied: applied,

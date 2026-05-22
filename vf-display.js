@@ -1023,7 +1023,19 @@
       };
     }
 
-    function buildExpandedPointMesh(spec, camera, lights) {
+    function fieldMeshRenderMode(spec) {
+      var mode = String((spec && spec.render_mode) || "proxy_geometry").toLowerCase();
+      return mode === "marker_impostor" ? "marker_impostor" : "proxy_geometry";
+    }
+
+    function fieldMeshMarkerSpace(spec) {
+      var mode = fieldMeshRenderMode(spec);
+      var space = String((spec && spec.marker_space) || (mode === "marker_impostor" ? "pixel" : "world")).toLowerCase();
+      return space === "pixel" ? "pixel" : "world";
+    }
+
+  function buildExpandedPointMesh(spec, camera, lights) {
+    var sizingCamera = camera && camera._marker_size_camera ? camera._marker_size_camera : camera;
     var verts = spec.vertices || [];
     var inds = spec.indices || [];
     var vertexRadius = Number(spec.vertex_size || 0);
@@ -1061,7 +1073,8 @@
     var outOffset = 0;
     var scales = Array.isArray(spec.vertex_scale) ? spec.vertex_scale : null;
     var globalScale = scales ? null : Number(spec.vertex_scale == null ? 1.0 : spec.vertex_scale);
-      var viewportHeight = Number(camera && camera.viewport_height_px) || 0;
+    var viewportHeight = markerViewportHeight(sizingCamera, Number(sizingCamera && sizingCamera.viewport_height_px) || 0);
+    var markerSpace = fieldMeshMarkerSpace(spec);
       for (var pi = 0; pi < pointCount; pi += 1) {
       var sourceIndex = Number(inds[pi]) * 10;
       var px = Number(verts[sourceIndex] || 0);
@@ -1069,8 +1082,10 @@
         var pz = Number(verts[sourceIndex + 2] || 0);
         var sizeScale = scales ? Number(scales[pi] == null ? 1.0 : scales[pi]) : globalScale;
         if (!(sizeScale > 0)) { sizeScale = 1.0; }
-        var radius = impostorWorldRadius(camera, viewportHeight, [px, py, pz], vertexRadius * sizeScale);
-        var cr = Number(verts[sourceIndex + 6] == null ? 0.8 : verts[sourceIndex + 6]);
+        var radius = markerSpace === "pixel"
+          ? impostorWorldRadius(sizingCamera, viewportHeight, [px, py, pz], vertexRadius * sizeScale)
+          : (vertexRadius * sizeScale);
+      var cr = Number(verts[sourceIndex + 6] == null ? 0.8 : verts[sourceIndex + 6]);
       var cg = Number(verts[sourceIndex + 7] == null ? 0.8 : verts[sourceIndex + 7]);
       var cb = Number(verts[sourceIndex + 8] == null ? 0.8 : verts[sourceIndex + 8]);
       var ca = Number(verts[sourceIndex + 9] == null ? 1.0 : verts[sourceIndex + 9]);
@@ -1093,15 +1108,20 @@
     }
     mesh.camera = camera || null;
     mesh.lights = lights || [];
+    mesh.interpolation = spec.interpolation === true;
     mesh.__revision = Number(mesh.__revision || 0) + 1;
     return mesh;
   }
 
-    function buildExpandedLineMesh(spec, camera, lights) {
+  function buildExpandedLineMesh(spec, camera, lights) {
+    var sizingCamera = camera && camera._marker_size_camera ? camera._marker_size_camera : camera;
     var verts = spec.vertices || [];
     var inds = spec.indices || [];
     var edgeRadius = Number(spec.edge_width || 0);
-    if (!(edgeRadius > 0) || inds.length < 2) { return null; }
+    var vertexWidths = Array.isArray(spec.vertex_widths) ? spec.vertex_widths : null;
+    var hasVertexWidths = !!(vertexWidths && vertexWidths.length);
+    if (!(edgeRadius > 0) && !hasVertexWidths) { return null; }
+    if (inds.length < 2) { return null; }
     var edgeCaps = spec.edge_caps === true;
     var cylinderTemplate = getCylinderTemplate(20);
     var cylinderVertCount = Math.floor(cylinderTemplate.ring.length / 2) * 2;
@@ -1118,6 +1138,7 @@
       mesh.__cacheKind !== "line-list" ||
       mesh.__sourceCount !== segmentCount ||
       mesh.__radius !== edgeRadius ||
+      mesh.__hasVertexWidths !== hasVertexWidths ||
       mesh.__edgeCaps !== edgeCaps ||
       !mesh.vertices ||
       mesh.vertices.length !== vertexCount * 10 ||
@@ -1155,12 +1176,14 @@
       }
       mesh.__sourceCount = segmentCount;
       mesh.__radius = edgeRadius;
+      mesh.__hasVertexWidths = hasVertexWidths;
       mesh.__edgeCaps = edgeCaps;
       spec.__overlayExpandedMesh = mesh;
     }
     var out = mesh.vertices;
     var outOffset = 0;
-    var viewportHeight = Number(camera && camera.viewport_height_px) || 0;
+    var viewportHeight = markerViewportHeight(sizingCamera, Number(sizingCamera && sizingCamera.viewport_height_px) || 0);
+    var markerSpace = fieldMeshMarkerSpace(spec);
     for (var segment = 0; segment < segmentCount; segment += 1) {
       var aSource = Number(inds[segment * 2]) * 10;
       var bSource = Number(inds[(segment * 2) + 1]) * 10;
@@ -1174,12 +1197,14 @@
         var cg = Number(verts[aSource + 7] == null ? 0.8 : verts[aSource + 7]);
         var cb = Number(verts[aSource + 8] == null ? 0.8 : verts[aSource + 8]);
         var ca = Number(verts[aSource + 9] == null ? 1.0 : verts[aSource + 9]);
-        var edgeRadiusWorld = impostorWorldRadius(
-        camera,
-        viewportHeight,
-          [(ax + bx) * 0.5, (ay + by) * 0.5, (az + bz) * 0.5],
-          edgeRadius
-        );
+        var aWidth = hasVertexWidths ? Number(vertexWidths[Number(inds[segment * 2])] || 0) : edgeRadius;
+        var bWidth = hasVertexWidths ? Number(vertexWidths[Number(inds[(segment * 2) + 1])] || 0) : edgeRadius;
+        var edgeRadiusWorldA = markerSpace === "pixel"
+          ? impostorWorldRadius(sizingCamera, viewportHeight, [ax, ay, az], aWidth)
+          : aWidth;
+        var edgeRadiusWorldB = markerSpace === "pixel"
+          ? impostorWorldRadius(sizingCamera, viewportHeight, [bx, by, bz], bWidth)
+          : bWidth;
         var dir = norm3(bx - ax, by - ay, bz - az);
       var ref = Math.abs(dir[1]) < 0.92 ? [0, 1, 0] : [1, 0, 0];
       var u = norm3.apply(null, cross3(dir, ref));
@@ -1190,9 +1215,9 @@
         var nx = (u[0] * ct) + (v[0] * st);
         var ny = (u[1] * ct) + (v[1] * st);
         var nz = (u[2] * ct) + (v[2] * st);
-        out[outOffset] = ax + (edgeRadiusWorld * nx);
-        out[outOffset + 1] = ay + (edgeRadiusWorld * ny);
-        out[outOffset + 2] = az + (edgeRadiusWorld * nz);
+        out[outOffset] = ax + (edgeRadiusWorldA * nx);
+        out[outOffset + 1] = ay + (edgeRadiusWorldA * ny);
+        out[outOffset + 2] = az + (edgeRadiusWorldA * nz);
         out[outOffset + 3] = nx;
         out[outOffset + 4] = ny;
         out[outOffset + 5] = nz;
@@ -1201,9 +1226,9 @@
         out[outOffset + 8] = cb;
         out[outOffset + 9] = ca;
         outOffset += 10;
-        out[outOffset] = bx + (edgeRadiusWorld * nx);
-        out[outOffset + 1] = by + (edgeRadiusWorld * ny);
-        out[outOffset + 2] = bz + (edgeRadiusWorld * nz);
+        out[outOffset] = bx + (edgeRadiusWorldB * nx);
+        out[outOffset + 1] = by + (edgeRadiusWorldB * ny);
+        out[outOffset + 2] = bz + (edgeRadiusWorldB * nz);
         out[outOffset + 3] = nx;
         out[outOffset + 4] = ny;
         out[outOffset + 5] = nz;
@@ -1218,9 +1243,9 @@
           var cax = capTemplate.verts[capVertA];
           var cay = capTemplate.verts[capVertA + 1];
           var caz = capTemplate.verts[capVertA + 2];
-          out[outOffset] = ax + (edgeRadiusWorld * cax);
-          out[outOffset + 1] = ay + (edgeRadiusWorld * cay);
-          out[outOffset + 2] = az + (edgeRadiusWorld * caz);
+          out[outOffset] = ax + (edgeRadiusWorldA * cax);
+          out[outOffset + 1] = ay + (edgeRadiusWorldA * cay);
+          out[outOffset + 2] = az + (edgeRadiusWorldA * caz);
           out[outOffset + 3] = cax;
           out[outOffset + 4] = cay;
           out[outOffset + 5] = caz;
@@ -1234,9 +1259,9 @@
           var cbx = capTemplate.verts[capVertB];
           var cby = capTemplate.verts[capVertB + 1];
           var cbz = capTemplate.verts[capVertB + 2];
-          out[outOffset] = bx + (edgeRadiusWorld * cbx);
-          out[outOffset + 1] = by + (edgeRadiusWorld * cby);
-          out[outOffset + 2] = bz + (edgeRadiusWorld * cbz);
+          out[outOffset] = bx + (edgeRadiusWorldB * cbx);
+          out[outOffset + 1] = by + (edgeRadiusWorldB * cby);
+          out[outOffset + 2] = bz + (edgeRadiusWorldB * cbz);
           out[outOffset + 3] = cbx;
           out[outOffset + 4] = cby;
           out[outOffset + 5] = cbz;
@@ -1250,11 +1275,181 @@
     }
     mesh.camera = camera || null;
     mesh.lights = lights || [];
+    mesh.interpolation = spec.interpolation === true;
     mesh.__revision = Number(mesh.__revision || 0) + 1;
     return mesh;
   }
 
-    function buildCombinedTriangleMesh(specs, camera, lights) {
+  function buildAnalyticPointImpostorMesh(spec, camera, lights) {
+    var sizingCamera = camera && camera._marker_size_camera ? camera._marker_size_camera : camera;
+    var verts = spec.vertices || [];
+    var inds = spec.indices || [];
+    var vertexRadius = Number(spec.vertex_size || 0);
+    if (!(vertexRadius > 0) || !inds.length) { return null; }
+    var mesh = spec.__analyticImpostorMesh;
+    if (!mesh || mesh.__cacheKind !== "point-impostor") {
+      mesh = {
+        id: String(spec.id || "point_impostor"),
+        mode3d: true,
+        label: String(spec.id || "point_impostor"),
+        vertices: new Float32Array([
+          -1, -1, 0,  0, 0, 1,  1, 1, 1, 1,
+           1, -1, 0,  0, 0, 1,  1, 1, 1, 1,
+           1,  1, 0,  0, 0, 1,  1, 1, 1, 1,
+          -1,  1, 0,  0, 0, 1,  1, 1, 1, 1
+        ]),
+        indices: new Uint32Array([0, 1, 2, 0, 2, 3]),
+        topology: "triangle-list",
+        camera: null,
+        lights: [],
+        center: [0, 0, 0],
+        rotation: [0, 0, 0],
+        scale: [1, 1, 1],
+        alpha: 1,
+        transparent: true,
+        overlay_expanded: true,
+        instance_kind: "point-impostor",
+        static_vertices: true,
+        static_indices: true,
+        __cacheKind: "point-impostor"
+      };
+      spec.__analyticImpostorMesh = mesh;
+    }
+    var pointCount = inds.length;
+    var inst = new Float32Array(pointCount * 8);
+    var scales = Array.isArray(spec.vertex_scale) ? spec.vertex_scale : null;
+    var globalScale = scales ? null : Number(spec.vertex_scale == null ? 1.0 : spec.vertex_scale);
+    var viewportHeight = markerViewportHeight(sizingCamera, Number(sizingCamera && sizingCamera.viewport_height_px) || 0);
+    var markerSpace = fieldMeshMarkerSpace(spec);
+    for (var pi = 0; pi < pointCount; pi += 1) {
+      var sourceIndex = Number(inds[pi]) * 10;
+      var px = Number(verts[sourceIndex] || 0);
+      var py = Number(verts[sourceIndex + 1] || 0);
+      var pz = Number(verts[sourceIndex + 2] || 0);
+      var sizeScale = scales ? Number(scales[pi] == null ? 1.0 : scales[pi]) : globalScale;
+      if (!(sizeScale > 0)) { sizeScale = 1.0; }
+      var radius = markerSpace === "pixel"
+        ? impostorWorldRadius(sizingCamera, viewportHeight, [px, py, pz], vertexRadius * sizeScale)
+        : (vertexRadius * sizeScale);
+      var cr = Number(verts[sourceIndex + 6] == null ? 0.8 : verts[sourceIndex + 6]);
+      var cg = Number(verts[sourceIndex + 7] == null ? 0.8 : verts[sourceIndex + 7]);
+      var cb = Number(verts[sourceIndex + 8] == null ? 0.8 : verts[sourceIndex + 8]);
+      var ca = Number(verts[sourceIndex + 9] == null ? 1.0 : verts[sourceIndex + 9]);
+      var base = pi * 8;
+      inst[base + 0] = px;
+      inst[base + 1] = py;
+      inst[base + 2] = pz;
+      inst[base + 3] = radius;
+      inst[base + 4] = cr;
+      inst[base + 5] = cg;
+      inst[base + 6] = cb;
+      inst[base + 7] = ca;
+    }
+    mesh.instances = inst;
+    mesh.instance_count = pointCount;
+    mesh.camera = camera || null;
+    mesh.lights = lights || [];
+    mesh.alpha = meshAlpha(spec);
+    mesh.depth_write = spec.depth_write === true;
+    mesh.interpolation = spec.interpolation === true;
+    mesh.pickable = false;
+    mesh.__revision = Number(mesh.__revision || 0) + 1;
+    return mesh;
+  }
+
+  function buildAnalyticLineImpostorMesh(spec, camera, lights) {
+    var sizingCamera = camera && camera._marker_size_camera ? camera._marker_size_camera : camera;
+    var verts = spec.vertices || [];
+    var inds = spec.indices || [];
+    var edgeRadius = Number(spec.edge_width || 0);
+    var vertexWidths = Array.isArray(spec.vertex_widths) ? spec.vertex_widths : null;
+    var hasVertexWidths = !!(vertexWidths && vertexWidths.length);
+    if (!(edgeRadius > 0) && !hasVertexWidths) { return null; }
+    if (inds.length < 2) { return null; }
+    var mesh = spec.__analyticImpostorMesh;
+    if (!mesh || mesh.__cacheKind !== "line-impostor") {
+      mesh = {
+        id: String(spec.id || "line_impostor"),
+        mode3d: true,
+        label: String(spec.id || "line_impostor"),
+        vertices: new Float32Array([
+          -1, 0, 0,  0, 0, 1,  1, 1, 1, 1,
+           1, 0, 0,  0, 0, 1,  1, 1, 1, 1,
+          -1, 1, 0,  0, 0, 1,  1, 1, 1, 1,
+           1, 1, 0,  0, 0, 1,  1, 1, 1, 1
+        ]),
+        indices: new Uint32Array([0, 1, 2, 2, 1, 3]),
+        topology: "triangle-list",
+        camera: null,
+        lights: [],
+        center: [0, 0, 0],
+        rotation: [0, 0, 0],
+        scale: [1, 1, 1],
+        alpha: 1,
+        transparent: true,
+        overlay_expanded: true,
+        instance_kind: "line-impostor",
+        static_vertices: true,
+        static_indices: true,
+        __cacheKind: "line-impostor"
+      };
+      spec.__analyticImpostorMesh = mesh;
+    }
+    var segmentCount = Math.floor(inds.length / 2);
+    var inst = new Float32Array(segmentCount * 12);
+    var viewportHeight = markerViewportHeight(sizingCamera, Number(sizingCamera && sizingCamera.viewport_height_px) || 0);
+    var markerSpace = fieldMeshMarkerSpace(spec);
+    for (var si = 0; si < segmentCount; si += 1) {
+      var aIdx = Number(inds[si * 2]);
+      var bIdx = Number(inds[(si * 2) + 1]);
+      var aBase = aIdx * 10;
+      var bBase = bIdx * 10;
+      var ax = Number(verts[aBase] || 0);
+      var ay = Number(verts[aBase + 1] || 0);
+      var az = Number(verts[aBase + 2] || 0);
+      var bx = Number(verts[bBase] || 0);
+      var by = Number(verts[bBase + 1] || 0);
+      var bz = Number(verts[bBase + 2] || 0);
+      var aWidth = hasVertexWidths ? Number(vertexWidths[aIdx] || 0) : edgeRadius;
+      var bWidth = hasVertexWidths ? Number(vertexWidths[bIdx] || 0) : edgeRadius;
+      var aRadius = markerSpace === "pixel"
+        ? impostorWorldRadius(sizingCamera, viewportHeight, [ax, ay, az], aWidth)
+        : aWidth;
+      var bRadius = markerSpace === "pixel"
+        ? impostorWorldRadius(sizingCamera, viewportHeight, [bx, by, bz], bWidth)
+        : bWidth;
+      var cr = Number(verts[aBase + 6] == null ? 0.8 : verts[aBase + 6]);
+      var cg = Number(verts[aBase + 7] == null ? 0.8 : verts[aBase + 7]);
+      var cb = Number(verts[aBase + 8] == null ? 0.8 : verts[aBase + 8]);
+      var ca = Number(verts[aBase + 9] == null ? 1.0 : verts[aBase + 9]);
+      var base = si * 12;
+      inst[base + 0] = ax;
+      inst[base + 1] = ay;
+      inst[base + 2] = az;
+      inst[base + 3] = aRadius;
+      inst[base + 4] = bx;
+      inst[base + 5] = by;
+      inst[base + 6] = bz;
+      inst[base + 7] = bRadius;
+      inst[base + 8] = cr;
+      inst[base + 9] = cg;
+      inst[base + 10] = cb;
+      inst[base + 11] = ca;
+    }
+    mesh.instances = inst;
+    mesh.instance_count = segmentCount;
+    mesh.camera = camera || null;
+    mesh.lights = lights || [];
+    mesh.alpha = meshAlpha(spec);
+    mesh.depth_write = spec.depth_write === true;
+    mesh.interpolation = spec.interpolation === true;
+    mesh.pickable = false;
+    mesh.__revision = Number(mesh.__revision || 0) + 1;
+    return mesh;
+  }
+
+  function buildCombinedTriangleMesh(specs, camera, lights) {
+    var sizingCamera = camera && camera._marker_size_camera ? camera._marker_size_camera : camera;
     if (Array.isArray(specs) && specs.length === 1) {
       var singleSpec = specs[0] || {};
       if (singleSpec.type === "field_mesh") {
@@ -1272,7 +1467,7 @@
     var outIdx = [];
     var spheres = 0;
     var cylinders = 0;
-    var viewportHeight = Number(camera && camera.viewport_height_px) || 0;
+    var viewportHeight = markerViewportHeight(sizingCamera, Number(sizingCamera && sizingCamera.viewport_height_px) || 0);
     for (var si = 0; si < specs.length; si++) {
       var spec = specs[si] || {};
       if (spec.type !== "field_mesh") { return null; }
@@ -1281,6 +1476,7 @@
       var topology = String(spec.topology || "");
       var vertexRadius = Number(spec.vertex_size || 0);
       var edgeRadius = Number(spec.edge_width || 0);
+      var markerSpace = fieldMeshMarkerSpace(spec);
       if (topology === "point-list" && vertexRadius > 0) {
         var pointScales = Array.isArray(spec.vertex_scale) ? spec.vertex_scale : null;
         var pointGlobalScale = pointScales ? null : Number(spec.vertex_scale == null ? 1.0 : spec.vertex_scale);
@@ -1293,14 +1489,16 @@
               outVerts,
               outIdx,
               pointCenter,
-              impostorWorldRadius(camera, viewportHeight, pointCenter, vertexRadius * pointScale),
+              markerSpace === "pixel"
+                ? impostorWorldRadius(sizingCamera, viewportHeight, pointCenter, vertexRadius * pointScale)
+                : (vertexRadius * pointScale),
               meshColorAt(verts, vi),
-              12,
-              18
+              20,
+              32
             );
           spheres += 1;
         }
-      } else if (topology === "line-list" && edgeRadius > 0) {
+      } else if (topology === "line-list" && (edgeRadius > 0 || (Array.isArray(spec.vertex_widths) && spec.vertex_widths.length > 0))) {
         var edgeCaps = spec.edge_caps === true;
         for (var ei = 0; ei + 1 < inds.length; ei += 2) {
           var aIdx = Number(inds[ei]);
@@ -1308,16 +1506,18 @@
             var pa = meshVec3At(verts, aIdx);
             var pb = meshVec3At(verts, bIdx);
             var col = meshColorAt(verts, aIdx);
-            var edgeRadiusWorld = impostorWorldRadius(
-              camera,
-            viewportHeight,
-              [(pa[0] + pb[0]) * 0.5, (pa[1] + pb[1]) * 0.5, (pa[2] + pb[2]) * 0.5],
-              edgeRadius
-            );
-            appendCylinderMesh(outVerts, outIdx, pa, pb, edgeRadiusWorld, col, 20);
+            var aWidth = Array.isArray(spec.vertex_widths) ? Number(spec.vertex_widths[aIdx] || 0) : edgeRadius;
+            var bWidth = Array.isArray(spec.vertex_widths) ? Number(spec.vertex_widths[bIdx] || 0) : edgeRadius;
+            var edgeRadiusWorld = markerSpace === "pixel"
+              ? Math.max(
+                  impostorWorldRadius(sizingCamera, viewportHeight, pa, aWidth),
+                  impostorWorldRadius(sizingCamera, viewportHeight, pb, bWidth)
+                )
+              : Math.max(aWidth, bWidth);
+            appendCylinderMesh(outVerts, outIdx, pa, pb, edgeRadiusWorld, col, 32);
             if (edgeCaps) {
-              appendSphereMesh(outVerts, outIdx, pa, edgeRadiusWorld, col, 10, 14);
-              appendSphereMesh(outVerts, outIdx, pb, edgeRadiusWorld, col, 10, 14);
+              appendSphereMesh(outVerts, outIdx, pa, edgeRadiusWorld, col, 16, 24);
+              appendSphereMesh(outVerts, outIdx, pb, edgeRadiusWorld, col, 16, 24);
               spheres += 2;
           }
           cylinders += 1;
@@ -1429,6 +1629,12 @@
     var verticalScale = cameraVerticalScale(cam);
     var worldPerPixel = (2 * depth) / (viewportHeight * Math.max(1e-6, verticalScale));
     return pxRadius * worldPerPixel;
+  }
+
+  function markerViewportHeight(camera, fallbackHeightPx) {
+    var ref = Number(camera && camera.viewport_marker_reference_height_px || 0);
+    if (ref > 0) { return ref; }
+    return Number(fallbackHeightPx || 0);
   }
 
     function applyImpostorViewBias(camera, viewportHeightPx, point, pixelBias) {
@@ -1560,12 +1766,17 @@
     var parts = [];
     for (var i = 0; i < specs.length; i++) {
       var mesh = buildSingleMesh(specs[i], camera, lights);
-      if (!mesh) { return null; }
+      if (!mesh) {
+        vlog("warn", "buildUnifiedFrameScene: buildSingleMesh returned null at index=" + i + " type=" + String(specs[i] && specs[i].type || ""));
+        return null;
+      }
       mesh.object_id = Number(specs[i] && specs[i].object_id) || (i + 1);
       if (!mesh.indices || !mesh.indices.length) {
+        vlog("warn", "buildUnifiedFrameScene: part has zero indices at index=" + i + " id=" + String(mesh.id || i) + " type=" + String(specs[i] && specs[i].type || ""));
         throw new Error("buildUnifiedFrameScene: part has zero indices: " + String(mesh.id || i));
       }
       if (!mesh.vertices || !mesh.vertices.length) {
+        vlog("warn", "buildUnifiedFrameScene: part has zero vertices at index=" + i + " id=" + String(mesh.id || i) + " type=" + String(specs[i] && specs[i].type || ""));
         throw new Error("buildUnifiedFrameScene: part has zero vertices: " + String(mesh.id || i));
       }
       parts.push(mesh);
@@ -1604,12 +1815,40 @@
       var verts = spec.vertices || [];
       var inds = spec.indices || [];
       var topology = String(spec.topology || "");
-      if (topology === "point-list") {
-        mesh = buildExpandedPointMesh(spec, camera, lights);
-      } else if (topology === "line-list" && Number(spec.edge_width || 0) > 0 && spec.edge_caps === true) {
-        mesh = buildExpandedLineMesh(spec, camera, lights);
+      var renderMode = fieldMeshRenderMode(spec);
+      if (spec.instance_kind && spec.instances && Number(spec.instance_count || 0) > 0) {
+        mesh = {
+          id: spec.id || "field_mesh",
+          mode3d: spec.mode3d === false ? false : true,
+          label: spec.id || "field_mesh",
+          vertices: (verts instanceof Float32Array) ? verts : new Float32Array(verts),
+          indices: (inds instanceof Uint32Array) ? inds : new Uint32Array(inds),
+          instances: (spec.instances instanceof Float32Array) ? spec.instances : new Float32Array(spec.instances),
+          instance_count: Math.max(0, Number(spec.instance_count || 0) | 0),
+          instance_kind: String(spec.instance_kind || ""),
+          static_vertices: spec.static_vertices === true,
+          static_indices: spec.static_indices === true,
+          topology: spec.topology || "triangle-list",
+          transparent: spec.transparent === true,
+          overlay_expanded: spec.overlay_expanded === true,
+          pickable: spec.pickable === true
+        };
+      } else if (topology === "point-list") {
+        mesh = renderMode === "marker_impostor"
+          ? buildAnalyticPointImpostorMesh(spec, camera, lights)
+          : buildExpandedPointMesh(spec, camera, lights);
+      } else if (
+        topology === "line-list" &&
+        (
+          Number(spec.edge_width || 0) > 0 ||
+          (Array.isArray(spec.vertex_widths) && spec.vertex_widths.length > 0)
+        )
+      ) {
+        mesh = renderMode === "marker_impostor"
+          ? buildAnalyticLineImpostorMesh(spec, camera, lights)
+          : buildExpandedLineMesh(spec, camera, lights);
       }
-      if (meshAlpha(spec) < 0.999) {
+      if (meshAlpha(spec) < 0.999 && renderMode !== "marker_impostor") {
         mesh = buildCombinedTriangleMesh([spec], camera, lights);
       }
       if (!mesh) {
@@ -1646,12 +1885,15 @@
     out.alpha    = meshAlpha(spec);
     out.transparent = spec.transparent === true || out.alpha < 0.999;
     out.depth_write = spec.depth_write === true;
+    out.interpolation = spec.interpolation === true || mesh.interpolation === true;
     out.light_model = spec.light_model || mesh.light_model || null;
     out.blend_mode = spec.blend_mode || mesh.blend_mode || null;
     out.no_cull = spec.no_cull === true || mesh.no_cull === true;
     out.light_flares = spec.light_flares || mesh.light_flares || null;
     out.texture = spec.texture || mesh.texture || null;
     out.surface_system = spec.surface_system || mesh.surface_system || null;
+    out.kind = mesh.kind || spec.kind || null;
+    out.size = mesh.size || spec.size || null;
     out.tracks = spec.tracks || mesh.tracks || null;
     out.animation_timing = spec.animation_timing || mesh.animation_timing || null;
     out.shadow_hull = Array.isArray(spec.shadow_hull) ? spec.shadow_hull : (Array.isArray(mesh.shadow_hull) ? mesh.shadow_hull : []);
@@ -1916,14 +2158,17 @@
       ? [{ __mesh: combinedTransparent, type: "combined_transparent" }]
       : specs;
 
-    vlog("info", "updateGeomFrame [" + fid + "]: meshes=" + specs.length +
+    if (!frameRecs[fid]) { frameRecs[fid] = { entries: [] }; }
+    var rec = frameRecs[fid];
+    var summary = "meshes=" + specs.length +
       (unifiedScene ? " (unified frame renderer)" : "") +
       (combinedTransparent ? " (combined transparent pass)" : "") +
       " camera=" + (camera ? JSON.stringify(camera.pos) : "none") +
-      " lights=" + lights.length);
-
-    if (!frameRecs[fid]) { frameRecs[fid] = { entries: [] }; }
-    var rec = frameRecs[fid];
+      " lights=" + lights.length;
+    if (rec._lastSummary !== summary) {
+      rec._lastSummary = summary;
+      vlog("info", "updateGeomFrame [" + fid + "]: " + summary);
+    }
 
     for (var i = 0; i < renderSpecs.length; i++) {
       var spec = renderSpecs[i];
@@ -1934,14 +2179,17 @@
       }
 
       if (i < rec.entries.length) {
-        rec.entries[i].ref.mesh = mesh;
-        if (rec.entries[i].canvas) {
-          rec.entries[i].canvas.style.opacity = String(mesh.alpha == null ? 1 : mesh.alpha);
+        var existingEntry = rec.entries[i] || null;
+        if (!existingEntry) { continue; }
+        if (!existingEntry.ref) { existingEntry.ref = { mesh: null }; }
+        existingEntry.ref.mesh = mesh;
+        if (existingEntry.canvas) {
+          existingEntry.canvas.style.opacity = String(mesh.alpha == null ? 1 : mesh.alpha);
         }
         // log only on first few updates to avoid spam
-        if (rec.entries[i]._logCount == null) { rec.entries[i]._logCount = 0; }
-        rec.entries[i]._logCount++;
-        if (rec.entries[i]._logCount <= 3) {
+        if (existingEntry._logCount == null) { existingEntry._logCount = 0; }
+        existingEntry._logCount++;
+        if (existingEntry._logCount <= 3) {
           vlog("info", "updateGeomFrame [" + fid + "]: updated renderer " + i +
             " center=" + JSON.stringify(spec.center) +
             " scale=" + JSON.stringify(spec.scale) +
@@ -2030,7 +2278,10 @@
           rec.entries[j].canvas.parentNode.removeChild(rec.entries[j].canvas);
         }
       } catch(_) {}
-      rec.entries[j].ref.mesh = null;
+      if (rec.entries[j]) {
+        if (!rec.entries[j].ref) { rec.entries[j].ref = { mesh: null }; }
+        rec.entries[j].ref.mesh = null;
+      }
     }
     rec.entries.length = renderSpecs.length;
     // Notify native host of updated hit regions (geom canvases)
@@ -2380,12 +2631,12 @@
         return;
       }
       entry.initError = "";
-      vlog("info", "mountOffscreenGeomFrame [" + fid + "]: renderer init OK, starting render loop");
+      vlog("info", "mountOffscreenGeomFrame [" + fid + "]: renderer init OK, using on-demand renders");
       prewarmGeomRenderer(r);
       if (rec.dynamicAdapter) {
         rec.dynamicAdapter.onHostResize(rec.offscreenWidth, rec.offscreenHeight);
       }
-      r.start();
+      try { r._renderContent(performance.now()); } catch (_) {}
     }).catch(function(err) {
       entry.initError = (err && err.message ? err.message : String(err));
       vlog("error", "mountOffscreenGeomFrame [" + fid + "]: renderer init threw: " + (err && err.message ? err.message : String(err)));
@@ -2726,6 +2977,16 @@ fn fsMain(in : VOut) -> @location(0) vec4<f32> {
       return;
     }
     rec.dynamicAdapter.markDirty();
+    var entry = rec.entries && rec.entries[0];
+    var renderer = entry && entry.renderer;
+    if (
+      renderer &&
+      renderer._offscreenFrame === true &&
+      renderer._device &&
+      typeof renderer._renderContent === "function"
+    ) {
+      try { renderer._renderContent(performance.now()); } catch (_) {}
+    }
   }
 
   function dynamicGeomFrameCanAcceptUpdate(fid) {

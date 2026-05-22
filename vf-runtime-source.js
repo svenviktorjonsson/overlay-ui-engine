@@ -23,12 +23,10 @@
             runtimeLog("warn", "loadFromOverlayApi: status=" + r.status);
             return null;
           }
-          runtimeLog("info", "loadFromOverlayApi: status=" + r.status);
           return r.json();
         })
         .then(function(payload) {
           var packets = parsePacketPayload(payload);
-          runtimeLog("info", "loadFromOverlayApi: packets=" + (Array.isArray(packets) ? packets.length : "null"));
           return packets;
         })
         .catch(function(err) {
@@ -45,13 +43,11 @@
             runtimeLog("warn", "loadFromFileMirror: status=" + r.status);
             return null;
           }
-          runtimeLog("info", "loadFromFileMirror: status=" + r.status);
           return r.text();
         })
         .then(function(raw) {
           if (raw == null) { return null; }
           var packets = JSON.parse(raw);
-          runtimeLog("info", "loadFromFileMirror: packets=" + (Array.isArray(packets) ? packets.length : "non-array"));
           return Array.isArray(packets) ? packets : null;
         })
         .catch(function(err) {
@@ -80,7 +76,6 @@
         })
         .then(function(raw) {
           if (raw == null) { return null; }
-          runtimeLog("info", "loadScene: " + sceneUrl + " fetched (" + raw.length + " bytes)");
           var data = JSON.parse(raw);
           if (!Array.isArray(data)) {
             runtimeLog("warn", "loadScene: " + sceneUrl + " is not an array (got " + typeof data + ")");

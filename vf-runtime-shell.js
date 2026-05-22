@@ -74,8 +74,8 @@
       "vf-display.js"
     ],
     scenePollMs: 1500,
-    packetPollMs: 16,
-    packetPollIdleMs: 120,
+    packetPollMs: 33,
+    packetPollIdleMs: 180,
     packetPollSteadyMs: 400,
     packetPollIdleThreshold: 12,
     packetPollSteadyThreshold: 60,
@@ -667,7 +667,7 @@
       }
       var flow = getRuntimeFlow();
       if (!flow || !flow.getNextPacketPollDelay) {
-        return Number(DEFAULT_RUNTIME_CONFIG.packetPollMs) || 16;
+        return Number(DEFAULT_RUNTIME_CONFIG.packetPollMs) || 33;
       }
       return flow.getNextPacketPollDelay();
     }
@@ -683,7 +683,7 @@
         return;
       }
       if (typeof global.setTimeout !== "function") { return; }
-      var nextDelay = Math.max(16, Number(delayMs) || 16);
+      var nextDelay = Math.max(33, Number(delayMs) || 33);
       state.packetPollDelayMs = nextDelay;
       state.packetPollTimer = global.setTimeout(function() {
         state.packetPollTimer = 0;

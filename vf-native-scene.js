@@ -398,16 +398,52 @@
     return live && typeof live === "object" ? live : null;
   }
 
+  function parseCssRgbaColor(text) {
+    var raw = String(text || "").trim();
+    if (!raw) { return null; }
+    if (raw === "transparent") { return [0.0, 0.0, 0.0, 0.0]; }
+    var m = raw.match(/^rgba?\(([^)]+)\)$/i);
+    if (!m) { return null; }
+    var parts = m[1].split(",").map(function (part) { return String(part).trim(); });
+    if (parts.length < 3) { return null; }
+    var r = Math.max(0, Math.min(255, Number(parts[0]) || 0)) / 255.0;
+    var g = Math.max(0, Math.min(255, Number(parts[1]) || 0)) / 255.0;
+    var b = Math.max(0, Math.min(255, Number(parts[2]) || 0)) / 255.0;
+    var a = parts.length >= 4 ? Math.max(0, Math.min(1, Number(parts[3]) || 0)) : 1.0;
+    return [r, g, b, a];
+  }
+
+  function resolveSceneBackgroundFallback() {
+    if (config && Object.prototype.hasOwnProperty.call(config, "background")) {
+      return toRgba(config.background, [0.0, 0.0, 0.0, 0.0]);
+    }
+    try {
+      var doc = global.document;
+      if (!doc || typeof global.getComputedStyle !== "function") {
+        return [0.0, 0.0, 0.0, 0.0];
+      }
+      var selector = '.vf-frame[data-vf-frame-id="' + String(frameSpec.frame_id || config.frame_id || "") + '"] .vf-frame__body';
+      var host = doc.querySelector(selector) || doc.body;
+      if (!host) { return [0.0, 0.0, 0.0, 0.0]; }
+      var style = global.getComputedStyle(host);
+      var parsed = parseCssRgbaColor(style && style.backgroundColor);
+      return parsed || [0.0, 0.0, 0.0, 0.0];
+    } catch (_) {
+      return [0.0, 0.0, 0.0, 0.0];
+    }
+  }
+
   function normalizeSurfaceWorldSpec(source) {
     var spec = source && typeof source === "object" ? source : {};
+    var sceneBackground = resolveSceneBackgroundFallback();
     return {
       kind: String(spec.kind || "cube_demo"),
       cube_size: Math.max(0.2, Number(spec.cube_size == null ? 0.88 : spec.cube_size) || 0.88),
       spin_axis: normalize3(toVec3(spec.spin_axis, [0.0, 1.0, 0.0]), [0.0, 1.0, 0.0]),
       angular_velocity: Number(spec.angular_velocity == null ? 1.05 : spec.angular_velocity) || 1.05,
       phase: Number(spec.phase || 0.0) || 0.0,
-      background: toRgba(spec.background, [0.98, 0.98, 1.0, 1.0]),
-      frame_color: toRgba(spec.frame_color, [0.05, 0.05, 0.07, 1.0]),
+      background: toRgba(spec.background, sceneBackground),
+      frame_color: toRgba(spec.frame_color, sceneBackground),
     };
   }
 
@@ -440,6 +476,7 @@
     return {
       kind: runtimeKind,
       scale: Array.isArray(system.scale) ? [Number(system.scale[0]) || 1.0, Number(system.scale[1]) || 1.0] : [1.0, 1.0],
+      reflectivity: Math.max(0.0, Math.min(1.0, Number(system.reflectivity == null ? 1.0 : system.reflectivity) || 0.0)),
       world_ref: String(system.world_ref || ""),
       camera_ref: String(system.camera_ref || ""),
       frame_ref: String(system.frame_ref || ""),
@@ -700,7 +737,7 @@
   function appendSphereTriangles(triangles, center, radius, color, latSeg, lonSeg) {
     radius = Number(radius);
     if (!(radius > 0)) { return; }
-    var template = getSphereTemplate(latSeg || 10, lonSeg || 16);
+    var template = getSphereTemplate(latSeg || 12, lonSeg || 18);
     var verts = [];
     for (var i = 0; i < template.verts.length; i += 3) {
       var nx = template.verts[i];
@@ -720,7 +757,7 @@
   function appendCylinderTriangles(triangles, a, b, radius, color, seg) {
     radius = Number(radius);
     if (!(radius > 0)) { return; }
-    var template = getCylinderTemplate(seg || 18);
+    var template = getCylinderTemplate(seg || 20);
     var dir = norm3(Number(b[0]) - Number(a[0]), Number(b[1]) - Number(a[1]), Number(b[2]) - Number(a[2]));
     var ref = Math.abs(dir[1]) < 0.92 ? [0, 1, 0] : [1, 0, 0];
     var u = normalize3(cross3(dir, ref), [1, 0, 0]);
@@ -767,6 +804,37 @@
     ];
   }
 
+  function fieldMeshRenderMode(mesh) {
+    var mode = String((mesh && mesh.render_mode) || "proxy_geometry").toLowerCase();
+    return mode === "marker_impostor" ? "marker_impostor" : "proxy_geometry";
+  }
+
+  function fieldMeshMarkerSpace(mesh) {
+    var mode = fieldMeshRenderMode(mesh);
+    var space = String((mesh && mesh.marker_space) || (mode === "marker_impostor" ? "pixel" : "world")).toLowerCase();
+    return space === "pixel" ? "pixel" : "world";
+  }
+
+  function overlayRenderMode(mesh, prefix) {
+    var key = String(prefix || "") + "_render_mode";
+    var mode = String((mesh && mesh[key]) || "proxy_geometry").toLowerCase();
+    return mode === "marker_impostor" ? "marker_impostor" : "proxy_geometry";
+  }
+
+  function overlayMarkerSpace(mesh, prefix) {
+    var mode = overlayRenderMode(mesh, prefix);
+    var key = String(prefix || "") + "_marker_space";
+    var fallback = mode === "marker_impostor" ? "pixel" : "world";
+    var space = String((mesh && mesh[key]) || fallback).toLowerCase();
+    return space === "pixel" ? "pixel" : "world";
+  }
+
+  function overlayDepthWrite(mesh, prefix) {
+    var key = String(prefix || "") + "_depth_write";
+    if (mesh && mesh[key] != null) { return mesh[key] === true; }
+    return overlayRenderMode(mesh, prefix) !== "marker_impostor";
+  }
+
   function appendTriangleListWorldTriangles(triangles, mesh, model) {
     var verts = mesh.vertices;
     var inds = mesh.indices;
@@ -796,6 +864,7 @@
     if (!(vertexRadius > 0) || !inds.length) { return; }
     var scales = Array.isArray(mesh.vertex_scale) ? mesh.vertex_scale : null;
     var globalScale = scales ? null : Number(mesh.vertex_scale == null ? 1.0 : mesh.vertex_scale);
+    var markerSpace = fieldMeshMarkerSpace(mesh);
     for (var i = 0; i < inds.length; i += 1) {
       var vi = Number(inds[i]);
       var pointCenter = meshVec3At(verts, vi);
@@ -810,7 +879,9 @@
       appendSphereTriangles(
         triangles,
         biasedCenter,
-        impostorWorldRadius(camera, viewportHeight, pointCenter, vertexRadius * pointScale),
+        markerSpace === "pixel"
+          ? impostorWorldRadius(camera, viewportHeight, pointCenter, vertexRadius * pointScale)
+          : (vertexRadius * pointScale),
         meshColorAt(verts, vi),
         12,
         18
@@ -822,26 +893,32 @@
     var verts = mesh.vertices || [];
     var inds = mesh.indices || [];
     var edgeRadius = Number(mesh.edge_width || 0);
-    if (!(edgeRadius > 0) || inds.length < 2) { return; }
+    var vertexWidths = Array.isArray(mesh.vertex_widths) ? mesh.vertex_widths : null;
+    var hasVertexWidths = !!(vertexWidths && vertexWidths.length);
+    if (!(edgeRadius > 0) && !hasVertexWidths) { return; }
+    if (inds.length < 2) { return; }
     var edgeCaps = mesh.edge_caps === true;
+    var markerSpace = fieldMeshMarkerSpace(mesh);
     for (var i = 0; i + 1 < inds.length; i += 2) {
       var aIdx = Number(inds[i]);
       var bIdx = Number(inds[i + 1]);
       var pa = meshVec3At(verts, aIdx);
       var pb = meshVec3At(verts, bIdx);
       var col = meshColorAt(verts, aIdx);
-      var edgeRadiusWorld = impostorWorldRadius(
-        camera,
-        viewportHeight,
-        [(pa[0] + pb[0]) * 0.5, (pa[1] + pb[1]) * 0.5, (pa[2] + pb[2]) * 0.5],
-        edgeRadius
-      );
+      var aWidth = hasVertexWidths ? Number(vertexWidths[aIdx] || 0) : edgeRadius;
+      var bWidth = hasVertexWidths ? Number(vertexWidths[bIdx] || 0) : edgeRadius;
+      var edgeRadiusWorld = markerSpace === "pixel"
+        ? Math.max(
+            impostorWorldRadius(camera, viewportHeight, pa, aWidth),
+            impostorWorldRadius(camera, viewportHeight, pb, bWidth)
+          )
+        : Math.max(aWidth, bWidth);
       var biasedSegment = applyImpostorViewBiasToSegment(
         camera,
         viewportHeight,
         pa,
         pb,
-        Math.max(0.75, edgeRadius * 0.4)
+        Math.max(0.75, edgeRadiusWorld * 0.4)
       );
       pa = biasedSegment[0];
       pb = biasedSegment[1];
@@ -1186,6 +1263,16 @@
     if (!sourceLight || !mirrorMesh) { return lightSpec; }
     var aperture = quadApertureFrame(mirrorMesh);
     if (!aperture) { return lightSpec; }
+    var clipEpsilon = Math.max(0.0, Number(lightSpec && lightSpec.clip_epsilon == null ? 1e-3 : lightSpec.clip_epsilon) || 0.0);
+    var sourceSide = dot3([
+      Number(sourceLight.pos[0] || 0.0) - Number(aperture.center[0] || 0.0),
+      Number(sourceLight.pos[1] || 0.0) - Number(aperture.center[1] || 0.0),
+      Number(sourceLight.pos[2] || 0.0) - Number(aperture.center[2] || 0.0)
+    ], aperture.normal);
+    var reflectivity = 1.0;
+    if (mirrorMesh.surface_system && typeof mirrorMesh.surface_system === "object") {
+      reflectivity = Math.max(0.0, Math.min(1.0, Number(mirrorMesh.surface_system.reflectivity == null ? 1.0 : mirrorMesh.surface_system.reflectivity) || 0.0));
+    }
     var reflectedPos = reflectPointAcrossPlane(sourceLight.pos, aperture.center, aperture.normal);
     var reflectedTarget = Array.isArray(sourceLight.target)
       ? reflectPointAcrossPlane(sourceLight.target, aperture.center, aperture.normal)
@@ -1195,6 +1282,17 @@
       target: reflectedTarget,
       motion: "linked_reflection"
     });
+    if (resolved.intensity != null) {
+      resolved.intensity = Math.max(0.0, Number(resolved.intensity || 0.0) * reflectivity);
+    }
+    if (resolved.power != null) {
+      resolved.power = Math.max(0.0, Number(resolved.power || 0.0) * reflectivity);
+    }
+    if (!(sourceSide > clipEpsilon) || !(reflectivity > 1e-4)) {
+      resolved.intensity = 0.0;
+      resolved.power = 0.0;
+      resolved.casts_shadow = false;
+    }
     if (!resolved.aperture_mesh_id) {
       resolved.aperture_mesh_id = mirrorMeshId;
     }
@@ -1684,6 +1782,37 @@
 
   function meshVerticesForOccluder(mesh) {
     if (!mesh) { return []; }
+    if (mesh.kind === "field_mesh") {
+      var rawVerts = Array.isArray(mesh.vertices) ? mesh.vertices : [];
+      var localPositions = [];
+      if (rawVerts.length && Array.isArray(rawVerts[0])) {
+        for (var fv = 0; fv < rawVerts.length; fv += 1) {
+          localPositions.push(toVec3(rawVerts[fv], [0.0, 0.0, 0.0]));
+        }
+      } else {
+        for (var flatIndex = 0; flatIndex + 2 < rawVerts.length; flatIndex += 10) {
+          localPositions.push([
+            Number(rawVerts[flatIndex] || 0.0),
+            Number(rawVerts[flatIndex + 1] || 0.0),
+            Number(rawVerts[flatIndex + 2] || 0.0)
+          ]);
+        }
+      }
+      if (Array.isArray(mesh._modelMatrix) && mesh._modelMatrix.length === 16) {
+        return transformVerticesByMatrix(localPositions, mesh._modelMatrix);
+      }
+      var meshScale = toVec3(mesh.scale, [1.0, 1.0, 1.0]);
+      var scaledLocal = [];
+      for (var localIndex = 0; localIndex < localPositions.length; localIndex += 1) {
+        var lp = localPositions[localIndex];
+        scaledLocal.push([
+          Number(lp[0] || 0.0) * Number(meshScale[0] || 1.0),
+          Number(lp[1] || 0.0) * Number(meshScale[1] || 1.0),
+          Number(lp[2] || 0.0) * Number(meshScale[2] || 1.0)
+        ]);
+      }
+      return transformLocalVertices(scaledLocal, mesh.center || [0, 0, 0], mesh.rotation || [0, 0, 0]);
+    }
     if (mesh.kind === "cube") {
       if (Array.isArray(mesh.transform) && mesh.transform.length === 16) {
         return transformVerticesByMatrix(makeCubeLocalVertices(mesh.size), mesh.transform);
@@ -1922,8 +2051,12 @@
       edge_width: edgeWidth,
       edge_caps: mesh.edge_caps !== false,
       color: color,
+      render_mode: overlayRenderMode(mesh, "edge"),
+      marker_space: overlayMarkerSpace(mesh, "edge"),
+      casts_shadow: mesh.edge_casts_shadow !== false,
+      no_lighting: mesh.edge_receives_lighting === false,
       interpolation: false,
-      depth_write: true
+      depth_write: overlayDepthWrite(mesh, "edge")
     };
   }
 
@@ -1956,8 +2089,12 @@
       indices: indices,
       vertex_size: vertexSize,
       color: color,
+      render_mode: overlayRenderMode(mesh, "vertex"),
+      marker_space: overlayMarkerSpace(mesh, "vertex"),
+      casts_shadow: mesh.vertex_casts_shadow !== false,
+      no_lighting: mesh.vertex_receives_lighting === false,
       interpolation: false,
-      depth_write: true
+      depth_write: overlayDepthWrite(mesh, "vertex")
     };
   }
 
@@ -2042,8 +2179,12 @@
       edge_width: edgeWidth,
       edge_caps: mesh.edge_caps !== false,
       color: color,
+      render_mode: overlayRenderMode(mesh, "edge"),
+      marker_space: overlayMarkerSpace(mesh, "edge"),
+      casts_shadow: mesh.edge_casts_shadow !== false,
+      no_lighting: mesh.edge_receives_lighting === false,
       interpolation: false,
-      depth_write: true
+      depth_write: overlayDepthWrite(mesh, "edge")
     };
   }
 
@@ -2069,8 +2210,12 @@
       indices: indices,
       vertex_size: vertexSize,
       color: color,
+      render_mode: overlayRenderMode(mesh, "vertex"),
+      marker_space: overlayMarkerSpace(mesh, "vertex"),
+      casts_shadow: mesh.vertex_casts_shadow !== false,
+      no_lighting: mesh.vertex_receives_lighting === false,
       interpolation: false,
-      depth_write: true
+      depth_write: overlayDepthWrite(mesh, "vertex")
     };
   }
 
@@ -2140,10 +2285,12 @@
     return {
       type: "field_mesh",
       id: String(plane.id || "ground_plane"),
+      kind: "quad",
       topology: "triangle-list",
       vertices: verts,
       indices: [0, 1, 2, 0, 2, 3],
       center: center,
+      size: size,
       rotation: rotation,
       _modelMatrix: toMatrix4(plane.transform, null),
       color: planeColor,
@@ -2161,8 +2308,43 @@
     var framePos = animationFramePosition(seconds || 0.0);
     var kind = String(spec.kind || "");
     var faceColor = entityProp(spec, "face_color", entityProp(spec, "color", [0.96, 0.22, 0.16, 1.0]));
-    if (kind !== "cube" && kind !== "quad" && kind !== "random_hull" && kind !== "convex_hull" && kind !== "simplices") {
-      failFast("mesh.kind must be cube, quad, random_hull, convex_hull, or simplices");
+    if (kind !== "cube" && kind !== "quad" && kind !== "random_hull" && kind !== "convex_hull" && kind !== "simplices" && kind !== "field_mesh") {
+      failFast("mesh.kind must be cube, quad, random_hull, convex_hull, simplices, or field_mesh");
+    }
+    if (kind === "field_mesh") {
+      var renderMode = String(entityProp(spec, "render_mode", "proxy_geometry"));
+      return {
+        id: String(spec.id || "field_mesh"),
+        kind: "field_mesh",
+        vertices: Array.isArray(entityProp(spec, "vertices", [])) ? entityProp(spec, "vertices", []).slice() : [],
+        indices: Array.isArray(entityProp(spec, "indices", [])) ? entityProp(spec, "indices", []).slice() : [],
+        topology: String(entityProp(spec, "topology", "triangle-list")),
+        interpolation: entityProp(spec, "interpolation", false) === true,
+        alpha: Math.max(0.0, Math.min(1.0, Number(entityProp(spec, "alpha", 1.0) || 1.0))),
+        center: resolveTrackedVec3(spec, "center", framePos, toVec3(entityProp(spec, "center", [0.0, 0.0, 0.0]), [0.0, 0.0, 0.0])),
+        scale: resolveTrackedVec3(spec, "scale", framePos, toVec3(entityProp(spec, "scale", [1.0, 1.0, 1.0]), [1.0, 1.0, 1.0])),
+        rotation: resolveTrackedVec3(spec, "rotation", framePos, toVec3(entityProp(spec, "rotation", [0.0, 0.0, 0.0]), [0.0, 0.0, 0.0])),
+        color: toRgba(entityProp(spec, "color", [1.0, 1.0, 1.0, 1.0]), [1.0, 1.0, 1.0, 1.0]),
+        time_boundary: String(entityProp(spec, "time_boundary", "clamp")),
+        time_count: Math.max(1, Number(entityProp(spec, "time_count", 1) || 1) | 0),
+        time_index: Math.max(0, Number(entityProp(spec, "time_index", 0) || 0) | 0),
+        manifold_dim_count: Math.max(0, Number(entityProp(spec, "manifold_dim_count", 0) || 0) | 0),
+        solid_volume: entityProp(spec, "solid_volume", false) === true,
+        vertex_size: Math.max(0.0, Number(entityProp(spec, "vertex_size", 0.0) || 0.0)),
+        edge_width: Math.max(0.0, Number(entityProp(spec, "edge_width", 0.0) || 0.0)),
+        vertex_widths: Array.isArray(entityProp(spec, "vertex_widths", [])) ? entityProp(spec, "vertex_widths", []).slice() : [],
+        render_mode: renderMode,
+        marker_space: String(entityProp(spec, "marker_space", String(renderMode).toLowerCase() === "marker_impostor" ? "pixel" : "world")),
+        casts_shadow: entityProp(spec, "casts_shadow", true) !== false,
+        no_lighting: entityProp(spec, "receives_lighting", true) === false,
+        depth_write: entityProp(spec, "depth_write", false) === true,
+        tracks: spec && spec.tracks && typeof spec.tracks === "object" ? spec.tracks : null,
+        animation_timing: {
+          fps: fps,
+          duration_seconds: durationSeconds,
+          boundary: boundary
+        }
+      };
     }
     if (kind === "cube") {
       var transformFallback = entityProp(spec, "transform", null);
@@ -2196,10 +2378,20 @@
           edge_caps: entityProp(spec, "edge_caps", true) !== false,
           edge_lift: Math.max(0.0, Number(entityProp(spec, "edge_lift", 0.003) || 0.003)),
           show_edges: entityProp(spec, "show_edges", true) !== false,
+          edge_render_mode: String(entityProp(spec, "edge_render_mode", "proxy_geometry")),
+          edge_marker_space: String(entityProp(spec, "edge_marker_space", "world")),
+          edge_casts_shadow: entityProp(spec, "edge_casts_shadow", true) !== false,
+          edge_receives_lighting: entityProp(spec, "edge_receives_lighting", true) !== false,
+          edge_depth_write: entityProp(spec, "edge_depth_write", null),
           vertex_color: toRgba(entityProp(spec, "vertex_color", faceColor), [0.96, 0.22, 0.16, 1.0]),
           vertex_size: Math.max(0.0, Number(entityProp(spec, "vertex_size", 0.06) || 0.06)),
           vertex_lift: Math.max(0.0, Number(entityProp(spec, "vertex_lift", 0.006) || 0.006)),
           show_vertices: entityProp(spec, "show_vertices", true) !== false,
+          vertex_render_mode: String(entityProp(spec, "vertex_render_mode", "proxy_geometry")),
+          vertex_marker_space: String(entityProp(spec, "vertex_marker_space", "world")),
+          vertex_casts_shadow: entityProp(spec, "vertex_casts_shadow", true) !== false,
+          vertex_receives_lighting: entityProp(spec, "vertex_receives_lighting", true) !== false,
+          vertex_depth_write: entityProp(spec, "vertex_depth_write", null),
           _generatedHull: null
         };
       }
@@ -2217,6 +2409,25 @@
           stretch: toVec3(entityProp(spec, "stretch", [1.0, 0.84, 1.28]), [1.0, 0.84, 1.28]),
           jitter: Math.max(0.0, Number(entityProp(spec, "jitter", 0.28) || 0.28)),
           face_color: toRgba(faceColor, [0.96, 0.22, 0.16, 1.0]),
+          edge_color: toRgba(entityProp(spec, "edge_color", [0.10, 0.82, 0.26, 1.0]), [0.10, 0.82, 0.26, 1.0]),
+          edge_width: Math.max(0.0, Number(entityProp(spec, "edge_width", 0.03) || 0.03)),
+          edge_caps: entityProp(spec, "edge_caps", true) !== false,
+          edge_lift: Math.max(0.0, Number(entityProp(spec, "edge_lift", 0.003) || 0.003)),
+          show_edges: entityProp(spec, "show_edges", true) !== false,
+          edge_render_mode: String(entityProp(spec, "edge_render_mode", "proxy_geometry")),
+          edge_marker_space: String(entityProp(spec, "edge_marker_space", "world")),
+          edge_casts_shadow: entityProp(spec, "edge_casts_shadow", true) !== false,
+          edge_receives_lighting: entityProp(spec, "edge_receives_lighting", true) !== false,
+          edge_depth_write: entityProp(spec, "edge_depth_write", null),
+          vertex_color: toRgba(entityProp(spec, "vertex_color", faceColor), [0.96, 0.22, 0.16, 1.0]),
+          vertex_size: Math.max(0.0, Number(entityProp(spec, "vertex_size", 0.06) || 0.06)),
+          vertex_lift: Math.max(0.0, Number(entityProp(spec, "vertex_lift", 0.006) || 0.006)),
+          show_vertices: entityProp(spec, "show_vertices", true) !== false,
+          vertex_render_mode: String(entityProp(spec, "vertex_render_mode", "proxy_geometry")),
+          vertex_marker_space: String(entityProp(spec, "vertex_marker_space", "world")),
+          vertex_casts_shadow: entityProp(spec, "vertex_casts_shadow", true) !== false,
+          vertex_receives_lighting: entityProp(spec, "vertex_receives_lighting", true) !== false,
+          vertex_depth_write: entityProp(spec, "vertex_depth_write", null),
           _generatedHull: null
         };
       }
@@ -2235,10 +2446,20 @@
           edge_caps: entityProp(spec, "edge_caps", true) !== false,
           edge_lift: Math.max(0.0, Number(entityProp(spec, "edge_lift", 0.003) || 0.003)),
           show_edges: entityProp(spec, "show_edges", true) !== false,
+          edge_render_mode: String(entityProp(spec, "edge_render_mode", "proxy_geometry")),
+          edge_marker_space: String(entityProp(spec, "edge_marker_space", "world")),
+          edge_casts_shadow: entityProp(spec, "edge_casts_shadow", true) !== false,
+          edge_receives_lighting: entityProp(spec, "edge_receives_lighting", true) !== false,
+          edge_depth_write: entityProp(spec, "edge_depth_write", null),
           vertex_color: toRgba(entityProp(spec, "vertex_color", faceColor), [0.96, 0.22, 0.16, 1.0]),
           vertex_size: Math.max(0.0, Number(entityProp(spec, "vertex_size", 0.06) || 0.06)),
           vertex_lift: Math.max(0.0, Number(entityProp(spec, "vertex_lift", 0.006) || 0.006)),
           show_vertices: entityProp(spec, "show_vertices", true) !== false,
+          vertex_render_mode: String(entityProp(spec, "vertex_render_mode", "proxy_geometry")),
+          vertex_marker_space: String(entityProp(spec, "vertex_marker_space", "world")),
+          vertex_casts_shadow: entityProp(spec, "vertex_casts_shadow", true) !== false,
+          vertex_receives_lighting: entityProp(spec, "vertex_receives_lighting", true) !== false,
+          vertex_depth_write: entityProp(spec, "vertex_depth_write", null),
           _generatedSimplices: null
         };
       }
@@ -2284,7 +2505,124 @@
     };
   }
 
-  function buildMeshPayload(mesh) {
+  function buildMeshPayload(mesh, camera, lights) {
+    if (mesh.kind === "field_mesh") {
+      var renderMode = String(mesh.render_mode || "proxy_geometry");
+      var displayTest = global.VfDisplay && global.VfDisplay.__test;
+      var canExpandOverlay = displayTest && typeof displayTest.buildSingleMesh === "function";
+      var topology = String(mesh.topology || "triangle-list");
+      var markerSizingCamera = camera && camera._marker_size_camera ? camera._marker_size_camera : camera;
+      var buildCamera = (
+        String(renderMode).toLowerCase() === "marker_impostor" &&
+        (topology === "point-list" || topology === "line-list")
+      ) ? markerSizingCamera : camera;
+      if (canExpandOverlay && (topology === "point-list" || topology === "line-list")) {
+        var expanded = displayTest.buildSingleMesh({
+          type: "field_mesh",
+          id: String(mesh.id || "field_mesh"),
+          topology: topology,
+          vertices: Array.isArray(mesh.vertices) ? mesh.vertices.slice() : [],
+          indices: Array.isArray(mesh.indices) ? mesh.indices.slice() : [],
+          color: toRgba(mesh.color, [1.0, 1.0, 1.0, 1.0]),
+          alpha: Math.max(0.0, Math.min(1.0, Number(mesh.alpha || 1.0) || 1.0)),
+          center: toVec3(mesh.center, [0.0, 0.0, 0.0]),
+          scale: toVec3(mesh.scale, [1.0, 1.0, 1.0]),
+          rotation: toVec3(mesh.rotation, [0.0, 0.0, 0.0]),
+          vertex_size: Math.max(0.0, Number(mesh.vertex_size || 0.0)),
+          edge_width: Math.max(0.0, Number(mesh.edge_width || 0.0)),
+          vertex_widths: Array.isArray(mesh.vertex_widths) ? mesh.vertex_widths.slice() : [],
+          render_mode: renderMode,
+          marker_space: String(mesh.marker_space || (String(renderMode).toLowerCase() === "marker_impostor" ? "pixel" : "world")),
+          interpolation: mesh.interpolation === true,
+          depth_write: mesh.depth_write === true,
+          edge_caps: mesh.edge_caps === true,
+          vertex_scale: Array.isArray(mesh.vertex_scale) ? mesh.vertex_scale.slice() : mesh.vertex_scale
+        }, buildCamera, lights);
+        if (expanded && expanded.vertices && expanded.indices) {
+          return {
+            type: "field_mesh",
+            id: String(expanded.id || mesh.id || "field_mesh"),
+            kind: String(mesh.kind || expanded.kind || "field_mesh"),
+            topology: String(expanded.topology || "triangle-list"),
+            vertices: expanded.vertices instanceof Float32Array
+              ? new Float32Array(expanded.vertices)
+              : (Array.isArray(expanded.vertices) ? new Float32Array(expanded.vertices) : new Float32Array(Array.prototype.slice.call(expanded.vertices || []))),
+            indices: expanded.indices instanceof Uint32Array
+              ? new Uint32Array(expanded.indices)
+              : (Array.isArray(expanded.indices) ? new Uint32Array(expanded.indices) : new Uint32Array(Array.prototype.slice.call(expanded.indices || []))),
+            instances: expanded.instances
+              ? (
+                  expanded.instances instanceof Float32Array
+                    ? new Float32Array(expanded.instances)
+                    : (Array.isArray(expanded.instances) ? new Float32Array(expanded.instances) : new Float32Array(Array.prototype.slice.call(expanded.instances)))
+                )
+              : null,
+            instance_count: Math.max(0, Number(expanded.instance_count || 0) | 0),
+            instance_kind: expanded.instance_kind || null,
+            static_vertices: expanded.static_vertices === true,
+            static_indices: expanded.static_indices === true,
+            transparent: expanded.transparent === true,
+            color: toRgba(mesh.color, [1.0, 1.0, 1.0, 1.0]),
+            alpha: Math.max(0.0, Math.min(1.0, Number(mesh.alpha || 1.0) || 1.0)),
+            center: Array.isArray(expanded.center) ? expanded.center.slice() : [0.0, 0.0, 0.0],
+            scale: Array.isArray(expanded.scale) ? expanded.scale.slice() : [1.0, 1.0, 1.0],
+            rotation: Array.isArray(expanded.rotation) ? expanded.rotation.slice() : [0.0, 0.0, 0.0],
+            size: Array.isArray(mesh.size) ? mesh.size.slice() : (mesh.size != null ? mesh.size : null),
+            time_boundary: String(mesh.time_boundary || "clamp"),
+            time_count: Math.max(1, Number(mesh.time_count || 1) | 0),
+            time_index: Math.max(0, Number(mesh.time_index || 0) | 0),
+            manifold_dim_count: Math.max(0, Number(mesh.manifold_dim_count || 0) | 0),
+            solid_volume: mesh.solid_volume === true,
+            vertex_size: Math.max(0.0, Number(mesh.vertex_size || 0.0)),
+            edge_width: Math.max(0.0, Number(mesh.edge_width || 0.0)),
+            vertex_widths: Array.isArray(mesh.vertex_widths) ? mesh.vertex_widths.slice() : [],
+            render_mode: renderMode,
+            marker_space: String(mesh.marker_space || (String(renderMode).toLowerCase() === "marker_impostor" ? "pixel" : "world")),
+            casts_shadow: mesh.casts_shadow !== false,
+            no_lighting: mesh.no_lighting === true,
+            interpolation: mesh.interpolation === true,
+            depth_write: mesh.depth_write === true,
+            overlay_expanded: expanded.overlay_expanded === true,
+            surface_system: mesh.surface_system || null,
+            tracks: mesh.tracks || null,
+            animation_timing: mesh.animation_timing || null,
+            _modelMatrix: Array.isArray(mesh._modelMatrix) ? mesh._modelMatrix.slice() : null
+          };
+        }
+      }
+      return {
+        type: "field_mesh",
+        id: String(mesh.id || "field_mesh"),
+        kind: String(mesh.kind || "field_mesh"),
+        topology: topology,
+        vertices: Array.isArray(mesh.vertices) ? mesh.vertices.slice() : [],
+        indices: Array.isArray(mesh.indices) ? mesh.indices.slice() : [],
+        color: toRgba(mesh.color, [1.0, 1.0, 1.0, 1.0]),
+        alpha: Math.max(0.0, Math.min(1.0, Number(mesh.alpha || 1.0) || 1.0)),
+        center: toVec3(mesh.center, [0.0, 0.0, 0.0]),
+        scale: toVec3(mesh.scale, [1.0, 1.0, 1.0]),
+        rotation: toVec3(mesh.rotation, [0.0, 0.0, 0.0]),
+        size: Array.isArray(mesh.size) ? mesh.size.slice() : (mesh.size != null ? mesh.size : null),
+        time_boundary: String(mesh.time_boundary || "clamp"),
+        time_count: Math.max(1, Number(mesh.time_count || 1) | 0),
+        time_index: Math.max(0, Number(mesh.time_index || 0) | 0),
+        manifold_dim_count: Math.max(0, Number(mesh.manifold_dim_count || 0) | 0),
+        solid_volume: mesh.solid_volume === true,
+        vertex_size: Math.max(0.0, Number(mesh.vertex_size || 0.0)),
+        edge_width: Math.max(0.0, Number(mesh.edge_width || 0.0)),
+        vertex_widths: Array.isArray(mesh.vertex_widths) ? mesh.vertex_widths.slice() : [],
+        render_mode: renderMode,
+        marker_space: String(mesh.marker_space || (String(renderMode).toLowerCase() === "marker_impostor" ? "pixel" : "world")),
+        casts_shadow: mesh.casts_shadow !== false,
+        no_lighting: mesh.no_lighting === true,
+        interpolation: mesh.interpolation === true,
+        depth_write: mesh.depth_write === true,
+        surface_system: mesh.surface_system || null,
+        tracks: mesh.tracks || null,
+        animation_timing: mesh.animation_timing || null,
+        _modelMatrix: Array.isArray(mesh._modelMatrix) ? mesh._modelMatrix.slice() : null
+      };
+    }
     if (mesh.kind === "cube") {
       return cubeMesh(mesh, mesh.face_color);
     }
@@ -2802,12 +3140,6 @@
         sourceLightsById[String(sourceLight.id)] = sourceLight;
       }
     }
-    lights = lights.map(function (lightSpec) {
-      return resolveLinkedMirrorLight(lightSpec, sourceLightsById, meshById);
-    });
-    lights = lights.map(function (lightSpec) {
-      return resolveProjectedLightSpec(lightSpec, meshById);
-    });
     for (var mirrorIndex = 0; mirrorIndex < meshSpecs.length; mirrorIndex += 1) {
       var mirrorMesh = meshSpecs[mirrorIndex];
       var surfaceSystem = mirrorMesh && mirrorMesh.surface_system && typeof mirrorMesh.surface_system === "object"
@@ -2835,7 +3167,7 @@
       receiverIds[receiverMesh.id] = true;
       var lightIds = Array.isArray(receiver.lights) ? receiver.lights.map(String) : [];
       void lightIds;
-      var receiverPayload = buildMeshPayload(receiverMesh);
+      var receiverPayload = buildMeshPayload(receiverMesh, camera, lights);
       if (Array.isArray(receiverPayload)) {
         for (var receiverPayloadIndex = 0; receiverPayloadIndex < receiverPayload.length; receiverPayloadIndex += 1) {
           if (receiverPayload[receiverPayloadIndex]) { meshes.push(receiverPayload[receiverPayloadIndex]); }
@@ -2848,7 +3180,7 @@
       var mesh = meshSpecs[i];
       if (mesh.visible === false) { continue; }
       if (receiverIds[mesh.id]) { continue; }
-      var meshPayload = buildMeshPayload(mesh);
+      var meshPayload = buildMeshPayload(mesh, camera, lights);
       if (Array.isArray(meshPayload)) {
         for (var meshPayloadIndex = 0; meshPayloadIndex < meshPayload.length; meshPayloadIndex += 1) {
           if (meshPayload[meshPayloadIndex]) { meshes.push(meshPayload[meshPayloadIndex]); }
@@ -2870,11 +3202,13 @@
     if (!state.meshes || !state.meshes.length) {
       failFast("scene resolved zero visible meshes");
     }
+    var sceneBackground = resolveSceneBackgroundFallback();
     var geom = {};
     geom[String(frameSpec.frame_id || config.frame_id)] = {
       meshes: state.meshes,
       camera: state.camera,
       lights: state.lights,
+      background: sceneBackground,
       light_flares: {
         enabled: renderOptions.show_light_markers === true,
         size: Number(renderOptions.light_marker_size || 0.18),
@@ -3138,6 +3472,7 @@
           orbitPhi: 0.0,
           orbitTheta: 0.0,
           orbitStep: cameraOrbitStepRadians(config.camera || {}),
+          orbitSpeedRadPerSec: Math.max(cameraOrbitStepRadians(config.camera || {}) * 18.0, Math.PI * 0.45),
           controlsEnabled: cameraBehaviorProps().controls_enabled !== false,
           lookOnlyControls: cameraBehaviorProps().look_only_controls === true,
           lockApertureCamera: cameraBehaviorProps().lock_aperture_camera === true,
@@ -3146,7 +3481,12 @@
           linkedEyeKey: "",
           baseCamera: null,
           exactInitCamera: null,
-          rendering: false
+          rendering: false,
+          lastRenderTsMs: 0.0,
+          keyLeft: false,
+          keyRight: false,
+          keyUp: false,
+          keyDown: false
         };
       }
     var controlState = controlRegistry.states[watchedFrameId];
@@ -3239,12 +3579,37 @@
         if (!activeState) { return; }
         if (activeState.controlsEnabled === false) { return; }
         ev.preventDefault();
-        var step = Number(activeState.orbitStep || 0.0) || 0.0;
-        if (key === "ArrowLeft") { activeState.orbitPhi -= step; }
-        else if (key === "ArrowRight") { activeState.orbitPhi += step; }
-        else if (key === "ArrowUp") { activeState.orbitTheta += step; }
-        else if (key === "ArrowDown") { activeState.orbitTheta -= step; }
+        if (key === "ArrowLeft") { activeState.keyLeft = true; }
+        else if (key === "ArrowRight") { activeState.keyRight = true; }
+        else if (key === "ArrowUp") { activeState.keyUp = true; }
+        else if (key === "ArrowDown") { activeState.keyDown = true; }
         activeState.userInteracted = true;
+      }, true);
+      global.addEventListener("keyup", function (ev) {
+        var key = String(ev && ev.key || "");
+        if (key !== "ArrowLeft" && key !== "ArrowRight" && key !== "ArrowUp" && key !== "ArrowDown") { return; }
+        var activeFrameId = String(global.__vfNativeSceneCameraControls && global.__vfNativeSceneCameraControls.activeFrameId || "").trim();
+        var activeState = activeFrameId && global.__vfNativeSceneCameraControls && global.__vfNativeSceneCameraControls.states
+          ? global.__vfNativeSceneCameraControls.states[activeFrameId]
+          : null;
+        if (!activeState) { return; }
+        if (key === "ArrowLeft") { activeState.keyLeft = false; }
+        else if (key === "ArrowRight") { activeState.keyRight = false; }
+        else if (key === "ArrowUp") { activeState.keyUp = false; }
+        else if (key === "ArrowDown") { activeState.keyDown = false; }
+      }, true);
+      global.addEventListener("blur", function () {
+        var registry = global.__vfNativeSceneCameraControls;
+        if (!registry || !registry.states) { return; }
+        var frameIds = Object.keys(registry.states);
+        for (var i = 0; i < frameIds.length; i += 1) {
+          var state = registry.states[frameIds[i]];
+          if (!state) { continue; }
+          state.keyLeft = false;
+          state.keyRight = false;
+          state.keyUp = false;
+          state.keyDown = false;
+        }
       }, true);
     }
 
@@ -3275,6 +3640,27 @@
           var seconds = (global.performance && typeof global.performance.now === "function")
             ? (global.performance.now() * 0.001)
             : (Date.now() * 0.001);
+          var nowMs = seconds * 1000.0;
+          var dtSec = controlState.lastRenderTsMs > 0
+            ? Math.max(0.0, Math.min(0.1, (nowMs - controlState.lastRenderTsMs) * 0.001))
+            : (1.0 / 60.0);
+          controlState.lastRenderTsMs = nowMs;
+          if (controlState.controlsEnabled !== false) {
+            var orbitSpeed = Number(controlState.orbitSpeedRadPerSec || 0.0) || 0.0;
+            if (orbitSpeed > 0.0) {
+              var deltaPhi = 0.0;
+              var deltaTheta = 0.0;
+              if (controlState.keyLeft) { deltaPhi -= orbitSpeed * dtSec; }
+              if (controlState.keyRight) { deltaPhi += orbitSpeed * dtSec; }
+              if (controlState.keyUp) { deltaTheta += orbitSpeed * dtSec; }
+              if (controlState.keyDown) { deltaTheta -= orbitSpeed * dtSec; }
+              if (deltaPhi !== 0.0 || deltaTheta !== 0.0) {
+                controlState.orbitPhi += deltaPhi;
+                controlState.orbitTheta += deltaTheta;
+                controlState.userInteracted = true;
+              }
+            }
+          }
           var authoredCamera = makeCamera(config.camera || {}, cameraFallback, seconds);
           if (controlState.lockApertureCamera === true) {
             var currentEyeKey = linkedSourceEyeKey();
@@ -3323,13 +3709,49 @@
           var renderCamera = controlState.userInteracted !== true && controlState.exactInitCamera
             ? cloneCameraState(controlState.exactInitCamera, cameraFallback)
             : userCamera;
+          var markerReferenceHeightPx;
+          if (useVisibleFrame) {
+            markerReferenceHeightPx = Math.max(
+              1,
+              Math.round((body && body.getBoundingClientRect ? body.getBoundingClientRect().height : 0) || 0) ||
+              Math.round(Number(global.innerHeight || 720) || 720)
+            );
+          } else {
+            var sourceMarkerReferenceHeightPx = 0;
+            if (dependencySourceFrameId && global.__vfNativeSceneLiveCameras) {
+              sourceMarkerReferenceHeightPx = Number(
+                global.__vfNativeSceneLiveCameras[dependencySourceFrameId] &&
+                global.__vfNativeSceneLiveCameras[dependencySourceFrameId].viewport_marker_reference_height_px || 0
+              ) || 0;
+            }
+            markerReferenceHeightPx = sourceMarkerReferenceHeightPx > 0
+              ? Math.max(1, Math.round(sourceMarkerReferenceHeightPx))
+              : Math.max(1, Number(offscreenPixels && offscreenPixels.height || 0) || 1);
+          }
+          var markerSizeCamera = null;
+          if (!useVisibleFrame && dependencySourceFrameId && global.__vfNativeSceneLiveCameras) {
+            var sourceMarkerCamera = global.__vfNativeSceneLiveCameras[dependencySourceFrameId];
+            if (sourceMarkerCamera && typeof sourceMarkerCamera === "object") {
+              markerSizeCamera = Object.assign({}, sourceMarkerCamera);
+              if (!(Number(markerSizeCamera.viewport_height_px || 0) > 0)) {
+                markerSizeCamera.viewport_height_px = Number(markerSizeCamera.viewport_marker_reference_height_px || 0) || 0;
+              }
+            }
+          }
           var liveCamera = {
             pos: toVec3(renderCamera.pos, [0, 0, 0]),
             target: toVec3(renderCamera.target, [0, 0, 0]),
             up: toVec3(renderCamera.up, [0, 0, 1]),
             fov: Number(renderCamera.fov || 34.0) || 34.0,
+            viewport_height_px: markerReferenceHeightPx,
+            viewport_marker_reference_height_px: markerReferenceHeightPx,
             flip_x: renderCamera.flip_x === true
           };
+          renderCamera.viewport_marker_reference_height_px = markerReferenceHeightPx;
+          renderCamera.viewport_height_px = markerReferenceHeightPx;
+          if (markerSizeCamera) {
+            renderCamera._marker_size_camera = markerSizeCamera;
+          }
           if (Array.isArray(renderCamera.view_matrix) && renderCamera.view_matrix.length === 16) {
             liveCamera.view_matrix = renderCamera.view_matrix.slice();
           }
