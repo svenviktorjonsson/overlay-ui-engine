@@ -752,6 +752,9 @@
       if (!hasBodyContent) {
         body.classList.add("vf-frame__body--empty");
       }
+      if (opt.bodyTransparent === true) {
+        body.classList.add("vf-frame__body--transparent");
+      }
       const drawCanvas = document.createElement("canvas");
       drawCanvas.className = "vf-frame__draw-canvas";
       drawCanvas.setAttribute("aria-hidden", "true");

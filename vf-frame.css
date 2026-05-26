@@ -186,6 +186,10 @@
   background: rgba(28, 28, 34, calc(0.92 * var(--vf-ui-alpha, 1)));
 }
 
+.vf-frame__body--transparent {
+  background: transparent;
+}
+
 /* Background layer for vektorflow ``d.draw_rect`` / vf-display.json (see vf-display.js). */
 .vf-frame__draw-canvas {
   position: absolute;
@@ -399,15 +403,20 @@
 
 .vf-frame__body.vf-w-grid {
   display: grid;
-  grid-template-columns: repeat(var(--vf-grid-cols, 1), minmax(0, 1fr));
-  grid-template-rows: repeat(var(--vf-grid-rows, 1), minmax(min-content, auto));
-  gap: 8px;
+  grid-template-columns: var(--vf-grid-template-columns, repeat(var(--vf-grid-cols, 1), minmax(0, 1fr)));
+  grid-template-rows: var(--vf-grid-template-rows, repeat(var(--vf-grid-rows, 1), minmax(0, 1fr)));
+  gap: 6px;
   padding: 8px 10px 10px;
   min-height: 0;
   box-sizing: border-box;
-  align-content: start;
-  background: rgba(28, 28, 35, 0.92);
+  align-content: stretch;
+  justify-items: start;
+  background: rgba(28, 28, 35, calc(0.92 * var(--vf-ui-alpha, 1)));
   border-radius: 0 0 8px 8px;
+}
+
+.vf-frame__body.vf-w-grid.vf-frame__body--transparent {
+  background: transparent;
 }
 
 .vf-frame__body.vf-w-grid > *:not(.vf-frame__draw-canvas):not(.vf-frame__overlay) {
@@ -427,14 +436,97 @@
 }
 
 .vf-w-label {
+  display: flex;
+  align-items: center;
   color: #e0e0ea;
-  line-height: 1.4;
+  line-height: 1.2;
+  min-height: 22px;
   word-break: break-word;
+}
+
+.vf-w-label .katex-display {
+  margin: 0;
+}
+
+.vf-w-label-math {
+  display: inline-flex;
+  align-items: center;
+}
+
+.vf-w-plot-panel {
+  position: relative;
+  justify-self: stretch;
+  align-self: stretch;
+  width: 100%;
+  min-height: 0;
+  height: 100%;
+  border: 0;
+  border-radius: 0;
+  overflow: hidden;
+  background: transparent;
+  pointer-events: auto;
+  z-index: 0;
+}
+
+.vf-frame__body.vf-w-grid > .vf-w-plot-panel {
+  z-index: 0;
+  min-height: 0;
+  height: 100%;
+}
+
+.vf-w-stackframe {
+  position: relative;
+  justify-self: stretch;
+  align-self: stretch;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.vf-w-stackframe__child {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.vf-w-plot-panel__canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  pointer-events: auto;
+}
+
+.vf-w-align-left {
+  justify-self: start;
+}
+
+.vf-w-align-center {
+  justify-self: center;
+}
+
+.vf-w-align-right {
+  justify-self: end;
+}
+
+.vf-w-align-stretch {
+  justify-self: stretch;
+  width: 100%;
+}
+
+.vf-w-compact {
+  max-width: 7rem;
 }
 
 .vf-w-btn {
   font: inherit;
-  padding: 6px 12px;
+  padding: 4px 10px;
   border-radius: 6px;
   border: 1px solid rgba(120, 120, 150, 0.6);
   background: linear-gradient(180deg, #4a4a58, #383844);
@@ -442,6 +534,8 @@
   cursor: pointer;
   pointer-events: auto;
   align-self: flex-start;
+  justify-self: start;
+  width: auto;
 }
 
 .vf-w-btn:hover {
@@ -472,8 +566,13 @@
   pointer-events: auto;
 }
 
+.vf-w-slider.vf-w-compact {
+  width: 8.5rem;
+  max-width: 8.5rem;
+}
+
 .vf-w-range {
-  flex: 1;
+  flex: 0 1 220px;
   min-width: 80px;
   accent-color: #6a9cff;
   cursor: pointer;
@@ -495,11 +594,27 @@
   background: rgba(20, 20, 28, 0.95);
   border: 1px solid rgba(100, 100, 130, 0.45);
   border-radius: 6px;
-  padding: 6px 8px;
+  padding: 4px 7px;
   min-width: 0;
+  max-width: 11rem;
   box-sizing: border-box;
   pointer-events: auto;
   cursor: text;
+}
+
+.vf-w-slider.vf-w-compact .vf-w-range {
+  flex-basis: 5.5rem;
+  min-width: 4.5rem;
+}
+
+.vf-w-slider.vf-w-compact .vf-w-slider-val {
+  flex-basis: 2.4em;
+}
+
+.vf-w-input.vf-w-compact,
+.vf-w-select.vf-w-compact {
+  width: 6.5rem;
+  max-width: 6.5rem;
 }
 
 .vf-w-textarea {
@@ -509,5 +624,21 @@
 
 .vf-w-select {
   cursor: pointer;
-  max-width: 100%;
+  max-width: 11rem;
+}
+
+.vf-w-combobox.vf-w-align-stretch,
+.vf-w-combobox.vf-w-align-stretch .vf-w-input {
+  max-width: none;
+  width: 100%;
+}
+
+.vf-w-combobox.vf-w-compact {
+  max-width: 24rem;
+  width: 24rem;
+}
+
+.vf-w-combobox.vf-w-compact .vf-w-input {
+  max-width: 24rem;
+  width: 24rem;
 }

@@ -75,8 +75,7 @@
         quiesceThreshold = steadyThreshold;
       }
       if (idlePolls >= quiesceThreshold) {
-        enterIdle("idle polls=" + idlePolls);
-        return null;
+        return Number(config.packetPollSteadyMs) || 400;
       }
       if (idlePolls >= steadyThreshold) {
         return Number(config.packetPollSteadyMs) || 400;

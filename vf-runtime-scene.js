@@ -229,6 +229,7 @@
             resizable: flags.resizable !== false,
             closable: flags.closable !== false,
             alpha: alpha,
+            bodyTransparent: spec.body_transparent === true,
             master: isMaster,
             dockLocation: dockLocation,
             zIndexBase: 1000 + i * 2,

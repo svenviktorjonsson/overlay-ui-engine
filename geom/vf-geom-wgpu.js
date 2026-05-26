@@ -5816,7 +5816,10 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
             fireBatchPickCallback = !!this._pickCallback;
           }
         } else if (pendingBatchPick) {
-          failFast("pending GPU pick request but pick pass is unavailable for scene parts");
+          wlog("warn", "dropping GPU pick request: pick pass is unavailable for scene parts");
+          this._pendingPickPx = null;
+          this._pickPending = false;
+          this._pickCallback = null;
         }
         perfSample.pick = perfNowMs() - pickPerfStart;
         this._blitFrameTargetToCanvas(encBatch, mesh);
@@ -5862,11 +5865,26 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
 
       if (mesh.mode3d === false) {
         // 2D ortho — ignore camera
-        projMat = Mm.mat4OrthoZ01(-1, 1, -1, 1, 0, 1);
+        if (String(mesh.aspect || "").toLowerCase() === "equal") {
+          if (asp >= 1.0) {
+            projMat = Mm.mat4OrthoZ01(-asp, asp, -1, 1, 0, 1);
+          } else {
+            projMat = Mm.mat4OrthoZ01(-1, 1, -1 / Math.max(1e-6, asp), 1 / Math.max(1e-6, asp), 0, 1);
+          }
+        } else {
+          projMat = Mm.mat4OrthoZ01(-1, 1, -1, 1, 0, 1);
+        }
         mvp     = projMat;
       } else {
         var fovRad = fov * Math.PI / 180;
-        projMat  = Mm.mat4PerspectiveZ01(fovRad, asp, 0.05, 500);
+        if (cam && Array.isArray(cam.projection_matrix) && cam.projection_matrix.length === 16) {
+          projMat = new Float32Array(cam.projection_matrix);
+        } else if (String(cam && cam.projection || "").toLowerCase() === "orthographic") {
+          var orthoScale = Math.max(1e-6, Number(cam.ortho_scale || 2.5) || 2.5);
+          projMat = Mm.mat4OrthoZ01(-orthoScale * asp, orthoScale * asp, -orthoScale, orthoScale, 0.05, 500);
+        } else {
+          projMat  = Mm.mat4PerspectiveZ01(fovRad, asp, 0.05, 500);
+        }
         // auto-spin if no camera is set on mesh
         if (!mesh.camera) {
           var ang  = t * 0.0008;
@@ -5988,7 +6006,10 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
           fireSinglePickCallback = !!this._pickCallback;
         }
       } else if (pendingSinglePick) {
-        failFast("pending GPU pick request but pick pass is unavailable for mesh");
+        wlog("warn", "dropping GPU pick request: pick pass is unavailable for mesh");
+        this._pendingPickPx = null;
+        this._pickPending = false;
+        this._pickCallback = null;
       }
       this._blitFrameTargetToCanvas(enc, mesh);
       this._device.queue.submit([enc.finish()]);
@@ -6172,8 +6193,8 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     try {
       this._ctx.configure({ device: this._device, format: this._format, alphaMode: "premultiplied" });
     } catch (e) {
-      try { this._ctx.configure({ device: this._device, format: this._format, alphaMode: "opaque" }); }
-      catch (e2) { wlog("error", "configure failed: " + (e2 && e2.message ? e2.message : e2)); return false; }
+      wlog("error", "configure alphaMode=premultiplied failed: " + (e && e.message ? e.message : e));
+      return false;
     }
     try {
       this._uniformBuf = this._device.createBuffer({
