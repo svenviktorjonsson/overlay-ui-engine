@@ -665,6 +665,7 @@
       const opt = options || {};
       const id = opt.id || "vf-frame-" + Math.random().toString(36).slice(2, 9);
       const title = opt.title != null ? String(opt.title) : "";
+      const frameless = opt.frameless === true;
       const ta = opt.titleAlign;
       const titleAlign = ta === "center" || ta === "right" ? ta : "left";
       const draggable = opt.draggable !== false;
@@ -697,7 +698,8 @@
 
       const root = document.createElement("div");
       root.className = "vf-frame";
-      root.classList.toggle("vf-frame--resizable", resizable);
+      root.classList.toggle("vf-frame--resizable", resizable && !frameless);
+      root.classList.toggle("vf-frame--frameless", frameless);
       root.dataset.vfFrameId = id;
       root.dataset.vfMinDock = minDock;
       if (aspect) { root.dataset.vfAspect = aspect; }
@@ -771,10 +773,14 @@
       resizeGrip.className = "vf-frame__resize-grip";
       resizeGrip.setAttribute("aria-hidden", "true");
 
-      root.appendChild(head);
+      if (!frameless) {
+        root.appendChild(head);
+      }
       root.appendChild(minibar);
       root.appendChild(body);
-      root.appendChild(resizeGrip);
+      if (!frameless) {
+        root.appendChild(resizeGrip);
+      }
 
       layer.appendChild(root);
 
@@ -935,6 +941,7 @@
       const inLayerDrag = wv0 ? opt.inLayerDrag !== false : opt.inLayerDrag === true;
       const useHostWindowDrag = !!(
         draggable &&
+        !frameless &&
         !inLayerDrag &&
         wv0 &&
         typeof wv0.postMessage === "function"
@@ -967,7 +974,7 @@
 
       if (useHostWindowDrag) {
         VfFrame.attachHostWindowDrag([head, minibar], { onDragStart: bringToFront });
-      } else if (draggable) {
+      } else if (draggable && !frameless) {
         /* vf-overlay: keep region lock-step with pointer movement to avoid visible crop lag. */
         VfFrame.attachHeaderDrag({
           root,
@@ -1004,7 +1011,7 @@
       attachPointerToFront(head);
       attachPointerToFront(body);
       attachPointerToFront(minibar);
-      if (resizable) attachPointerToFront(resizeGrip);
+      if (resizable && !frameless) attachPointerToFront(resizeGrip);
 
       let resizeState = null;
       function onResizeMove(e) {
@@ -1038,7 +1045,7 @@
           },
         });
       }
-      if (resizable) {
+      if (resizable && !frameless) {
         resizeGrip.addEventListener("pointerdown", (e) => {
           if (minimized) return;
           if (e.button !== 0) return;

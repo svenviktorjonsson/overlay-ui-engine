@@ -10,6 +10,12 @@
   var lastStateText = "";
   var pollTimer = 0;
   var started = false;
+  var buttonGroups = [];
+  var buttonGroupState = Object.create(null);
+
+  function buttonGroupStateKey(frameId, widgetId) {
+    return String(frameId || "") + "::" + String(widgetId || "");
+  }
 
   function getOrigin() {
     if (typeof location !== "undefined" && location && location.origin) {
@@ -38,7 +44,14 @@
       obj.widget_id = String(obj.widgetId);
     }
     try {
-      if (typeof window !== "undefined" && window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
+      // Keep vf_event traffic off the native WebMessage input path for now.
+      // Widget/host events can travel over /api/enqueue just like the
+      // non-WebView fallback, while non-vf_event host chrome messages still
+      // use postMessage elsewhere.
+      if (obj.type !== "vf_event" &&
+          typeof window !== "undefined" &&
+          window.chrome && window.chrome.webview &&
+          window.chrome.webview.postMessage) {
         window.chrome.webview.postMessage(obj);
         return;
       }
@@ -69,6 +82,11 @@
 
   function clearFrameWidgets(fid) {
     delete reg[fid];
+    if (Array.isArray(buttonGroups) && buttonGroups.length) {
+      buttonGroups = buttonGroups.filter(function (record) {
+        return !(record && String(record.frameId || "") === String(fid || ""));
+      });
+    }
   }
 
   function makeDebouncedEmitter(delayMs) {
@@ -294,6 +312,16 @@
         }
       }
     }
+    if (r.type === "button_group" && r.root) {
+      if (p.active != null) {
+        setButtonGroupActive(r, String(p.active), false);
+      } else if (p.value != null && Array.isArray(r.options)) {
+        var bgIndex = Number(p.value);
+        if (Number.isFinite(bgIndex) && bgIndex >= 0 && bgIndex < r.options.length) {
+          setButtonGroupActive(r, String(r.options[Math.floor(bgIndex)].value), false);
+        }
+      }
+    }
   }
 
 
@@ -469,9 +497,58 @@
       storeWidget(frameId, w, { type: "button", el: b, root: b, id: w });
       return b;
     }
+    if (t === "button_group") {
+      var group = document.createElement("div");
+      group.className = "vf-w-button-group";
+      applyWidgetLayoutClasses(group, spec);
+      group.setAttribute("role", "group");
+      var opts = Array.isArray(spec.options) ? spec.options : [];
+      var buttons = Object.create(null);
+      var normalized = [];
+      for (var oi = 0; oi < opts.length; oi++) {
+        var opt = opts[oi] || {};
+        var value = opt.value != null ? String(opt.value) : String(oi);
+        var btn = document.createElement("button");
+        btn.className = "vf-w-button-group__btn";
+        btn.type = "button";
+        btn.textContent = opt.label != null ? String(opt.label) : value;
+        btn.setAttribute("data-vf-button-group-value", value);
+        group.appendChild(btn);
+        buttons[value] = btn;
+        normalized.push({
+          value: value,
+          label: opt.label != null ? String(opt.label) : value,
+          targetFrame: opt.target_frame != null ? String(opt.target_frame) : (opt.targetFrame != null ? String(opt.targetFrame) : "")
+        });
+        btn.addEventListener("click", function (e) {
+          var v = this.getAttribute("data-vf-button-group-value") || "";
+          setButtonGroupActive(record, v, true);
+          if (e && typeof e.stopPropagation === "function") { e.stopPropagation(); }
+        });
+      }
+      var record = {
+        type: "button_group",
+        root: group,
+        id: w,
+        frameId: String(frameId),
+        options: normalized,
+        buttons: buttons,
+        active: ""
+      };
+      storeWidget(frameId, w, record);
+      buttonGroups.push(record);
+      var remembered = buttonGroupState[buttonGroupStateKey(frameId, w)];
+      var initialActive = remembered != null
+        ? String(remembered)
+        : (spec.active != null ? String(spec.active) : (normalized[0] ? normalized[0].value : ""));
+      setButtonGroupActive(record, initialActive, false);
+      setWidgetVisibility(group, spec.visible !== false);
+      return group;
+    }
     if (t === "checkbox") {
       var row = document.createElement("label");
       row.className = "vf-w-check";
+      applyWidgetLayoutClasses(row, spec);
       var cb = document.createElement("input");
       cb.type = "checkbox";
       cb.checked = spec.checked === true;
@@ -481,6 +558,18 @@
       row.appendChild(cb);
       row.appendChild(cap);
       cb.addEventListener("change", function () {
+        if ((spec.axis_log_target_frame || spec.axis_log_target_frames) && spec.axis) {
+          try {
+            if (global.VfDisplay && typeof global.VfDisplay.setAxisTickMode === "function") {
+              var targets = Array.isArray(spec.axis_log_target_frames) ? spec.axis_log_target_frames : [spec.axis_log_target_frame];
+              for (var ti = 0; ti < targets.length; ti += 1) {
+                if (targets[ti] != null) {
+                  global.VfDisplay.setAxisTickMode(String(targets[ti]), String(spec.axis), cb.checked ? "log" : "linear");
+                }
+              }
+            }
+          } catch (_) {}
+        }
         enqueueEvent({
           frameId: String(frameId),
           widgetId: w,
@@ -714,6 +803,75 @@
     }
   }
 
+  function setButtonGroupActive(record, active, emit) {
+    if (!record || !record.root) return;
+    var next = String(active || "");
+    if (!next && Array.isArray(record.options) && record.options.length) {
+      next = String(record.options[0].value || "");
+    }
+    var same = record.active === next;
+    record.active = next;
+    buttonGroupState[buttonGroupStateKey(record.frameId, record.id)] = next;
+    var targets = [];
+    for (var i = 0; Array.isArray(record.options) && i < record.options.length; i++) {
+      var opt = record.options[i] || {};
+      var value = String(opt.value || "");
+      var btn = record.buttons ? record.buttons[value] : null;
+      var selected = value === next;
+      if (btn) {
+        btn.classList.toggle("vf-w-button-group__btn--active", selected);
+        btn.setAttribute("aria-pressed", selected ? "true" : "false");
+      }
+      if (opt.targetFrame) {
+        targets.push({ frameId: String(opt.targetFrame), selected: selected });
+      }
+    }
+    function applyTargetVisibility() {
+      if (typeof document === "undefined") return;
+      var changed = false;
+      for (var ti = 0; ti < targets.length; ti++) {
+        var fid = targets[ti].frameId;
+        var el = document.querySelector && document.querySelector(".vf-frame[data-vf-frame-id=\"" + fid.replace(/["\\]/g, "") + "\"]");
+        if (!el) continue;
+        var nextDisplay = targets[ti].selected ? "" : "none";
+        if (el.style.display !== nextDisplay) { changed = true; }
+        el.style.display = nextDisplay;
+        el.classList.toggle("vf-frame--button-group-active", targets[ti].selected);
+      }
+      if (changed && global.VfDisplay && typeof global.VfDisplay.redrawVisibleGeomFrames === "function") {
+        try { global.VfDisplay.redrawVisibleGeomFrames(); } catch (_) {}
+      }
+      if (changed && typeof global.requestAnimationFrame === "function") {
+        global.requestAnimationFrame(function () {
+          try {
+            if (global.VfDisplay && typeof global.VfDisplay.redrawVisibleGeomFrames === "function") {
+              global.VfDisplay.redrawVisibleGeomFrames();
+            }
+          } catch (_) {}
+          try { global.dispatchEvent(new Event("resize")); } catch (_) {}
+        });
+      }
+    }
+    applyTargetVisibility();
+    if (emit === true && !same) {
+      enqueueEvent({
+        frameId: String(record.frameId || ""),
+        widgetId: String(record.id || ""),
+        event: "button_group.changed",
+        data: { value: next, text: next }
+      });
+    }
+  }
+
+  function refreshButtonGroups() {
+    for (var i = 0; i < buttonGroups.length; i++) {
+      var r = buttonGroups[i];
+      if (r && r.root && r.root.isConnected !== false) {
+        setButtonGroupActive(r, r.active, false);
+      }
+    }
+  }
+
   function applyGridSlot(node, spec) {
     if (!node || !spec || !Array.isArray(spec.grid) || spec.grid.length !== 4) return;
     var row = Number(spec.grid[0]);
@@ -806,5 +964,6 @@
     applyRuntimePacket: applyRuntimePacket,
     clearFrame: clearFrameWidgets,
     widgetRecord: widgetRecord,
+    refreshButtonGroups: refreshButtonGroups,
   };
 })(typeof window !== "undefined" ? window : this);

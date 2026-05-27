@@ -245,6 +245,19 @@
   position: absolute !important;
 }
 
+.vf-frame--frameless {
+  border-radius: 0;
+  border-color: transparent;
+  box-shadow: none;
+  background: transparent;
+}
+
+.vf-frame--frameless > .vf-frame__body {
+  position: absolute;
+  inset: 0;
+  border-radius: 0;
+}
+
 .vf-frame__minibar {
   display: none;
   align-items: center;
@@ -536,6 +549,35 @@
   align-self: flex-start;
   justify-self: start;
   width: auto;
+}
+
+.vf-w-button-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.vf-w-button-group__btn {
+  font: inherit;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(210, 205, 230, 0.38);
+  color: rgba(246, 243, 255, 0.92);
+  background: rgba(28, 23, 42, 0.72);
+  cursor: pointer;
+}
+
+.vf-w-button-group__btn:hover {
+  border-color: rgba(236, 232, 255, 0.62);
+  background: rgba(44, 37, 64, 0.86);
+}
+
+.vf-w-button-group__btn--active {
+  color: #101018;
+  border-color: rgba(255, 255, 255, 0.88);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 0 0 1px rgba(130, 170, 255, 0.42), 0 0 18px rgba(130, 170, 255, 0.28);
 }
 
 .vf-w-btn:hover {

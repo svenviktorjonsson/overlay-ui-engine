@@ -93,11 +93,6 @@
         if (global.console.log) { global.console.log(s); }
       }
     } catch (_) {}
-    try {
-      if (global.chrome && global.chrome.webview && global.chrome.webview.postMessage) {
-        global.chrome.webview.postMessage({ type: "vf_log", level: level, message: s, t: Date.now() });
-      }
-    } catch (_) {}
   }
 
   function createRuntimeDependencies() {

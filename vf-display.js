@@ -81,7 +81,13 @@
       }
     } catch (_) {}
     try {
-      if (typeof window !== "undefined" && window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
+      // Route vf_event traffic through HTTP even inside WebView. The native
+      // postMessage event path is currently unstable under interaction, while
+      // /api/enqueue already carries the same event payloads for the host.
+      if (evt && evt.type !== "vf_event" &&
+          typeof window !== "undefined" &&
+          window.chrome && window.chrome.webview &&
+          window.chrome.webview.postMessage) {
         window.chrome.webview.postMessage(evt);
         return;
       }
@@ -2311,8 +2317,59 @@
     var geom = _lastDisplayPayload.geom[fid];
     var camera = Object.assign({}, geom.camera || {});
     mutator(camera, geom);
+    camera.__vf_live_mutated = true;
     geom.camera = camera;
     schedulePlotCameraUpdate(fid);
+  }
+
+  function copyLiveAxisTickState(nextCfg, prevCfg) {
+    if (!nextCfg || !prevCfg || prevCfg.__vf_live_mutated !== true) { return; }
+    nextCfg.x_min = prevCfg.x_min;
+    nextCfg.x_max = prevCfg.x_max;
+    nextCfg.y_min = prevCfg.y_min;
+    nextCfg.y_max = prevCfg.y_max;
+    if (Object.prototype.hasOwnProperty.call(prevCfg, "rotation_deg")) {
+      nextCfg.rotation_deg = prevCfg.rotation_deg;
+    }
+    if (Object.prototype.hasOwnProperty.call(prevCfg, "__raw_rotation_deg")) {
+      nextCfg.__raw_rotation_deg = prevCfg.__raw_rotation_deg;
+    }
+    if (Object.prototype.hasOwnProperty.call(prevCfg, "__frozen_box_tick_state")) {
+      nextCfg.__frozen_box_tick_state = prevCfg.__frozen_box_tick_state;
+    }
+    nextCfg.__vf_live_mutated = true;
+  }
+
+  function carryForwardLiveGeomState(prevData, nextData) {
+    if (!prevData || !nextData || !prevData.geom || !nextData.geom) { return; }
+    var nextGeom = nextData.geom;
+    var prevGeom = prevData.geom;
+    var frameIds = Object.keys(nextGeom);
+    for (var fi = 0; fi < frameIds.length; fi += 1) {
+      var fid = frameIds[fi];
+      var prevFrameGeom = prevGeom[fid];
+      var nextFrameGeom = nextGeom[fid];
+      if (!prevFrameGeom || !nextFrameGeom) { continue; }
+      if (nextFrameGeom.camera && prevFrameGeom.camera && prevFrameGeom.camera.__vf_live_mutated === true) {
+        nextFrameGeom.camera = Object.assign({}, nextFrameGeom.camera, prevFrameGeom.camera, { __vf_live_mutated: true });
+      }
+      var prevMeshes = Array.isArray(prevFrameGeom.meshes) ? prevFrameGeom.meshes : [];
+      var nextMeshes = Array.isArray(nextFrameGeom.meshes) ? nextFrameGeom.meshes : [];
+      if (!prevMeshes.length || !nextMeshes.length) { continue; }
+      var prevById = {};
+      for (var pm = 0; pm < prevMeshes.length; pm += 1) {
+        var prevMesh = prevMeshes[pm];
+        if (!prevMesh || !prevMesh.id) { continue; }
+        prevById[String(prevMesh.id)] = prevMesh;
+      }
+      for (var nm = 0; nm < nextMeshes.length; nm += 1) {
+        var nextMesh = nextMeshes[nm];
+        if (!nextMesh || !nextMesh.id) { continue; }
+        var prevMeshMatch = prevById[String(nextMesh.id)];
+        if (!prevMeshMatch) { continue; }
+        copyLiveAxisTickState(nextMesh.axis_ticks, prevMeshMatch.axis_ticks);
+      }
+    }
   }
 
   function crossVec3(a, b) {
@@ -2330,6 +2387,19 @@
     var len = Math.sqrt(x * x + y * y + z * z);
     if (!(len > 1e-9)) { return (fallback || [0, 0, 1]).slice(); }
     return [x / len, y / len, z / len];
+  }
+
+  function rotateVec3AroundAxis(v, axis, angleRad) {
+    axis = normalizeVec3Local(axis, [0, 0, 1]);
+    var c = Math.cos(Number(angleRad) || 0);
+    var s = Math.sin(Number(angleRad) || 0);
+    var d = dot3(axis, v);
+    var cr = crossVec3(axis, v);
+    return [
+      v[0] * c + cr[0] * s + axis[0] * d * (1 - c),
+      v[1] * c + cr[1] * s + axis[1] * d * (1 - c),
+      v[2] * c + cr[2] * s + axis[2] * d * (1 - c)
+    ];
   }
 
   function applyAxis3DCameraToLiveRenderers(fid, camera) {
@@ -2358,6 +2428,12 @@
     var rec = frameRecs[String(fid)] || null;
     var geom = _lastDisplayPayload && _lastDisplayPayload.geom ? _lastDisplayPayload.geom[String(fid)] : null;
     if (!rec || !rec.pendingTextFrameEl || !geom || geom.axis3d_controls !== true) { return; }
+    if (Array.isArray(rec.axis3DBoundaryLabelPool)) {
+      for (var hi = 0; hi < rec.axis3DBoundaryLabelPool.length; hi += 1) {
+        if (rec.axis3DBoundaryLabelPool[hi]) { rec.axis3DBoundaryLabelPool[hi].style.display = "none"; }
+      }
+    }
+    return;
     var frameEl = rec.pendingTextFrameEl;
     var layer = ensureGeomTextOverlay(frameEl, String(fid));
     if (!layer) { return; }
@@ -2562,9 +2638,11 @@
     var halfWidth = halfHeight * aspect;
     var viewRadius = Math.sqrt((halfWidth * halfWidth) + (halfHeight * halfHeight));
     var span = Math.max(configuredExtent, viewRadius);
+    var fallbackLo = center - span;
+    var fallbackHi = center + span;
     return {
-      lo: center - span,
-      hi: center + span,
+      lo: fallbackLo,
+      hi: fallbackHi,
       pixelSpan: Math.max(1, Math.max(w, h) * (span / Math.max(1e-9, viewRadius))),
       w: w,
       h: h
@@ -2610,6 +2688,64 @@
     );
   }
 
+  function axis3DCrosshairTickStepCacheKey(cfg, w, h) {
+    return [
+      "v2",
+      "w" + Math.round(Number(w) || 0),
+      "h" + Math.round(Number(h) || 0),
+      "m" + [cfg.x_mode || "linear", cfg.y_mode || "linear", cfg.z_mode || "linear"].join(","),
+      "d" + String(Number(cfg.tick_dist) || 120),
+      "min" + String(Number(cfg.min_tick_dist) || 72),
+      "max" + String(Number(cfg.max_tick_dist) || 180),
+      "fs" + String(Number(cfg.tick_label_font_size) || 11),
+      "hints" + JSON.stringify(Array.isArray(cfg.tick_hints) ? cfg.tick_hints : [1, 2, 5])
+    ].join(":");
+  }
+
+  function axis3DCrosshairTickSteps(fid, cfg, cam, target, axisInfos, w, h, rec3) {
+    var stepKey = axis3DCrosshairTickStepCacheKey(cfg, w, h);
+    if (rec3 && rec3.axis3DHelperStepCache && rec3.axis3DHelperStepCache.key === stepKey) {
+      return rec3.axis3DHelperStepCache.axes || [];
+    }
+    var hints = Array.isArray(cfg.tick_hints) && cfg.tick_hints.length ? cfg.tick_hints : [1, 2, 5];
+    var out = [];
+    for (var ai = 0; ai < 3; ai += 1) {
+      var axisName = ai === 0 ? "x" : ai === 1 ? "y" : "z";
+      var tickMode = String(cfg[axisName + "_mode"] || cfg[axisName + "_tick_mode"] || "linear").toLowerCase();
+      var range = axis3DVisibleRange(String(fid), cfg, cam, target, axisName);
+      var dataPerPixel = (Number(range.hi) - Number(range.lo)) / Math.max(1, Number(range.pixelSpan) || Math.max(w, h));
+      if (!(dataPerPixel > 0)) {
+        var infoForStep = axisInfos && axisInfos[ai] || null;
+        dataPerPixel = infoForStep && infoForStep.len > 1e-9 ? 1 / infoForStep.len : 1;
+      }
+      var step = chooseAxisTickStep(
+        dataPerPixel,
+        Number(cfg.tick_dist) || 120,
+        hints,
+        Number(cfg.min_tick_dist) || 72,
+        Number(cfg.max_tick_dist) || 180
+      );
+      if (!isLogTickMode(tickMode)) {
+        step = chooseReadableLinearTickStep(
+          range.lo,
+          range.hi,
+          step,
+          null,
+          "linear",
+          hints,
+          Math.max(1, Number(range.pixelSpan) || Math.max(w, h)),
+          Number(cfg.tick_dist) || 120,
+          Number(cfg.min_tick_dist) || 72,
+          Number(cfg.max_tick_dist) || 180,
+          Number(cfg.tick_label_font_size) || 11
+        );
+      }
+      out[ai] = { step: step, mode: tickMode };
+    }
+    if (rec3) { rec3.axis3DHelperStepCache = { key: stepKey, axes: out }; }
+    return out;
+  }
+
   function axis3DTickValues(lo, hi, step) {
     step = Math.abs(Number(step) || 0);
     if (!(step > 0)) { return []; }
@@ -2648,14 +2784,1260 @@
     return out;
   }
 
+  function normalizeUndirectedAngleDeg(angleDeg) {
+    var angle = Number(angleDeg) || 0;
+    while (angle < 0) { angle += 180; }
+    while (angle >= 180) { angle -= 180; }
+    return angle;
+  }
+
+  function undirectedAngleDiffDeg(aDeg, bDeg) {
+    var a = normalizeUndirectedAngleDeg(aDeg);
+    var b = normalizeUndirectedAngleDeg(bDeg);
+    var diff = Math.abs(a - b);
+    return Math.min(diff, 180 - diff);
+  }
+
+  function nearestAxisSnapAngleDeg(angleDeg, snapTargets) {
+    var angle = normalizeUndirectedAngleDeg(angleDeg);
+    var targets = Array.isArray(snapTargets) && snapTargets.length ? snapTargets : [0, 90];
+    var best = targets[0];
+    var bestDiff = undirectedAngleDiffDeg(angle, best);
+    for (var i = 1; i < targets.length; i += 1) {
+      var diff = undirectedAngleDiffDeg(angle, targets[i]);
+      if (diff < bestDiff) {
+        best = targets[i];
+        bestDiff = diff;
+      }
+    }
+    return { angleDeg: best, diffDeg: bestDiff };
+  }
+
+  function snapAngleDegWithinThreshold(rawAngleDeg, thresholdDeg, snapTargets) {
+    var nearest = nearestAxisSnapAngleDeg(rawAngleDeg, snapTargets);
+    return nearest.diffDeg <= Math.max(0, Number(thresholdDeg) || 0) ? nearest.angleDeg : rawAngleDeg;
+  }
+
+  function normalizeSignedAngleDeg(angleDeg) {
+    var angle = Number(angleDeg) || 0;
+    while (angle <= -180) { angle += 360; }
+    while (angle > 180) { angle -= 360; }
+    return angle;
+  }
+
+  function signedAngleDiffDeg(aDeg, bDeg) {
+    return Math.abs(normalizeSignedAngleDeg(aDeg - bDeg));
+  }
+
+  function nearestSignedSnapAngleDeg(angleDeg, snapTargets) {
+    var angle = normalizeSignedAngleDeg(angleDeg);
+    var targets = Array.isArray(snapTargets) && snapTargets.length ? snapTargets : [-180, -90, 0, 90, 180];
+    var best = targets[0];
+    var bestDiff = signedAngleDiffDeg(angle, best);
+    for (var i = 1; i < targets.length; i += 1) {
+      var diff = signedAngleDiffDeg(angle, targets[i]);
+      if (diff < bestDiff) {
+        best = targets[i];
+        bestDiff = diff;
+      }
+    }
+    return { angleDeg: normalizeSignedAngleDeg(best), diffDeg: bestDiff };
+  }
+
+  function snapSignedAngleDegWithinThreshold(rawAngleDeg, thresholdDeg, snapTargets) {
+    var nearest = nearestSignedSnapAngleDeg(rawAngleDeg, snapTargets);
+    return nearest.diffDeg <= Math.max(0, Number(thresholdDeg) || 0) ? nearest.angleDeg : rawAngleDeg;
+  }
+
+  function axis3DCrosshairCollapsedMarkerState(camera) {
+    var pos = vec3Array(camera && camera.pos, [0, 0, 1]);
+    var tgt = vec3Array(camera && camera.target, [0, 0, 0]);
+    var forward = normalizeVec3Local([tgt[0] - pos[0], tgt[1] - pos[1], tgt[2] - pos[2]], [0, 0, -1]);
+    var basisList = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+    var best = { axisIndex: 2, sign: 1, absDot: 0, angleDeg: 90 };
+    for (var axisIndex = 0; axisIndex < basisList.length; axisIndex += 1) {
+      var dot = dot3(basisList[axisIndex], forward);
+      var absDot = Math.max(0, Math.min(1, Math.abs(dot)));
+      if (absDot > best.absDot) {
+        best = {
+          axisIndex: axisIndex,
+          sign: dot >= 0 ? 1 : -1,
+          absDot: absDot,
+          angleDeg: Math.acos(absDot) * (180 / Math.PI)
+        };
+      }
+    }
+    return best;
+  }
+
+  function axis3DCrosshairSnapState(rawOrientation, previousSnap, cfg) {
+    var hideAngleDeg = Math.max(0, Number(cfg && cfg.axis_direction_hide_angle_deg) || 15);
+    var snapAngleDeg = hideAngleDeg;
+    if (!rawOrientation) {
+      return {
+        raw: null,
+        snapped: null,
+        hiddenAxisIndex: null,
+        hideAngleDeg: hideAngleDeg,
+        snapAngleDeg: snapAngleDeg
+      };
+    }
+    var snapped = null;
+    if (Number(rawOrientation.angleDeg) <= snapAngleDeg) {
+      snapped = {
+        axisIndex: rawOrientation.axisIndex,
+        sign: rawOrientation.sign,
+        angleDeg: rawOrientation.angleDeg
+      };
+    } else if (
+      previousSnap &&
+      previousSnap.axisIndex === rawOrientation.axisIndex &&
+      Number(rawOrientation.angleDeg) < hideAngleDeg
+    ) {
+      snapped = {
+        axisIndex: previousSnap.axisIndex,
+        sign: previousSnap.sign,
+        angleDeg: rawOrientation.angleDeg
+      };
+    }
+    return {
+      raw: rawOrientation,
+      snapped: snapped,
+      hiddenAxisIndex: Number(rawOrientation.angleDeg) < hideAngleDeg ? rawOrientation.axisIndex : null,
+      hideAngleDeg: hideAngleDeg,
+      snapAngleDeg: snapAngleDeg
+    };
+  }
+
+  function axis3DProjectedAxisSnapState(axisInfos, previousRawAngles, cfg) {
+    var snapAngleDeg = Math.max(0, Number(cfg && cfg.axis_projected_snap_angle_deg) || 5);
+    var rawAngles = [];
+    var deltas = [];
+    var hiddenAxes = {};
+    var cardinalSnaps = {};
+    for (var i = 0; i < axisInfos.length; i += 1) {
+      var info = axisInfos[i];
+      if (!info) { rawAngles[i] = null; deltas[i] = 0; continue; }
+      var angleDeg = normalizeUndirectedAngleDeg(Math.atan2(info.uy, info.ux) * 180 / Math.PI);
+      rawAngles[i] = angleDeg;
+      deltas[i] = previousRawAngles && Number.isFinite(previousRawAngles[i])
+        ? undirectedAngleDiffDeg(angleDeg, previousRawAngles[i])
+        : 0;
+      var nearest = nearestAxisSnapAngleDeg(angleDeg, [0, 90]);
+      if (nearest.diffDeg <= snapAngleDeg) {
+        cardinalSnaps[i] = nearest.angleDeg;
+      }
+    }
+    for (var a = 0; a < rawAngles.length; a += 1) {
+      if (!Number.isFinite(rawAngles[a])) { continue; }
+      for (var b = a + 1; b < rawAngles.length; b += 1) {
+        if (!Number.isFinite(rawAngles[b])) { continue; }
+        if (undirectedAngleDiffDeg(rawAngles[a], rawAngles[b]) > snapAngleDeg) { continue; }
+        var keep = a;
+        var hide = b;
+        var da = Number(deltas[a]) || 0;
+        var db = Number(deltas[b]) || 0;
+        if (Math.min(da, db) <= Math.max(da, db) * 0.5) {
+          keep = da <= db ? a : b;
+          hide = keep === a ? b : a;
+        } else {
+          keep = da >= db ? a : b;
+          hide = keep === a ? b : a;
+        }
+        hiddenAxes[hide] = keep;
+      }
+    }
+    return {
+      rawAngles: rawAngles,
+      deltas: deltas,
+      hiddenAxes: hiddenAxes,
+      cardinalSnaps: cardinalSnaps
+    };
+  }
+
+  function drawAxisCollapsedMarker(ctx, cfg, px, py, snappedOrientation, color3) {
+    if (!ctx || !snappedOrientation) { return; }
+    var r = Math.max(4, Number(cfg && cfg.tick_len_px) || 7);
+    ctx.save();
+    ctx.strokeStyle = "rgba(" + Math.round(color3[0] * 255) + "," + Math.round(color3[1] * 255) + "," + Math.round(color3[2] * 255) + "," + Math.max(0, Math.min(1, color3[3])) + ")";
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.lineWidth = Math.max(0.5, Number(cfg && cfg.width) || 1);
+    ctx.beginPath();
+    ctx.arc(px, py, r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    if (Number(snappedOrientation.sign) > 0) {
+      var cr = Math.max(2.2, r * 0.48);
+      ctx.moveTo(px - cr, py - cr);
+      ctx.lineTo(px + cr, py + cr);
+      ctx.moveTo(px + cr, py - cr);
+      ctx.lineTo(px - cr, py + cr);
+      ctx.stroke();
+    } else {
+      ctx.arc(px, py, Math.max(1.5, r * 0.28), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function axis3DRuntimeConfig(geom) {
+    if (!geom) { return null; }
+    if (geom.axis3d_runtime) { return geom.axis3d_runtime; }
+    var layers = Array.isArray(geom.frame_layers) ? geom.frame_layers : [];
+    for (var i = layers.length - 1; i >= 0; i -= 1) {
+      var layer = layers[i] || {};
+      if (String(layer.kind || "").toLowerCase() !== "axis") { continue; }
+      if (Number(layer.dim) !== 3) { continue; }
+      layer.mode = String(layer.variant || layer.mode || "crosshair").toLowerCase();
+      return layer;
+    }
+    return null;
+  }
+
+  function axis3DBoxRuntime(geom) {
+    var cfg = axis3DRuntimeConfig(geom);
+    return cfg && String(cfg.mode || "crosshair").toLowerCase() === "box" ? cfg : null;
+  }
+
+  function axis3DDebugEnabled() {
+    try {
+      var env = global && global.process && global.process.env ? global.process.env : null;
+      var raw = env ? String(env.VF_AXIS3D_DEBUG || "") : "";
+      return raw && raw !== "0" && raw.toLowerCase() !== "false";
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function axis3DDebugLog(msg) {
+    if (!axis3DDebugEnabled()) { return; }
+    try { console.log("[axis3d]", msg); } catch (_) {}
+  }
+
+  function axis3DBoxSpan(cfg, axis) {
+    var lo = Number(cfg[axis + "_min"]);
+    var hi = Number(cfg[axis + "_max"]);
+    return Number.isFinite(lo) && Number.isFinite(hi) && hi > lo ? hi - lo : 1;
+  }
+
+  function axis3DBoxEqualAspect(cfg) {
+    if (!cfg) { return true; }
+    if (cfg.equal_aspect != null) { return cfg.equal_aspect !== false; }
+    var aspect = String(cfg.aspect || "equal").toLowerCase();
+    return aspect !== "auto" && aspect !== "fill" && aspect !== "none" && aspect !== "stretched" && aspect !== "stretch";
+  }
+
+  function axis3DBoxAspectPoint(cfg, p) {
+    if (axis3DBoxEqualAspect(cfg)) { return p; }
+    var spans = [axis3DBoxSpan(cfg, "x"), axis3DBoxSpan(cfg, "y"), axis3DBoxSpan(cfg, "z")];
+    var maxSpan = Math.max(spans[0], spans[1], spans[2], 1e-12);
+    var cx = ((Number(cfg.x_min) || 0) + (Number(cfg.x_max) || 0)) * 0.5;
+    var cy = ((Number(cfg.y_min) || 0) + (Number(cfg.y_max) || 0)) * 0.5;
+    var cz = ((Number(cfg.z_min) || 0) + (Number(cfg.z_max) || 0)) * 0.5;
+    return [
+      cx + ((Number(p[0]) - cx) / Math.max(1e-12, spans[0])) * maxSpan,
+      cy + ((Number(p[1]) - cy) / Math.max(1e-12, spans[1])) * maxSpan,
+      cz + ((Number(p[2]) - cz) / Math.max(1e-12, spans[2])) * maxSpan
+    ];
+  }
+
+  function axis3DTranslateBoxRange(cfg, delta) {
+    var axes = ["x", "y", "z"];
+    for (var i = 0; i < axes.length; i += 1) {
+      var axis = axes[i];
+      var d = Number(delta[i]) || 0;
+      var lo = Number(cfg[axis + "_min"]);
+      var hi = Number(cfg[axis + "_max"]);
+      if (!Number.isFinite(lo) || !Number.isFinite(hi) || !(hi > lo)) { continue; }
+      cfg[axis + "_min"] = lo + d;
+      cfg[axis + "_max"] = hi + d;
+    }
+  }
+
+  function axis3DTranslateBoxAxisRange(cfg, axisIndex, delta) {
+    var axis = axisIndex === 0 ? "x" : axisIndex === 1 ? "y" : "z";
+    var d = Number(delta) || 0;
+    var lo = Number(cfg[axis + "_min"]);
+    var hi = Number(cfg[axis + "_max"]);
+    if (!Number.isFinite(lo) || !Number.isFinite(hi) || !(hi > lo)) { return; }
+    cfg[axis + "_min"] = lo + d;
+    cfg[axis + "_max"] = hi + d;
+  }
+
+  function axis3DBoxRangeSnapshot(cfg) {
+    return {
+      x_min: Number(cfg.x_min),
+      x_max: Number(cfg.x_max),
+      y_min: Number(cfg.y_min),
+      y_max: Number(cfg.y_max),
+      z_min: Number(cfg.z_min),
+      z_max: Number(cfg.z_max)
+    };
+  }
+
+  function axis3DBoxApplyAxisDeltaFromSnapshot(cfg, snapshot, axisIndex, delta) {
+    if (!snapshot) { axis3DTranslateBoxAxisRange(cfg, axisIndex, delta); return; }
+    var axes = ["x", "y", "z"];
+    for (var i = 0; i < axes.length; i += 1) {
+      var restoreAxis = axes[i];
+      var restoreLo = Number(snapshot[restoreAxis + "_min"]);
+      var restoreHi = Number(snapshot[restoreAxis + "_max"]);
+      if (Number.isFinite(restoreLo) && Number.isFinite(restoreHi) && restoreHi > restoreLo) {
+        cfg[restoreAxis + "_min"] = restoreLo;
+        cfg[restoreAxis + "_max"] = restoreHi;
+      }
+    }
+    var axis = axisIndex === 0 ? "x" : axisIndex === 1 ? "y" : "z";
+    var lo = Number(snapshot[axis + "_min"]);
+    var hi = Number(snapshot[axis + "_max"]);
+    var d = Number(delta) || 0;
+    if (!Number.isFinite(lo) || !Number.isFinite(hi) || !(hi > lo)) { return; }
+    cfg[axis + "_min"] = lo + d;
+    cfg[axis + "_max"] = hi + d;
+  }
+
+  function axis3DScaleBoxRange(cfg, factor) {
+    factor = Math.max(1e-6, Math.min(1e6, Number(factor) || 1));
+    var axes = ["x", "y", "z"];
+    for (var i = 0; i < axes.length; i += 1) {
+      var axis = axes[i];
+      var lo = Number(cfg[axis + "_min"]);
+      var hi = Number(cfg[axis + "_max"]);
+      if (!Number.isFinite(lo) || !Number.isFinite(hi) || !(hi > lo)) { continue; }
+      var c = (lo + hi) * 0.5;
+      var half = Math.max(1e-12, (hi - lo) * factor * 0.5);
+      cfg[axis + "_min"] = c - half;
+      cfg[axis + "_max"] = c + half;
+    }
+  }
+
+  function axis3DBoxRangePlan(cfg) {
+    return {
+      x_min: Number(cfg.x_min),
+      x_max: Number(cfg.x_max),
+      y_min: Number(cfg.y_min),
+      y_max: Number(cfg.y_max),
+      z_min: Number(cfg.z_min),
+      z_max: Number(cfg.z_max)
+    };
+  }
+
+  function axis3DApplyBoxRangePlan(cfg, start, target, a) {
+    var keys = ["x_min", "x_max", "y_min", "y_max", "z_min", "z_max"];
+    for (var i = 0; i < keys.length; i += 1) {
+      var k = keys[i];
+      cfg[k] = Number(start[k]) + (Number(target[k]) - Number(start[k])) * a;
+    }
+  }
+
+  function axis3DBoxDragDataDelta(camera, body, cfg, dx, dy) {
+    var pos = vec3Array(camera && camera.pos, [4, 4, 5.657]);
+    var target = vec3Array(camera && camera.target, [0, 0, 0]);
+    var upHint = normalizeVec3Local(camera && camera.up || [0, 0, 1], [0, 0, 1]);
+    var backward = normalizeVec3Local([pos[0] - target[0], pos[1] - target[1], pos[2] - target[2]], [0, 0, 1]);
+    var right = normalizeVec3Local(crossVec3(upHint, backward), [1, 0, 0]);
+    var up = normalizeVec3Local(crossVec3(backward, right), [0, 0, 1]);
+    var rect = body && body.getBoundingClientRect ? body.getBoundingClientRect() : { width: 1, height: 1 };
+    var pxSpan = Math.max(1, Math.min(Number(rect.width) || 1, Number(rect.height) || 1));
+    var dataSpan = Math.max(axis3DBoxSpan(cfg, "x"), axis3DBoxSpan(cfg, "y"), axis3DBoxSpan(cfg, "z"));
+    var unitsPerPx = dataSpan / pxSpan;
+    return [
+      (-dx * right[0] + dy * up[0]) * unitsPerPx,
+      (-dx * right[1] + dy * up[1]) * unitsPerPx,
+      (-dx * right[2] + dy * up[2]) * unitsPerPx
+    ];
+  }
+
+  function axis3DRotationCenter(cfg) {
+    if (cfg && String(cfg.mode || "crosshair").toLowerCase() === "box") {
+      return [
+        ((Number(cfg.x_min) || 0) + (Number(cfg.x_max) || 0)) * 0.5,
+        ((Number(cfg.y_min) || 0) + (Number(cfg.y_max) || 0)) * 0.5,
+        ((Number(cfg.z_min) || 0) + (Number(cfg.z_max) || 0)) * 0.5
+      ];
+    }
+    return [0, 0, 0];
+  }
+
+  function axis3DTrackballPoint(px, py, cx, cy, radius) {
+    var dx = (Number(px) || 0) - (Number(cx) || 0);
+    var dy = (Number(py) || 0) - (Number(cy) || 0);
+    var r = Math.max(1, Number(radius) || 1);
+    var nx = dx / r;
+    var ny = -dy / r;
+    var rr = nx * nx + ny * ny;
+    if (rr <= 1) {
+      return { inside: true, v: [nx, ny, Math.sqrt(Math.max(0, 1 - rr))] };
+    }
+    var len = Math.sqrt(rr);
+    return { inside: false, v: [nx / len, ny / len, 0] };
+  }
+
+  function axis3DScreenBasis(camera, center) {
+    var pos = vec3Array(camera && camera.pos, [4, 4, 5.657]);
+    var target = Array.isArray(center) ? center.slice() : vec3Array(camera && camera.target, [0, 0, 0]);
+    var upHint = normalizeVec3Local(camera && camera.up || [0, 0, 1], [0, 0, 1]);
+    var forward = normalizeVec3Local([target[0] - pos[0], target[1] - pos[1], target[2] - pos[2]], [0, 0, -1]);
+    var right = normalizeVec3Local(crossVec3(forward, upHint), [1, 0, 0]);
+    var up = normalizeVec3Local(crossVec3(right, forward), [0, 0, 1]);
+    return { right: right, up: up, forward: forward };
+  }
+
+  function axis3DApplyWorldRotation(camera, center, worldAxis, angleRad) {
+    var axis = normalizeVec3Local(worldAxis, [0, 0, 1]);
+    var pos = vec3Array(camera && camera.pos, [4, 4, 5.657]);
+    var target = Array.isArray(center) ? center.slice() : [0, 0, 0];
+    var offset = [pos[0] - target[0], pos[1] - target[1], pos[2] - target[2]];
+    var nextOffset = rotateVec3AroundAxis(offset, axis, angleRad);
+    var nextUp = rotateVec3AroundAxis(vec3Array(camera && camera.up, [0, 0, 1]), axis, angleRad);
+    camera.pos = [target[0] + nextOffset[0], target[1] + nextOffset[1], target[2] + nextOffset[2]];
+    camera.target = target;
+    camera.up = normalizeVec3Local(nextUp, [0, 0, 1]);
+  }
+
+  function axis3DCloneCamera(camera) {
+    var out = Object.assign({}, camera || {});
+    out.pos = vec3Array(camera && camera.pos, [4, 4, 5.657]);
+    out.target = vec3Array(camera && camera.target, [0, 0, 0]);
+    out.up = vec3Array(camera && camera.up, [0, 0, 1]);
+    return out;
+  }
+
+  function axis3DProjectedAxisInfos(camera, body, cfg) {
+    var rect = body && body.getBoundingClientRect ? body.getBoundingClientRect() : { width: 1, height: 1 };
+    var w = Math.max(1, Number(rect.width) || 1);
+    var h = Math.max(1, Number(rect.height) || 1);
+    var center = axis3DRotationCenter(cfg || {});
+    var cam = Object.assign({}, camera || {}, {
+      viewport_width_px: w,
+      viewport_height_px: h
+    });
+    var p0 = projectWorldToPixel(cam, w, h, center);
+    if (!p0) { return null; }
+    var reach = Math.max(w, h) * 4.0;
+    var axisInfos = [];
+    function axisLineInfo(axisIndex) {
+      var next = center.slice();
+      next[axisIndex] += 1;
+      var p1 = projectWorldToPixel(cam, w, h, next);
+      if (!p1) { return null; }
+      var dx = p1[0] - p0[0];
+      var dy = p1[1] - p0[1];
+      var len = Math.sqrt((dx * dx) + (dy * dy));
+      if (!(len > 1e-6)) { return null; }
+      var clipped = clipPixelLineToRect(
+        [p0[0] - (dx / len) * reach, p0[1] - (dy / len) * reach],
+        [p0[0] + (dx / len) * reach, p0[1] + (dy / len) * reach],
+        0,
+        0,
+        w,
+        h
+      );
+      if (!clipped) { return null; }
+      return {
+        axisIndex: axisIndex,
+        len: len,
+        ux: dx / len,
+        uy: dy / len,
+        clipped: clipped,
+        centerValue: Number(center[axisIndex]) || 0
+      };
+    }
+    for (var axisIndex = 0; axisIndex < 3; axisIndex += 1) {
+      axisInfos[axisIndex] = axisLineInfo(axisIndex);
+    }
+    return {
+      rect: rect,
+      w: w,
+      h: h,
+      center: center,
+      p0: p0,
+      axisInfos: axisInfos
+    };
+  }
+
+  function axis3DProjectedAxisAngleDeg(info) {
+    if (!info) { return null; }
+    return normalizeUndirectedAngleDeg(Math.atan2(info.uy, info.ux) * 180 / Math.PI);
+  }
+
+  function axis3DProjectedAxisDiffDeg(camera, body, cfg, axisIndex, targetAngleDeg) {
+    var projected = axis3DProjectedAxisInfos(camera, body, cfg);
+    if (!projected || !projected.axisInfos[axisIndex]) { return Infinity; }
+    var angleDeg = axis3DProjectedAxisAngleDeg(projected.axisInfos[axisIndex]);
+    return nearestAxisSnapAngleDeg(angleDeg, [targetAngleDeg]).diffDeg;
+  }
+
+  function axis3DAlignProjectedAxisToScreenSnap(camera, body, cfg, axisIndex, targetAngleDeg) {
+    var projected = axis3DProjectedAxisInfos(camera, body, cfg);
+    if (!projected || !projected.axisInfos[axisIndex]) { return false; }
+    var rawAngle = axis3DProjectedAxisAngleDeg(projected.axisInfos[axisIndex]);
+    var nearest = nearestAxisSnapAngleDeg(rawAngle, [targetAngleDeg]);
+    if (!(nearest.diffDeg > 1e-6)) { return false; }
+    var magnitudeRad = nearest.diffDeg * Math.PI / 180;
+    var best = null;
+    for (var si = 0; si < 2; si += 1) {
+      var sign = si === 0 ? 1 : -1;
+      var trial = axis3DCloneCamera(camera);
+      var basis = axis3DScreenBasis(trial, projected.center);
+      axis3DApplyWorldRotation(trial, projected.center, basis.forward, sign * magnitudeRad);
+      var diff = axis3DProjectedAxisDiffDeg(trial, body, cfg, axisIndex, targetAngleDeg);
+      if (!best || diff < best.diff) {
+        best = { sign: sign, diff: diff };
+      }
+    }
+    if (!best) { return false; }
+    var liveBasis = axis3DScreenBasis(camera, projected.center);
+    axis3DApplyWorldRotation(camera, projected.center, liveBasis.forward, best.sign * magnitudeRad);
+    return true;
+  }
+
+  function axis3DAlignAxisToViewSnap(camera, cfg, axisIndex, sign) {
+    var center = axis3DRotationCenter(cfg || {});
+    var pos = vec3Array(camera && camera.pos, [4, 4, 5.657]);
+    var tgt = vec3Array(camera && camera.target, center);
+    var forward = normalizeVec3Local([tgt[0] - pos[0], tgt[1] - pos[1], tgt[2] - pos[2]], [0, 0, -1]);
+    var basisAxes = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+    var desired = basisAxes[axisIndex] ? basisAxes[axisIndex].slice() : [0, 0, 1];
+    var desiredSign = Number(sign) || 1;
+    desired = [desired[0] * desiredSign, desired[1] * desiredSign, desired[2] * desiredSign];
+    var dot = Math.max(-1, Math.min(1, dot3(forward, desired)));
+    var angle = Math.acos(dot);
+    if (!(angle > 1e-6)) { return false; }
+    var axis = crossVec3(forward, desired);
+    var axisLen = Math.sqrt(dot3(axis, axis));
+    if (!(axisLen > 1e-9)) {
+      var basis = axis3DScreenBasis(camera, center);
+      axis = crossVec3(forward, basis.right);
+      axisLen = Math.sqrt(dot3(axis, axis));
+      if (!(axisLen > 1e-9)) { return false; }
+    }
+    axis3DApplyWorldRotation(camera, center, [axis[0] / axisLen, axis[1] / axisLen, axis[2] / axisLen], angle);
+    return true;
+  }
+
+  function axis3DApplySnapPostConstraint(camera, cfg, body, dx, dy, dragState) {
+    var projected = axis3DProjectedAxisInfos(camera, body, cfg);
+    var snappedViewState = axis3DCrosshairSnapState(
+      axis3DCrosshairCollapsedMarkerState(camera),
+      dragState ? dragState.axis3DLockedViewSnap || null : null,
+      cfg
+    );
+    if (dragState) {
+      dragState.axis3DLockedViewSnap = snappedViewState.snapped;
+    }
+    if (snappedViewState && snappedViewState.snapped) {
+      axis3DAlignAxisToViewSnap(camera, cfg, snappedViewState.snapped.axisIndex, snappedViewState.snapped.sign);
+    }
+    projected = axis3DProjectedAxisInfos(camera, body, cfg);
+    if (!projected) { return false; }
+    var axisInfos = projected.axisInfos;
+    var projectedSnapState = axis3DProjectedAxisSnapState(
+      axisInfos,
+      dragState && Array.isArray(dragState.axis3DProjectedSnapRawAngles) ? dragState.axis3DProjectedSnapRawAngles : null,
+      cfg
+    );
+    if (dragState) {
+      dragState.axis3DProjectedSnapRawAngles = projectedSnapState.rawAngles.slice();
+    }
+    var bestCardinal = null;
+    for (var axisIndex = 0; axisIndex < axisInfos.length; axisIndex += 1) {
+      var info = axisInfos[axisIndex];
+      if (!info) { continue; }
+      if (projectedSnapState.hiddenAxes[axisIndex] != null) { continue; }
+      if (projectedSnapState.cardinalSnaps[axisIndex] == null) { continue; }
+      var nx = -info.uy;
+      var ny = info.ux;
+      var component = (Number(dx) || 0) * nx + (Number(dy) || 0) * ny;
+      if (!bestCardinal || Math.abs(component) > Math.abs(bestCardinal.component)) {
+        bestCardinal = {
+          axisIndex: axisIndex,
+          targetAngleDeg: projectedSnapState.cardinalSnaps[axisIndex],
+          component: component
+        };
+      }
+    }
+    if (!bestCardinal || Math.abs(bestCardinal.component) <= 1e-6) { return false; }
+    return axis3DAlignProjectedAxisToScreenSnap(camera, body, cfg, bestCardinal.axisIndex, bestCardinal.targetAngleDeg);
+  }
+
+  function axis3DIncrementalRotateComponents(camera, cfg, dx, dy, body, dragState) {
+    var rect = body && body.getBoundingClientRect ? body.getBoundingClientRect() : { left: 0, top: 0, width: 1, height: 1 };
+    var w = Math.max(1, Number(rect.width) || 1);
+    var h = Math.max(1, Number(rect.height) || 1);
+    var scale = Math.PI / Math.max(120, Math.min(w, h));
+    var center = axis3DRotationCenter(cfg || {});
+    var basis = axis3DScreenBasis(camera, center);
+    var moveX = Number(dx) || 0;
+    var moveY = Number(dy) || 0;
+    var sampleLen = Math.sqrt(moveX * moveX + moveY * moveY);
+    if (!(sampleLen > 1e-6)) { return null; }
+    var isBox = String(cfg && cfg.mode || "crosshair").toLowerCase() === "box";
+    var snapState = isBox ? null : axis3DCrosshairSnapState(axis3DCrosshairCollapsedMarkerState(camera), null, cfg || {});
+    var projected = axis3DProjectedAxisInfos(camera, body, cfg || {});
+    if (!projected || !projected.p0) { return null; }
+    var curPx = Number(dragState && dragState.x) - Number(rect.left || 0);
+    var curPy = Number(dragState && dragState.y) - Number(rect.top || 0);
+    var prevPx = curPx - moveX;
+    var prevPy = curPy - moveY;
+    var rx = curPx - projected.p0[0];
+    var ry = curPy - projected.p0[1];
+    var rLen = Math.sqrt(rx * rx + ry * ry);
+    if (!(rLen > 1e-6)) {
+      rx = prevPx - projected.p0[0];
+      ry = prevPy - projected.p0[1];
+      rLen = Math.sqrt(rx * rx + ry * ry);
+    }
+    if (!(rLen > 1e-6)) { return null; }
+    var radialUx = rx / rLen;
+    var radialUy = ry / rLen;
+    var tangentialUx = radialUy;
+    var tangentialUy = -radialUx;
+    var tangentialComponent = moveX * tangentialUx + moveY * tangentialUy;
+    var radialComponent = moveX * radialUx + moveY * radialUy;
+    var tangentialAxis = basis.forward.slice();
+    if (snapState && snapState.snapped) {
+      var basisAxes = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+      var snappedAxis = basisAxes[snapState.snapped.axisIndex] || [0, 0, 1];
+      tangentialAxis = [
+        snappedAxis[0] * Number(snapState.snapped.sign || 1),
+        snappedAxis[1] * Number(snapState.snapped.sign || 1),
+        snappedAxis[2] * Number(snapState.snapped.sign || 1)
+      ];
+    }
+    var coaxialAxis = tangentialAxis.slice();
+    var radialWorld = normalizeVec3Local([
+      basis.right[0] * radialUx + basis.up[0] * (-radialUy),
+      basis.right[1] * radialUx + basis.up[1] * (-radialUy),
+      basis.right[2] * radialUx + basis.up[2] * (-radialUy)
+    ], basis.right);
+    var radialAxis = crossVec3(coaxialAxis, radialWorld);
+    var radialAxisLen = Math.sqrt(dot3(radialAxis, radialAxis));
+    if (!(radialAxisLen > 1e-9)) {
+      radialAxis = [0, 0, 0];
+    } else {
+      radialAxis = [radialAxis[0] / radialAxisLen, radialAxis[1] / radialAxisLen, radialAxis[2] / radialAxisLen];
+    }
+    return {
+      scale: scale,
+      center: center,
+      tangentialComponent: tangentialComponent,
+      radialComponent: radialComponent,
+      tangentialAxis: tangentialAxis,
+      radialAxis: radialAxis,
+      snapState: snapState
+    };
+  }
+
+  function axis3DChooseLockedWorldAxis(camera, cfg, body, startAxisIndex, dx, dy, dragState) {
+    var totalState = Object.assign({}, dragState || {}, {
+      x: Number(dragState && dragState.x) || 0,
+      y: Number(dragState && dragState.y) || 0,
+      pendingX: Number(dragState && dragState.x) || 0,
+      pendingY: Number(dragState && dragState.y) || 0
+    });
+    var comps = axis3DIncrementalRotateComponents(camera, cfg, dx, dy, body, totalState);
+    if (!comps) { return null; }
+    var combined = [
+      comps.tangentialAxis[0] * comps.tangentialComponent + comps.radialAxis[0] * comps.radialComponent,
+      comps.tangentialAxis[1] * comps.tangentialComponent + comps.radialAxis[1] * comps.radialComponent,
+      comps.tangentialAxis[2] * comps.tangentialComponent + comps.radialAxis[2] * comps.radialComponent
+    ];
+    var axes = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+    var best = null;
+    for (var i = 0; i < 3; i += 1) {
+      if (i === startAxisIndex) { continue; }
+      var score = Math.abs(dot3(combined, axes[i]));
+      if (!best || score > best.score) {
+        best = { axisIndex: i, score: score };
+      }
+    }
+    return best && best.score > 1e-6 ? best : null;
+  }
+
+  function axis3DApplyRawDragRotation(rawCamera, cfg, dx, dy, body, dragState) {
+    var comps = axis3DIncrementalRotateComponents(rawCamera, cfg || {}, dx, dy, body, dragState);
+    if (!comps) { return; }
+    if (
+      dragState &&
+      Number.isFinite(dragState.rotateStartAxisIndex) &&
+      dragState.rotateLockMode == null &&
+      Number(dragState.sampleCount || 0) < axisGestureSampleCount(cfg || {})
+    ) {
+      return;
+    }
+    if (
+      dragState &&
+      Number.isFinite(dragState.rotateStartAxisIndex) &&
+      dragState.rotateLockMode == null &&
+      Number(dragState.sampleCount || 0) >= axisGestureSampleCount(cfg || {})
+    ) {
+      dragState.rotateLockMode = axis3DChooseLockedWorldAxis(
+        rawCamera,
+        cfg || {},
+        body,
+        Number(dragState.rotateStartAxisIndex),
+        Number(dragState.totalDx || 0),
+        Number(dragState.totalDy || 0),
+        dragState
+      ) || { kind: "free", axisIndex: Number(dragState.rotateStartAxisIndex) };
+    }
+
+    if (dragState && dragState.rotateLockMode && dragState.rotateLockMode.kind !== "free") {
+      var lockAxis = dragState.rotateLockMode;
+      var basisAxis = [[1, 0, 0], [0, 1, 0], [0, 0, 1]][lockAxis.axisIndex];
+      var angle = dot3([
+        comps.tangentialAxis[0] * comps.tangentialComponent * comps.scale + comps.radialAxis[0] * comps.radialComponent * comps.scale,
+        comps.tangentialAxis[1] * comps.tangentialComponent * comps.scale + comps.radialAxis[1] * comps.radialComponent * comps.scale,
+        comps.tangentialAxis[2] * comps.tangentialComponent * comps.scale + comps.radialAxis[2] * comps.radialComponent * comps.scale
+      ], basisAxis);
+      if (Math.abs(angle) <= 1e-6) { return; }
+      axis3DApplyWorldRotation(
+        rawCamera,
+        comps.center,
+        basisAxis,
+        angle
+      );
+      return;
+    }
+    if (Math.abs(comps.tangentialComponent) > 1e-6) {
+      axis3DApplyWorldRotation(rawCamera, comps.center, comps.tangentialAxis, comps.tangentialComponent * comps.scale);
+    }
+    if (Math.abs(comps.radialComponent) > 1e-6 && (Math.abs(comps.radialAxis[0]) + Math.abs(comps.radialAxis[1]) + Math.abs(comps.radialAxis[2])) > 1e-9) {
+      axis3DApplyWorldRotation(rawCamera, comps.center, comps.radialAxis, comps.radialComponent * comps.scale);
+    }
+  }
+
+  function axis3DRotateCameraDrag(camera, cfg, dx, dy, body, snap15, dragState) {
+    if (dragState) {
+      dragState.rawYawRad = NaN;
+      dragState.rawPitchRad = NaN;
+    }
+    var rawCamera = dragState && dragState.axis3DRawCamera
+      ? axis3DCloneCamera(dragState.axis3DRawCamera)
+      : axis3DCloneCamera(camera);
+    axis3DApplyRawDragRotation(rawCamera, cfg || {}, dx, dy, body, dragState);
+    if (dragState) {
+      dragState.axis3DRawCamera = axis3DCloneCamera(rawCamera);
+    }
+    camera.pos = rawCamera.pos.slice();
+    camera.target = rawCamera.target.slice();
+    camera.up = rawCamera.up.slice();
+    axis3DApplySnapPostConstraint(camera, cfg || {}, body, dx, dy, dragState);
+  }
+
+  function applyAxis3DSelectionZoom(fid, body, drag) {
+    var geom = _lastDisplayPayload && _lastDisplayPayload.geom ? _lastDisplayPayload.geom[fid] : null;
+    if (!geom) { return; }
+    var cfg = axis3DBoxRuntime(geom);
+    var rect = body && body.getBoundingClientRect ? body.getBoundingClientRect() : { left: 0, top: 0, width: 1, height: 1 };
+    var w = Math.max(1, Number(rect.width) || 1);
+    var h = Math.max(1, Number(rect.height) || 1);
+    var x0 = Math.max(0, Math.min(w, Math.min(Number(drag.startX || 0), Number(drag.pendingX || drag.x || 0)) - Number(rect.left || 0)));
+    var x1 = Math.max(0, Math.min(w, Math.max(Number(drag.startX || 0), Number(drag.pendingX || drag.x || 0)) - Number(rect.left || 0)));
+    var y0 = Math.max(0, Math.min(h, Math.min(Number(drag.startY || 0), Number(drag.pendingY || drag.y || 0)) - Number(rect.top || 0)));
+    var y1 = Math.max(0, Math.min(h, Math.max(Number(drag.startY || 0), Number(drag.pendingY || drag.y || 0)) - Number(rect.top || 0)));
+    if ((x1 - x0) < 8 || (y1 - y0) < 8) { return; }
+    var frac = Math.max((x1 - x0) / w, (y1 - y0) / h);
+    frac = Math.max(0.02, Math.min(1, frac));
+    if (cfg) {
+      unfreezeAxis3DBoxTickPlacement(cfg);
+      var start = axis3DBoxRangePlan(cfg);
+      var target = {};
+      var axes = ["x", "y", "z"];
+      for (var ai = 0; ai < axes.length; ai += 1) {
+        var axis = axes[ai];
+        var lo = Number(start[axis + "_min"]);
+        var hi = Number(start[axis + "_max"]);
+        var c = (lo + hi) * 0.5;
+        var half = (hi - lo) * frac * 0.5;
+        target[axis + "_min"] = c - half;
+        target[axis + "_max"] = c + half;
+      }
+      animateAxisRanges(300, function (a) {
+        axis3DApplyBoxRangePlan(cfg, start, target, a);
+        repaintAxis3DHelperLines(fid);
+      });
+      return;
+    }
+    animateAxisRanges(300, function (a) {
+      mutateAxis3DCamera(fid, function (camera) {
+        var factor = 1 - (1 - frac) * a;
+        if (String(camera.projection || "").toLowerCase() === "orthographic") {
+          camera.ortho_scale = Math.max(1e-6, Number(camera.ortho_scale || 2.5) * factor);
+        }
+      }, { skipTextOverlay: true });
+      repaintAxis3DHelperLines(fid);
+    });
+  }
+
+  function axis3DBoxScreenAxisDirections(camera, body, cfg) {
+    var rect = body && body.getBoundingClientRect ? body.getBoundingClientRect() : { width: 1, height: 1 };
+    var w = Math.max(1, Number(rect.width) || 1);
+    var h = Math.max(1, Number(rect.height) || 1);
+    var cam = Object.assign({}, camera || {}, {
+      viewport_width_px: w,
+      viewport_height_px: h
+    });
+    var cx = ((Number(cfg.x_min) || 0) + (Number(cfg.x_max) || 0)) * 0.5;
+    var cy = ((Number(cfg.y_min) || 0) + (Number(cfg.y_max) || 0)) * 0.5;
+    var cz = ((Number(cfg.z_min) || 0) + (Number(cfg.z_max) || 0)) * 0.5;
+    var center = [cx, cy, cz];
+    var p0 = projectWorldToPixel(cam, w, h, center);
+    if (!p0) { return []; }
+    var xMin = Number(cfg.x_min);
+    var xMax = Number(cfg.x_max);
+    var yMin = Number(cfg.y_min);
+    var yMax = Number(cfg.y_max);
+    var zMin = Number(cfg.z_min);
+    var zMax = Number(cfg.z_max);
+    var corners = [
+      [xMin, yMin, zMin], [xMax, yMin, zMin], [xMin, yMax, zMin], [xMax, yMax, zMin],
+      [xMin, yMin, zMax], [xMax, yMin, zMax], [xMin, yMax, zMax], [xMax, yMax, zMax]
+    ].map(function (p) { return projectWorldToPixel(cam, w, h, axis3DBoxAspectPoint(cfg, p)); }).filter(function (p) {
+      return p && Number.isFinite(p[0]) && Number.isFinite(p[1]);
+    });
+    var fitScale = 1;
+    if (corners.length >= 2) {
+      var minX = corners[0][0];
+      var maxX = corners[0][0];
+      var minY = corners[0][1];
+      var maxY = corners[0][1];
+      for (var ci = 1; ci < corners.length; ci += 1) {
+        minX = Math.min(minX, corners[ci][0]);
+        maxX = Math.max(maxX, corners[ci][0]);
+        minY = Math.min(minY, corners[ci][1]);
+        maxY = Math.max(maxY, corners[ci][1]);
+      }
+      var fitMargin = Math.max(24, Number(cfg.fit_margin_px) || 48);
+      fitScale = Math.min(
+        Math.max(1, w - 2 * fitMargin) / Math.max(1e-6, maxX - minX),
+        Math.max(1, h - 2 * fitMargin) / Math.max(1e-6, maxY - minY)
+      );
+      if (!Number.isFinite(fitScale) || !(fitScale > 0)) { fitScale = 1; }
+    }
+    var spans = [axis3DBoxSpan(cfg, "x"), axis3DBoxSpan(cfg, "y"), axis3DBoxSpan(cfg, "z")];
+    var out = [];
+    for (var i = 0; i < 3; i += 1) {
+      var p = center.slice();
+      p[i] += spans[i] * 0.5;
+      var p1 = projectWorldToPixel(cam, w, h, axis3DBoxAspectPoint(cfg, p));
+      if (!p1) { continue; }
+      var dx = p1[0] - p0[0];
+      var dy = p1[1] - p0[1];
+      var len = Math.sqrt(dx * dx + dy * dy);
+      if (!(len > 1e-6)) { continue; }
+      out.push({ axisIndex: i, ux: dx / len, uy: dy / len, pxPerUnit: (len * fitScale) / Math.max(1e-12, spans[i] * 0.5) });
+    }
+    return out;
+  }
+
+  function axis3DBoxPixelProjector(camera, w, h, cfg) {
+    var cam = Object.assign({}, camera || {}, {
+      viewport_width_px: w,
+      viewport_height_px: h
+    });
+    var xMin = Number(cfg.x_min);
+    var xMax = Number(cfg.x_max);
+    var yMin = Number(cfg.y_min);
+    var yMax = Number(cfg.y_max);
+    var zMin = Number(cfg.z_min);
+    var zMax = Number(cfg.z_max);
+    if (![xMin, xMax, yMin, yMax, zMin, zMax].every(Number.isFinite)) { return null; }
+    var corners = [
+      [xMin, yMin, zMin], [xMax, yMin, zMin], [xMin, yMax, zMin], [xMax, yMax, zMin],
+      [xMin, yMin, zMax], [xMax, yMin, zMax], [xMin, yMax, zMax], [xMax, yMax, zMax]
+    ];
+    var rawPixels = corners.map(function (p) { return projectWorldToPixel(cam, w, h, axis3DBoxAspectPoint(cfg, p)); });
+    var finitePixels = rawPixels.filter(function (p) {
+      return p && Number.isFinite(p[0]) && Number.isFinite(p[1]);
+    });
+    if (finitePixels.length < 2) { return null; }
+    var minX = finitePixels[0][0];
+    var maxX = finitePixels[0][0];
+    var minY = finitePixels[0][1];
+    var maxY = finitePixels[0][1];
+    for (var i = 1; i < finitePixels.length; i += 1) {
+      minX = Math.min(minX, finitePixels[i][0]);
+      maxX = Math.max(maxX, finitePixels[i][0]);
+      minY = Math.min(minY, finitePixels[i][1]);
+      maxY = Math.max(maxY, finitePixels[i][1]);
+    }
+    var rawCx = (minX + maxX) * 0.5;
+    var rawCy = (minY + maxY) * 0.5;
+    var rawW = Math.max(1e-6, maxX - minX);
+    var rawH = Math.max(1e-6, maxY - minY);
+    var fitMargin = Math.max(24, Number(cfg.fit_margin_px) || 48);
+    var fitScale = Math.min(
+      Math.max(1, w - 2 * fitMargin) / rawW,
+      Math.max(1, h - 2 * fitMargin) / rawH
+    );
+    if (!Number.isFinite(fitScale) || !(fitScale > 0)) { fitScale = 1; }
+    return function projectBoxPixel(p) {
+      var raw = projectWorldToPixel(cam, w, h, axis3DBoxAspectPoint(cfg, p));
+      if (!raw) { return null; }
+      return [
+        (w * 0.5) + (raw[0] - rawCx) * fitScale,
+        (h * 0.5) + (raw[1] - rawCy) * fitScale
+      ];
+    };
+  }
+
+  function axis3DScreenAxisDirections(camera, body, cfg) {
+    var rect = body && body.getBoundingClientRect ? body.getBoundingClientRect() : { width: 1, height: 1 };
+    var w = Math.max(1, Number(rect.width) || 1);
+    var h = Math.max(1, Number(rect.height) || 1);
+    var cam = Object.assign({}, camera || {}, {
+      viewport_width_px: w,
+      viewport_height_px: h
+    });
+    var origin = [0, 0, 0];
+    var p0 = projectWorldToPixel(cam, w, h, origin);
+    if (!p0) { return []; }
+    var out = [];
+    for (var i = 0; i < 3; i += 1) {
+      var p = [0, 0, 0];
+      p[i] = 1;
+      var p1 = projectWorldToPixel(cam, w, h, p);
+      if (!p1) { continue; }
+      var dx = p1[0] - p0[0];
+      var dy = p1[1] - p0[1];
+      var len = Math.sqrt(dx * dx + dy * dy);
+      if (!(len > 1e-6)) { continue; }
+      out.push({ axisIndex: i, ux: dx / len, uy: dy / len });
+    }
+    return out;
+  }
+
+  function axis3DLockedDragAxisFromDirs(dirs, dx, dy, thresholdDeg) {
+    var dragLen = Math.sqrt(dx * dx + dy * dy);
+    if (!(dragLen > 1e-6)) { return null; }
+    var thresholdCos = Math.cos((Number(thresholdDeg) || 5) * Math.PI / 180);
+    var best = null;
+    for (var i = 0; i < dirs.length; i += 1) {
+      var d = dirs[i];
+      var dot = ((Number(dx) || 0) * d.ux + (Number(dy) || 0) * d.uy) / dragLen;
+      var score = Math.abs(dot);
+      if (!best || score > best.score) {
+        best = { axisIndex: d.axisIndex, dot: dot, score: score, ux: d.ux, uy: d.uy, pxPerUnit: d.pxPerUnit };
+      }
+    }
+    if (!best || best.score < thresholdCos) { return null; }
+    return best;
+  }
+
+  function axis3DLockedRotateAxisFromStartAxis(camera, body, cfg, axisIndex, dx, dy, thresholdDeg) {
+    var dirs = axis3DScreenAxisDirections(camera, body, cfg || {});
+    var dragLen = Math.sqrt(dx * dx + dy * dy);
+    if (!(dragLen > 1e-6)) { return null; }
+    var thresholdSin = Math.sin((Number(thresholdDeg) || 5) * Math.PI / 180);
+    var startDir = null;
+    for (var si = 0; si < dirs.length; si += 1) {
+      if (dirs[si] && dirs[si].axisIndex === axisIndex) {
+        startDir = dirs[si];
+        break;
+      }
+    }
+    var snapState = axis3DCrosshairSnapState(axis3DCrosshairCollapsedMarkerState(camera), null, cfg || {});
+    if (
+      snapState &&
+      snapState.snapped &&
+      snapState.snapped.axisIndex !== axisIndex &&
+      startDir
+    ) {
+      dirs = dirs.slice();
+      dirs.push({
+        axisIndex: snapState.snapped.axisIndex,
+        ux: startDir.ux,
+        uy: startDir.uy,
+        collapsed: true
+      });
+    }
+    var best = null;
+    for (var i = 0; i < dirs.length; i += 1) {
+      var d = dirs[i];
+      if (!d || d.axisIndex === axisIndex) { continue; }
+      var along = ((Number(dx) || 0) * d.ux + (Number(dy) || 0) * d.uy) / dragLen;
+      var tangentialScore = Math.sqrt(Math.max(0, 1 - along * along));
+      if (!best || tangentialScore > best.score) {
+        best = { axisIndex: d.axisIndex, ux: d.ux, uy: d.uy, score: tangentialScore };
+      }
+    }
+    if (!best || best.score < thresholdSin) { return null; }
+    return best;
+  }
+
+  function axis3DStartAxisLock(camera, body, cfg, clientX, clientY) {
+    var rect = body && body.getBoundingClientRect ? body.getBoundingClientRect() : { left: 0, top: 0, width: 1, height: 1 };
+    var w = Math.max(1, Number(rect.width) || 1);
+    var h = Math.max(1, Number(rect.height) || 1);
+    var px = Math.max(0, Math.min(w, Number(clientX || 0) - Number(rect.left || 0)));
+    var py = Math.max(0, Math.min(h, Number(clientY || 0) - Number(rect.top || 0)));
+    var threshold = axisStartLockDistancePx(cfg);
+    var cam = Object.assign({}, camera || {}, { viewport_width_px: w, viewport_height_px: h });
+    if (String(cfg && cfg.mode || "crosshair").toLowerCase() === "box") {
+      var projector = axis3DBoxPixelProjector(cam, w, h, cfg || {});
+      if (!projector) { return null; }
+      var xMin = Number(cfg.x_min);
+      var xMax = Number(cfg.x_max);
+      var yMin = Number(cfg.y_min);
+      var yMax = Number(cfg.y_max);
+      var zMin = Number(cfg.z_min);
+      var zMax = Number(cfg.z_max);
+      var segments = [
+        { axisIndex: 0, a: [xMin, yMin, zMin], b: [xMax, yMin, zMin] },
+        { axisIndex: 1, a: [xMin, yMin, zMin], b: [xMin, yMax, zMin] },
+        { axisIndex: 2, a: [xMin, yMin, zMin], b: [xMin, yMin, zMax] }
+      ];
+      var boxHits = [];
+      for (var bi = 0; bi < segments.length; bi += 1) {
+        var sa = projector(segments[bi].a);
+        var sb = projector(segments[bi].b);
+        if (!sa || !sb) { continue; }
+        var sdist = pointSegmentDistancePx(px, py, sa[0], sa[1], sb[0], sb[1]);
+        boxHits.push({ axisIndex: segments[bi].axisIndex, hit: sdist <= threshold, distance: sdist });
+      }
+      var boxHit = chooseUniqueAxisHit(boxHits);
+      return boxHit ? boxHit.axisIndex : null;
+    }
+    var center = axis3DRotationCenter(cfg || {});
+    var p0 = projectWorldToPixel(cam, w, h, center);
+    if (!p0) { return null; }
+    var dirs = axis3DScreenAxisDirections(cam, body, cfg || {});
+    var hits = [];
+    for (var i = 0; i < dirs.length; i += 1) {
+      var d = dirs[i];
+      var dist = pointLineDistancePx(px, py, p0[0], p0[1], d.ux, d.uy);
+      hits.push({ axisIndex: d.axisIndex, hit: dist <= threshold, distance: dist });
+    }
+    var hit = chooseUniqueAxisHit(hits);
+    return hit ? hit.axisIndex : null;
+  }
+
+  function axis3DBoxLockedDragAxis(camera, body, cfg, dx, dy, thresholdDeg) {
+    var best = axis3DLockedDragAxisFromDirs(axis3DBoxScreenAxisDirections(camera, body, cfg), dx, dy, thresholdDeg);
+    return best && best.pxPerUnit > 1e-9 ? best : null;
+  }
+
+  function axis3DBoxLockedDragDelta(camera, body, cfg, decisionDx, decisionDy, moveDx, moveDy, thresholdDeg) {
+    var best = axis3DBoxLockedDragAxis(camera, body, cfg, decisionDx, decisionDy, thresholdDeg);
+    if (!best) { return null; }
+    var moveAlongAxis = ((Number(moveDx) || 0) * best.ux + (Number(moveDy) || 0) * best.uy);
+    return {
+      axisIndex: best.axisIndex,
+      delta: -moveAlongAxis / best.pxPerUnit
+    };
+  }
+
+  function axis3DBoxLockedTotalDragDelta(camera, body, cfg, decisionDx, decisionDy, thresholdDeg) {
+    var best = axis3DBoxLockedDragAxis(camera, body, cfg, decisionDx, decisionDy, thresholdDeg);
+    if (!best) { return null; }
+    var totalAlongAxis = ((Number(decisionDx) || 0) * best.ux + (Number(decisionDy) || 0) * best.uy);
+    return {
+      axisIndex: best.axisIndex,
+      delta: -totalAlongAxis / best.pxPerUnit
+    };
+  }
+
+  function axis3DBoxFrozenTickValues(cfg, axisName) {
+    var axis = String(axisName || "").toLowerCase();
+    if (!cfg || (axis !== "x" && axis !== "y" && axis !== "z")) { return null; }
+    var frozen = cfg.__frozen_tick_values || null;
+    var values = frozen && frozen[axis];
+    return Array.isArray(values) ? values.slice() : null;
+  }
+
+  function chooseNiceAxisStepNear(rawStep, hints) {
+    var target = Math.max(1e-12, Math.abs(Number(rawStep) || 0));
+    var rawHints = Array.isArray(hints) && hints.length ? hints : [1, 2, 5];
+    var cleanHints = [];
+    for (var hi = 0; hi < rawHints.length; hi += 1) {
+      var hv = Math.abs(Number(rawHints[hi]) || 0);
+      if (hv > 0) { cleanHints.push(hv); }
+    }
+    if (!cleanHints.length) { cleanHints = [1, 2, 5]; }
+    var pow = Math.floor(Math.log(target) / Math.LN10);
+    var best = cleanHints[0] * Math.pow(10, pow);
+    var bestScore = Infinity;
+    for (var pi = pow - 1; pi <= pow + 1; pi += 1) {
+      var scale = Math.pow(10, pi);
+      for (var ci = 0; ci < cleanHints.length; ci += 1) {
+        var cand = cleanHints[ci] * scale;
+        if (!(cand > 0)) { continue; }
+        var score = Math.abs(Math.log(cand / target));
+        if (score < bestScore) {
+          bestScore = score;
+          best = cand;
+        }
+      }
+    }
+    return best;
+  }
+
+  function axis3DBoxTickFreezePayload(camera, body, cfg) {
+    if (!cfg || !camera) { return null; }
+    var rect = body && body.getBoundingClientRect ? body.getBoundingClientRect() : { width: 1, height: 1 };
+    var w = Math.max(1, Number(rect.width) || 1);
+    var h = Math.max(1, Number(rect.height) || 1);
+    var cam = Object.assign({}, camera || {}, {
+      viewport_width_px: w,
+      viewport_height_px: h
+    });
+    var xMin = Number(cfg.x_min);
+    var xMax = Number(cfg.x_max);
+    var yMin = Number(cfg.y_min);
+    var yMax = Number(cfg.y_max);
+    var zMin = Number(cfg.z_min);
+    var zMax = Number(cfg.z_max);
+    if (![xMin, xMax, yMin, yMax, zMin, zMax].every(Number.isFinite)) { return null; }
+    var boxCorners = [
+      [xMin, yMin, zMin], [xMax, yMin, zMin], [xMin, yMax, zMin], [xMax, yMax, zMin],
+      [xMin, yMin, zMax], [xMax, yMin, zMax], [xMin, yMax, zMax], [xMax, yMax, zMax]
+    ];
+    var rawBoxPixels = boxCorners.map(function (p) { return projectWorldToPixel(cam, w, h, axis3DBoxAspectPoint(cfg, p)); });
+    var finiteBoxPixels = rawBoxPixels.filter(function (p) {
+      return p && Number.isFinite(p[0]) && Number.isFinite(p[1]);
+    });
+    if (finiteBoxPixels.length < 2) { return null; }
+    var rawMinX = finiteBoxPixels[0][0];
+    var rawMaxX = finiteBoxPixels[0][0];
+    var rawMinY = finiteBoxPixels[0][1];
+    var rawMaxY = finiteBoxPixels[0][1];
+    for (var bp = 1; bp < finiteBoxPixels.length; bp += 1) {
+      rawMinX = Math.min(rawMinX, finiteBoxPixels[bp][0]);
+      rawMaxX = Math.max(rawMaxX, finiteBoxPixels[bp][0]);
+      rawMinY = Math.min(rawMinY, finiteBoxPixels[bp][1]);
+      rawMaxY = Math.max(rawMaxY, finiteBoxPixels[bp][1]);
+    }
+    var rawCx = (rawMinX + rawMaxX) * 0.5;
+    var rawCy = (rawMinY + rawMaxY) * 0.5;
+    var rawW = Math.max(1e-6, rawMaxX - rawMinX);
+    var rawH = Math.max(1e-6, rawMaxY - rawMinY);
+    var fitMargin = Math.max(24, Number(cfg.fit_margin_px) || 48);
+    var fitW = Math.max(1, w - 2 * fitMargin);
+    var fitH = Math.max(1, h - 2 * fitMargin);
+    var fitScale = Math.min(fitW / rawW, fitH / rawH);
+    if (!Number.isFinite(fitScale) || !(fitScale > 0)) { fitScale = 1; }
+    function fitBoxPixel(p) {
+      if (!p) { return null; }
+      return [
+        (w * 0.5) + (p[0] - rawCx) * fitScale,
+        (h * 0.5) + (p[1] - rawCy) * fitScale
+      ];
+    }
+    function projectBoxPoint(p) {
+      return fitBoxPixel(projectWorldToPixel(cam, w, h, axis3DBoxAspectPoint(cfg, p)));
+    }
+    function boxEdgeInfo(axisIndex, a, b) {
+      var pa = projectBoxPoint(a);
+      var pb = projectBoxPoint(b);
+      if (!pa || !pb) { return null; }
+      var dx = pb[0] - pa[0];
+      var dy = pb[1] - pa[1];
+      var len = Math.sqrt(dx * dx + dy * dy);
+      var lo = Number(a[axisIndex]);
+      var hi = Number(b[axisIndex]);
+      var span = Math.abs(hi - lo);
+      if (!(span > 1e-12)) { return null; }
+      return { len: len, lo: lo, hi: hi, span: span };
+    }
+    return {
+      x: boxEdgeInfo(0, [xMin, yMin, zMin], [xMax, yMin, zMin]),
+      y: boxEdgeInfo(1, [xMin, yMin, zMin], [xMin, yMax, zMin]),
+      z: boxEdgeInfo(2, [xMin, yMin, zMin], [xMin, yMin, zMax])
+    };
+  }
+
+  function freezeAxis3DBoxTickPlacement(cfg, camera, body) {
+    if (!cfg) { return; }
+    var hints = Array.isArray(cfg.tick_hints) && cfg.tick_hints.length ? cfg.tick_hints : [1, 2, 5];
+    var projected = axis3DBoxTickFreezePayload(camera, body, cfg);
+    var out = {};
+    ["x", "y", "z"].forEach(function (axis) {
+      var lo = Number(cfg[axis + "_min"]);
+      var hi = Number(cfg[axis + "_max"]);
+      if (!(hi > lo)) { out[axis] = []; return; }
+      var mode = String(cfg[axis + "_mode"] || cfg[axis + "_tick_mode"] || "linear").toLowerCase();
+      var span = Math.max(1e-12, hi - lo);
+      var projectedInfo = projected && projected[axis] || null;
+      var targetTickCount = Math.max(4, Math.min(10, Number(cfg.freeze_tick_count) || 7));
+      if (!isLogTickMode(mode)) {
+        var step = null;
+        if (projectedInfo && projectedInfo.len > 1e-6) {
+          var dataPerPixel = projectedInfo.span / Math.max(1, projectedInfo.len);
+          step = chooseAxisTickStep(
+            dataPerPixel,
+            Number(cfg.tick_dist) || 120,
+            hints,
+            Number(cfg.min_tick_dist) || 72,
+            Number(cfg.max_tick_dist) || 180
+          );
+          step = chooseReadableLinearTickStep(
+            Math.min(projectedInfo.lo, projectedInfo.hi),
+            Math.max(projectedInfo.lo, projectedInfo.hi),
+            step,
+            null,
+            "linear",
+            hints,
+            Math.max(1, projectedInfo.len),
+            Number(cfg.tick_dist) || 120,
+            Number(cfg.min_tick_dist) || 72,
+            Number(cfg.max_tick_dist) || 180,
+            Number(cfg.tick_label_font_size) || 11
+          );
+        }
+        if (!(Number(step) > 0)) {
+          step = chooseNiceAxisStepNear(span / targetTickCount, hints);
+        }
+        var values = axis3DZeroAnchoredTickValues(lo, hi, step);
+        if (values.length <= 1 && span > 1e-12) {
+          values = axis3DZeroAnchoredTickValues(lo, hi, span / Math.max(2, targetTickCount));
+        }
+        out[axis] = values;
+        return;
+      }
+      out[axis] = axisTickValuesForMode(
+        lo,
+        hi,
+        chooseNiceAxisStepNear(span / targetTickCount, hints),
+        null,
+        mode,
+        false,
+        hints,
+        targetTickCount * Math.max(1, Number(cfg.tick_dist) || 120),
+        Number(cfg.tick_dist) || 120,
+        Number(cfg.min_tick_dist) || 72,
+        Number(cfg.max_tick_dist) || 180
+      );
+    });
+    cfg.__frozen_tick_values = out;
+  }
+
+  function unfreezeAxis3DBoxTickPlacement(cfg) {
+    if (cfg) { delete cfg.__frozen_tick_values; }
+  }
+
   function pushAxis3DVertex(out, x, y, z, color) {
     out.push(Number(x) || 0, Number(y) || 0, Number(z) || 0, 0, 0, 1, color[0], color[1], color[2], color[3]);
   }
 
   function rebuildAxis3DLocalField(fid, skipUpdate, geomOverride) {
     var geom = geomOverride || (_lastDisplayPayload && _lastDisplayPayload.geom ? _lastDisplayPayload.geom[String(fid)] : null);
-    var cfg = geom && geom.axis3d_runtime;
+    var cfg = axis3DRuntimeConfig(geom);
     if (!geom || !cfg || !Array.isArray(geom.meshes) || !geom.meshes.length) { return; }
+    if (String(cfg.mode || "crosshair").toLowerCase() === "box") {
+      var boxMesh = geom.meshes[0];
+      if (boxMesh) {
+        boxMesh.axis3d_helper_lines = true;
+        boxMesh.edge_width = Math.max(0.5, Number(cfg.width) || Number(boxMesh.edge_width) || 1);
+        boxMesh.__dataRevision = Number(boxMesh.__dataRevision || 0) + 1;
+        boxMesh.__revision = Number(boxMesh.__revision || 0) + 1;
+      }
+      geom.texts = [];
+      if (skipUpdate === true) { return; }
+      updateGeomFrame(String(fid), geom);
+      return;
+    }
     var camera = geom.camera || {};
     var target = vec3Array(camera.target, [0, 0, 0]);
     var color = parseRuntimeColor(cfg.color || "white");
@@ -2670,9 +4052,12 @@
     var xRange = axis3DVisibleRange(String(fid), cfg, camera, target, "x");
     var yRange = axis3DVisibleRange(String(fid), cfg, camera, target, "y");
     var zRange = axis3DVisibleRange(String(fid), cfg, camera, target, "z");
-    addLine([xRange.lo, 0, 0], [xRange.hi, 0, 0]);
-    addLine([0, yRange.lo, 0], [0, yRange.hi, 0]);
-    addLine([0, 0, zRange.lo], [0, 0, zRange.hi]);
+    var baseX = axisCrosshairBaseValue(cfg, "x");
+    var baseY = axisCrosshairBaseValue(cfg, "y");
+    var baseZ = axisCrosshairBaseValue(cfg, "z");
+    addLine([xRange.lo, baseY, baseZ], [xRange.hi, baseY, baseZ]);
+    addLine([baseX, yRange.lo, baseZ], [baseX, yRange.hi, baseZ]);
+    addLine([baseX, baseY, zRange.lo], [baseX, baseY, zRange.hi]);
     var mesh = geom.meshes[0];
     mesh.vertices = verts;
     mesh.indices = inds;
@@ -2688,10 +4073,11 @@
   function refreshAxis3DRuntimeFrame(fid, renderOverlay) {
     fid = String(fid);
     var geom = _lastDisplayPayload && _lastDisplayPayload.geom ? _lastDisplayPayload.geom[fid] : null;
-    if (!geom || !geom.axis3d_runtime || !Array.isArray(geom.meshes) || !geom.meshes.length) { return; }
+    if (!geom || !axis3DRuntimeConfig(geom) || !Array.isArray(geom.meshes) || !geom.meshes.length) { return; }
     var frameEl = findFrameEl(geomTargetFrameId(fid));
     if (!frameEl) { return; }
     rebuildAxis3DLocalField(fid, true, geom);
+    applyAxis3DBoundMeshes(geom);
     var rec = frameRecs[fid] || null;
     if (rec && Array.isArray(rec.entries)) {
       var fit = fittedFrameContentRect(frameEl, geomFrameHost(frameEl, fid));
@@ -2733,7 +4119,7 @@
   function repaintAxis3DHelperLines(fid) {
     fid = String(fid);
     var geom = _lastDisplayPayload && _lastDisplayPayload.geom ? _lastDisplayPayload.geom[fid] : null;
-    if (!geom || !geom.axis3d_runtime) { return; }
+    if (!geom || !axis3DRuntimeConfig(geom)) { return; }
     var frameEl = findFrameEl(geomTargetFrameId(fid));
     if (!frameEl) { return; }
     var fit = fittedFrameContentRect(frameEl, geomFrameHost(frameEl, fid));
@@ -2751,7 +4137,7 @@
     fid = String(fid);
     var rec = frameRecs[fid] || null;
     var geom = _lastDisplayPayload && _lastDisplayPayload.geom ? _lastDisplayPayload.geom[fid] : null;
-    if (!rec || !geom || !geom.axis3d_runtime) { return; }
+    if (!rec || !geom || !axis3DRuntimeConfig(geom)) { return; }
     var dx = Number(rec.axis3DHelperPanX || 0);
     var dy = Number(rec.axis3DHelperPanY || 0);
     if (!dx && !dy) { return; }
@@ -2822,7 +4208,7 @@
 
   function renderableGeomSpecs(specs) {
     if (!Array.isArray(specs)) { return []; }
-    return specs.filter(function (spec) { return !isAxis3DHelperLineSpec(spec); });
+    return specs.filter(function (spec) { return !isAxis3DHelperLineSpec(spec) && !spec.axis_plot3d; });
   }
 
   function textPointIsNearViewport(p, w, h, pad) {
@@ -2944,20 +4330,575 @@
     return changed;
   }
 
-  function mutateAxisViewport(fid, mutator) {
+  function mutateAxisViewport(fid, mutator, options) {
     if (!_lastDisplayPayload || !_lastDisplayPayload.geom || !_lastDisplayPayload.geom[fid]) { return; }
     var geom = _lastDisplayPayload.geom[fid];
     var meshes = Array.isArray(geom.meshes) ? geom.meshes : [];
+    var opts = options || {};
     var changed = false;
     for (var i = 0; i < meshes.length; i += 1) {
       var cfg = meshes[i] && meshes[i].axis_ticks;
       if (!cfg || meshes[i].axis_interactive === false) { continue; }
       mutator(cfg, meshes[i]);
+      cfg.__vf_live_mutated = true;
       changed = true;
     }
     if (changed) {
-      schedulePlotCameraUpdate(fid);
+      if (opts.scheduleFrameUpdate !== false) {
+        schedulePlotCameraUpdate(fid);
+      }
+      var frameEl = findFrameEl(geomTargetFrameId(fid));
+      if (frameEl) {
+        drawSimple2DMarkerLineMeshes(fid, frameEl, meshes);
+        if (opts.scheduleTextOverlay !== false) {
+          scheduleGeomTextOverlayRender(String(fid), frameEl, geom);
+        }
+      }
     }
+  }
+
+  function axisGestureLock2D(dx, dy, thresholdDeg) {
+    var len = Math.sqrt(dx * dx + dy * dy);
+    if (!(len > 1e-6)) { return null; }
+    var thresholdCos = Math.cos((Number(thresholdDeg) || 5) * Math.PI / 180);
+    var sx = Math.abs(dx) / len;
+    var sy = Math.abs(dy) / len;
+    if (sx >= thresholdCos && sx >= sy) { return "x"; }
+    if (sy >= thresholdCos && sy > sx) { return "y"; }
+    return null;
+  }
+
+  function axisGestureSampleCount(cfg) {
+    return Math.max(1, Math.floor(Number(cfg && cfg.axis_lock_sample_count) || 3));
+  }
+
+  function axisGestureLockAngle(cfg) {
+    return Number(cfg && cfg.axis_lock_angle_deg) || 5;
+  }
+
+  function axisStartLockDistancePx(cfg) {
+    return Math.max(1, Number(cfg && cfg.axis_lock_distance_px) || 10);
+  }
+
+  function pointSegmentDistancePx(px, py, ax, ay, bx, by) {
+    var dx = bx - ax;
+    var dy = by - ay;
+    var lenSq = dx * dx + dy * dy;
+    if (!(lenSq > 1e-12)) {
+      var sx = px - ax;
+      var sy = py - ay;
+      return Math.sqrt(sx * sx + sy * sy);
+    }
+    var t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lenSq));
+    var qx = ax + dx * t;
+    var qy = ay + dy * t;
+    var ex = px - qx;
+    var ey = py - qy;
+    return Math.sqrt(ex * ex + ey * ey);
+  }
+
+  function pointLineDistancePx(px, py, ax, ay, ux, uy) {
+    return Math.abs((px - ax) * uy - (py - ay) * ux);
+  }
+
+  function chooseUniqueAxisHit(hits) {
+    var best = null;
+    var count = 0;
+    for (var i = 0; i < hits.length; i += 1) {
+      if (!hits[i] || hits[i].hit !== true) { continue; }
+      count += 1;
+      if (!best || hits[i].distance < best.distance) { best = hits[i]; }
+    }
+    return count === 1 ? best : null;
+  }
+
+  function axis2DStartAxisLock(mesh, cfg, px, py, w, h) {
+    var threshold = axisStartLockDistancePx(cfg);
+    var hits = [];
+    if (mesh && mesh.axis_box === true) {
+      var box = axisBoxRect(mesh, w, h);
+      hits.push({ axis: "x", hit: pointSegmentDistancePx(px, py, box.left, box.bottom, box.right, box.bottom) <= threshold, distance: pointSegmentDistancePx(px, py, box.left, box.bottom, box.right, box.bottom) });
+      hits.push({ axis: "y", hit: pointSegmentDistancePx(px, py, box.left, box.bottom, box.left, box.top) <= threshold, distance: pointSegmentDistancePx(px, py, box.left, box.bottom, box.left, box.top) });
+    } else {
+      var view = axisViewport(mesh, cfg, w, h);
+      if (!view) { return null; }
+      var yAxisPx = view.dataToY(axisCrosshairBaseValue(cfg, "y"));
+      var xAxisPx = view.dataToX(axisCrosshairBaseValue(cfg, "x"));
+      if (yAxisPx >= 0 && yAxisPx <= h) {
+        hits.push({ axis: "x", hit: Math.abs(py - yAxisPx) <= threshold, distance: Math.abs(py - yAxisPx) });
+      }
+      if (xAxisPx >= 0 && xAxisPx <= w) {
+        hits.push({ axis: "y", hit: Math.abs(px - xAxisPx) <= threshold, distance: Math.abs(px - xAxisPx) });
+      }
+    }
+    var hit = chooseUniqueAxisHit(hits);
+    return hit ? hit.axis : null;
+  }
+
+  function axis2DRotationDeg(cfg) {
+    var raw = Number(cfg && cfg.__raw_rotation_deg);
+    if (!Number.isFinite(raw)) { raw = Number(cfg && cfg.rotation_deg) || 0; }
+    return snapSignedAngleDegWithinThreshold(raw, Number(cfg && cfg.rotation_snap_angle_deg) || 5, [-180, -90, 0, 90, 180]);
+  }
+
+  function axisCrosshairBaseValue(cfg, axis) {
+    return isLogTickMode(cfg && cfg[axis + "_mode"]) ? 1 : 0;
+  }
+
+  function rotatePointAround(px, py, cx, cy, deg) {
+    var a = (Number(deg) || 0) * Math.PI / 180;
+    if (!a) { return [px, py]; }
+    var c = Math.cos(a);
+    var s = Math.sin(a);
+    var dx = px - cx;
+    var dy = py - cy;
+    return [cx + dx * c - dy * s, cy + dx * s + dy * c];
+  }
+
+  function axis2DRotationCenter(mesh, cfg, w, h) {
+    if (mesh && mesh.axis_box === true) {
+      var box = axisBoxRect(mesh, w, h);
+      return [(box.left + box.right) * 0.5, (box.top + box.bottom) * 0.5];
+    }
+    var view = axisViewport(mesh, cfg, w, h);
+    return view
+      ? [view.dataToX(axisCrosshairBaseValue(cfg, "x")), view.dataToY(axisCrosshairBaseValue(cfg, "y"))]
+      : [w * 0.5, h * 0.5];
+  }
+
+  function axis2DBoundaryAnchorInfo(px, py, cx, cy, inset, w, h) {
+    var dx = px - cx;
+    var dy = py - cy;
+    var left = inset;
+    var right = w - inset;
+    var top = inset;
+    var bottom = h - inset;
+    if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) {
+      return { point: [px, py], side: null };
+    }
+    var t = Infinity;
+    var side = null;
+    if (dx > 1e-6) { t = Math.min(t, (right - cx) / dx); }
+    else if (dx < -1e-6) { t = Math.min(t, (left - cx) / dx); }
+    if (dy > 1e-6) { t = Math.min(t, (bottom - cy) / dy); }
+    else if (dy < -1e-6) { t = Math.min(t, (top - cy) / dy); }
+    if (!(t > 0) || !isFinite(t)) {
+      return { point: [px, py], side: null };
+    }
+    var ax = cx + dx * t;
+    var ay = cy + dy * t;
+    var eps = 1e-3;
+    if (Math.abs(ax - left) <= eps) { side = "left"; }
+    else if (Math.abs(ax - right) <= eps) { side = "right"; }
+    else if (Math.abs(ay - top) <= eps) { side = "top"; }
+    else if (Math.abs(ay - bottom) <= eps) { side = "bottom"; }
+    return { point: [ax, ay], side: side };
+  }
+
+  function axis2DBoundaryAnchorPoint(px, py, cx, cy, inset, w, h) {
+    return axis2DBoundaryAnchorInfo(px, py, cx, cy, inset, w, h).point;
+  }
+
+  function normalizeUprightTextRotationDeg(deg) {
+    var angle = normalizeSignedAngleDeg(deg);
+    if (angle > 90) { angle -= 180; }
+    else if (angle < -90) { angle += 180; }
+    return angle;
+  }
+
+  function axisTextAnchorFromAxisOffset(dx, dy) {
+    var ax = Math.abs(Number(dx) || 0);
+    var ay = Math.abs(Number(dy) || 0);
+    if (ax >= ay) {
+      return {
+        ha: (Number(dx) || 0) >= 0 ? "left" : "right",
+        va: "center"
+      };
+    }
+    return {
+      ha: "center",
+      va: (Number(dy) || 0) >= 0 ? "top" : "bottom"
+    };
+  }
+
+  function axis2DPlaceBoundaryHorizontalLabel(item, center, axisBoundaryPoint, axisPoint, preBoundaryPoint, preferredNormal, boundaryInfo, w, h) {
+    if (!item || !boundaryInfo || !axisBoundaryPoint || !axisPoint || !preBoundaryPoint) { return null; }
+    var fontSize = Math.max(1, Number(item.font_size) || 12);
+    var text = item.text != null ? String(item.text) : "";
+    var boxW = Math.max(1, estimateTickLabelWidthPx(text, fontSize));
+    var boxH = Math.max(1, fontSize);
+    var ux = Number(axisBoundaryPoint[0]) - Number(center[0]);
+    var uy = Number(axisBoundaryPoint[1]) - Number(center[1]);
+    var uLen = Math.sqrt(ux * ux + uy * uy);
+    if (!(uLen > 1e-6)) { return null; }
+    ux /= Math.max(1e-6, uLen);
+    uy /= Math.max(1e-6, uLen);
+    var vx = preferredNormal
+      ? Number(preferredNormal[0]) - Number(axisPoint[0])
+      : Number(preBoundaryPoint[0]) - Number(axisPoint[0]);
+    var vy = preferredNormal
+      ? Number(preferredNormal[1]) - Number(axisPoint[1])
+      : Number(preBoundaryPoint[1]) - Number(axisPoint[1]);
+    var vDotU = vx * ux + vy * uy;
+    var nx = vx - ux * vDotU;
+    var ny = vy - uy * vDotU;
+    var nLen = Math.sqrt(nx * nx + ny * ny);
+    if (!(nLen > 1e-6)) {
+      nx = -uy;
+      ny = ux;
+      nLen = 1;
+    }
+    nx /= nLen;
+    ny /= nLen;
+    var edgeGap = Math.max(0, Number(item.axis_gap_px) || nLen);
+    var support = 0.5 * (Math.abs(nx) * boxW + Math.abs(ny) * boxH);
+    var cx = Number(axisBoundaryPoint[0]) + nx * (edgeGap + support);
+    var cy = Number(axisBoundaryPoint[1]) + ny * (edgeGap + support);
+    var targetX = null;
+    var targetY = null;
+    if (boundaryInfo.side === "left") {
+      targetX = Math.max(0, Number(item.boundary_inset_px) || 0) + boxW * 0.5;
+    } else if (boundaryInfo.side === "right") {
+      targetX = w - Math.max(0, Number(item.boundary_inset_px) || 0) - boxW * 0.5;
+    } else if (boundaryInfo.side === "top") {
+      targetY = Math.max(0, Number(item.boundary_inset_px) || 0) + boxH * 0.5;
+    } else if (boundaryInfo.side === "bottom") {
+      targetY = h - Math.max(0, Number(item.boundary_inset_px) || 0) - boxH * 0.5;
+    }
+    var t = 0;
+    if (targetX != null && Math.abs(ux) > 1e-6) {
+      t = (targetX - cx) / ux;
+    } else if (targetY != null && Math.abs(uy) > 1e-6) {
+      t = (targetY - cy) / uy;
+    }
+    return {
+      x: cx + ux * t,
+      y: cy + uy * t,
+      rotate: 0,
+      ha: "center",
+      va: "center"
+    };
+  }
+
+  function rotateAxis2DLabelSpecs(items, mesh, cfg, w, h) {
+    var deg = axis2DRotationDeg(cfg);
+    if (!deg || !Array.isArray(items) || !items.length) { return items; }
+    var c = axis2DRotationCenter(mesh, cfg, w, h);
+    for (var i = 0; i < items.length; i += 1) {
+      var item = items[i];
+      if (!item || item.pixel !== true) { continue; }
+      var p = rotatePointAround(Number(item.x) || 0, Number(item.y) || 0, c[0], c[1], deg);
+      var axisAnchor = item.axis_anchor_px != null && item.axis_anchor_py != null
+        ? rotatePointAround(Number(item.axis_anchor_px) || 0, Number(item.axis_anchor_py) || 0, c[0], c[1], deg)
+        : null;
+      var preferredNormal = item.preferred_normal_dx != null && item.preferred_normal_dy != null && axisAnchor
+        ? rotatePointAround(
+            Number(item.axis_anchor_px) + Number(item.preferred_normal_dx || 0),
+            Number(item.axis_anchor_py) + Number(item.preferred_normal_dy || 0),
+            c[0],
+            c[1],
+            deg
+          )
+        : null;
+      var boundaryInfo = null;
+      if (item.boundary_anchor === true) {
+        boundaryInfo = axis2DBoundaryAnchorInfo(
+          axisAnchor ? axisAnchor[0] : p[0],
+          axisAnchor ? axisAnchor[1] : p[1],
+          c[0],
+          c[1],
+          Math.max(0, Number(item.boundary_inset_px) || 0),
+          w,
+          h
+        );
+        if (item.boundary_keep_offset === true && axisAnchor) {
+          p = [
+            boundaryInfo.point[0] + (p[0] - axisAnchor[0]),
+            boundaryInfo.point[1] + (p[1] - axisAnchor[1])
+          ];
+        } else {
+          p = boundaryInfo.point;
+        }
+      }
+      if (item.solve_boundary_and_axis === true && boundaryInfo && axisAnchor) {
+        var solved = axis2DPlaceBoundaryHorizontalLabel(item, c, boundaryInfo.point, axisAnchor, p, preferredNormal, boundaryInfo, w, h);
+        if (solved) {
+          item.x = solved.x;
+          item.y = solved.y;
+          item.rotate = solved.rotate;
+          item.ha = solved.ha;
+          item.va = solved.va;
+          continue;
+        }
+      }
+      item.x = p[0];
+      item.y = p[1];
+      var rotateDeg = item.keep_horizontal === true
+        ? (Number(item.rotate) || 0)
+        : (Number(item.rotate) || 0) + deg;
+      if (item.keep_upright === true) {
+        rotateDeg = normalizeUprightTextRotationDeg(rotateDeg);
+      }
+      item.rotate = rotateDeg;
+      if (item.keep_horizontal === true && boundaryInfo && item.boundary_side_align === true) {
+        if (boundaryInfo.side === "left") {
+          item.ha = "left";
+          item.va = "center";
+        } else if (boundaryInfo.side === "right") {
+          item.ha = "right";
+          item.va = "center";
+        } else if (boundaryInfo.side === "top") {
+          item.ha = "center";
+          item.va = "top";
+        } else if (boundaryInfo.side === "bottom") {
+          item.ha = "center";
+          item.va = "bottom";
+        }
+      }
+      if (item.anchor_to_axis === true && axisAnchor) {
+        var anchor = axisTextAnchorFromAxisOffset(p[0] - axisAnchor[0], p[1] - axisAnchor[1]);
+        item.ha = anchor.ha;
+        item.va = anchor.va;
+      }
+    }
+    return items;
+  }
+
+  function applyAxis2DRotationTransform(ctx, mesh, cfg, w, h) {
+    var deg = axis2DRotationDeg(cfg);
+    if (!deg) { return false; }
+    var center = axis2DRotationCenter(mesh, cfg, w, h);
+    var cx = center[0];
+    var cy = center[1];
+    ctx.translate(cx, cy);
+    ctx.rotate(deg * Math.PI / 180);
+    ctx.translate(-cx, -cy);
+    return true;
+  }
+
+  function axis2DRotatedLocalBounds(mesh, cfg, w, h) {
+    var deg = axis2DRotationDeg(cfg);
+    if (!deg) { return { left: 0, right: w, top: 0, bottom: h, width: w, height: h }; }
+    var center = axis2DRotationCenter(mesh, cfg, w, h);
+    var pts = [
+      rotatePointAround(0, 0, center[0], center[1], -deg),
+      rotatePointAround(w, 0, center[0], center[1], -deg),
+      rotatePointAround(w, h, center[0], center[1], -deg),
+      rotatePointAround(0, h, center[0], center[1], -deg)
+    ];
+    var left = pts[0][0];
+    var right = pts[0][0];
+    var top = pts[0][1];
+    var bottom = pts[0][1];
+    for (var i = 1; i < pts.length; i += 1) {
+      left = Math.min(left, pts[i][0]);
+      right = Math.max(right, pts[i][0]);
+      top = Math.min(top, pts[i][1]);
+      bottom = Math.max(bottom, pts[i][1]);
+    }
+    var pad = Math.max(8, Number(cfg && cfg.len) || 7, Number(cfg && cfg.tick_label_font_size) || 11);
+    return {
+      left: left - pad,
+      right: right + pad,
+      top: top - pad,
+      bottom: bottom + pad,
+      width: Math.max(1, right - left + pad * 2),
+      height: Math.max(1, bottom - top + pad * 2)
+    };
+  }
+
+  function axis2DVisibleDataRangeFromLocalBounds(view, cfg, w, h, bounds, axis) {
+    if (!view || !bounds) { return axis === "x" ? [view.vx0, view.vx1] : [view.vy0, view.vy1]; }
+    if (axis === "x") {
+      var ux0 = bounds.left / Math.max(1, w);
+      var ux1 = bounds.right / Math.max(1, w);
+      var x0 = axisUnitToValue(ux0, view.vx0, view.vx1, cfg.x_mode);
+      var x1 = axisUnitToValue(ux1, view.vx0, view.vx1, cfg.x_mode);
+      return [Math.min(x0, x1), Math.max(x0, x1)];
+    }
+    var uyTop = 1 - (bounds.bottom / Math.max(1, h));
+    var uyBottom = 1 - (bounds.top / Math.max(1, h));
+    var y0 = axisUnitToValue(uyTop, view.vy0, view.vy1, cfg.y_mode);
+    var y1 = axisUnitToValue(uyBottom, view.vy0, view.vy1, cfg.y_mode);
+    return [Math.min(y0, y1), Math.max(y0, y1)];
+  }
+
+  function axis2DCrosshairBoundaryLabelAnchor(view, cfg, w, h, axis, insetPx) {
+    if (!view || !cfg) { return null; }
+    var baseX = axisCrosshairBaseValue(cfg, "x");
+    var baseY = axisCrosshairBaseValue(cfg, "y");
+    var origin = view.dataToPoint(baseX, baseY);
+    var dirPoint = axis === "x"
+      ? view.dataToPoint(baseX + 1, baseY)
+      : view.dataToPoint(baseX, baseY + 1);
+    if (!origin || !dirPoint) { return null; }
+    var dx = dirPoint[0] - origin[0];
+    var dy = dirPoint[1] - origin[1];
+    var len = Math.sqrt(dx * dx + dy * dy);
+    if (!(len > 1e-6)) { return null; }
+    var ux = dx / len;
+    var uy = dy / len;
+    var clipped = clipPixelLineToRect(
+      [origin[0] - ux * Math.max(w, h) * 4, origin[1] - uy * Math.max(w, h) * 4],
+      [origin[0] + ux * Math.max(w, h) * 4, origin[1] + uy * Math.max(w, h) * 4],
+      0,
+      0,
+      w,
+      h
+    );
+    if (!clipped) { return null; }
+    var positive = ((clipped[1][0] - origin[0]) * ux + (clipped[1][1] - origin[1]) * uy) >=
+      ((clipped[0][0] - origin[0]) * ux + (clipped[0][1] - origin[1]) * uy) ? clipped[1] : clipped[0];
+    var inset = Math.max(0, Number(insetPx) || 0);
+    return {
+      x: positive[0] - ux * inset,
+      y: positive[1] - uy * inset,
+      ux: ux,
+      uy: uy
+    };
+  }
+
+  function ensureAxisSelectionOverlay(body) {
+    if (!body) { return null; }
+    if (global.getComputedStyle && global.getComputedStyle(body).position === "static") {
+      body.style.position = "relative";
+    }
+    var el = body.querySelector(":scope > .vf-axis-selection-overlay");
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "vf-axis-selection-overlay";
+      el.style.position = "absolute";
+      el.style.border = "1px dashed rgba(255,255,255,0.9)";
+      el.style.background = "rgba(120,160,255,0.14)";
+      el.style.pointerEvents = "none";
+      el.style.display = "none";
+      el.style.zIndex = "80";
+      body.appendChild(el);
+    }
+    return el;
+  }
+
+  function updateAxisSelectionOverlay(body, drag) {
+    var el = ensureAxisSelectionOverlay(body);
+    if (!el || !drag) { return; }
+    var x0 = Number(drag.startX || 0);
+    var y0 = Number(drag.startY || 0);
+    var x1 = Number(drag.pendingX || drag.x || x0);
+    var y1 = Number(drag.pendingY || drag.y || y0);
+    var rect = body && body.getBoundingClientRect ? body.getBoundingClientRect() : { left: 0, top: 0 };
+    var left = Math.min(x0, x1) - Number(rect.left || 0);
+    var top = Math.min(y0, y1) - Number(rect.top || 0);
+    var width = Math.abs(x1 - x0);
+    var height = Math.abs(y1 - y0);
+    el.style.display = width >= 2 && height >= 2 ? "block" : "none";
+    el.style.left = Math.round(left) + "px";
+    el.style.top = Math.round(top) + "px";
+    el.style.width = Math.round(width) + "px";
+    el.style.height = Math.round(height) + "px";
+  }
+
+  function hideAxisSelectionOverlay(body) {
+    var el = body && body.querySelector ? body.querySelector(":scope > .vf-axis-selection-overlay") : null;
+    if (el) { el.style.display = "none"; }
+  }
+
+  function axis2DRangeSnapshot(cfg) {
+    return {
+      x_min: Number(cfg.x_min),
+      x_max: Number(cfg.x_max),
+      y_min: Number(cfg.y_min),
+      y_max: Number(cfg.y_max)
+    };
+  }
+
+  function axis2DRestoreUnlockedRange(cfg, snapshot, activeAxis) {
+    if (!snapshot || !activeAxis) { return; }
+    if (activeAxis !== "x" && Number.isFinite(snapshot.x_min) && Number.isFinite(snapshot.x_max)) {
+      cfg.x_min = snapshot.x_min;
+      cfg.x_max = snapshot.x_max;
+    }
+    if (activeAxis !== "y" && Number.isFinite(snapshot.y_min) && Number.isFinite(snapshot.y_max)) {
+      cfg.y_min = snapshot.y_min;
+      cfg.y_max = snapshot.y_max;
+    }
+  }
+
+  function applyAxis2DSelectionZoom(fid, body, drag) {
+    if (!_lastDisplayPayload || !_lastDisplayPayload.geom || !_lastDisplayPayload.geom[fid]) { return; }
+    var geom = _lastDisplayPayload.geom[fid];
+    var meshes = Array.isArray(geom.meshes) ? geom.meshes : [];
+    var rect = body && body.getBoundingClientRect ? body.getBoundingClientRect() : { left: 0, top: 0, width: 1, height: 1 };
+    var w = Math.max(1, Number(rect.width) || 1);
+    var h = Math.max(1, Number(rect.height) || 1);
+    var x0 = Math.max(0, Math.min(w, Math.min(Number(drag.startX || 0), Number(drag.pendingX || drag.x || 0)) - Number(rect.left || 0)));
+    var x1 = Math.max(0, Math.min(w, Math.max(Number(drag.startX || 0), Number(drag.pendingX || drag.x || 0)) - Number(rect.left || 0)));
+    var y0 = Math.max(0, Math.min(h, Math.min(Number(drag.startY || 0), Number(drag.pendingY || drag.y || 0)) - Number(rect.top || 0)));
+    var y1 = Math.max(0, Math.min(h, Math.max(Number(drag.startY || 0), Number(drag.pendingY || drag.y || 0)) - Number(rect.top || 0)));
+    if ((x1 - x0) < 8 || (y1 - y0) < 8) { return; }
+    var plans = [];
+    for (var i = 0; i < meshes.length; i += 1) {
+      var mesh = meshes[i];
+      var cfg = mesh && mesh.axis_ticks;
+      if (!cfg || mesh.axis_interactive === false) { continue; }
+      if (mesh.axis_box === true) { unfreezeAxis2DBoxTickPlacement(cfg); }
+      var view = axisViewport(mesh, cfg, w, h);
+      if (!view) { continue; }
+      var box = axisBoxRect(mesh, w, h);
+      var bx0 = mesh.axis_box === true ? Math.max(box.left, x0) : x0;
+      var bx1 = mesh.axis_box === true ? Math.min(box.right, x1) : x1;
+      var by0 = mesh.axis_box === true ? Math.max(box.top, y0) : y0;
+      var by1 = mesh.axis_box === true ? Math.min(box.bottom, y1) : y1;
+      if ((bx1 - bx0) < 4 || (by1 - by0) < 4) { continue; }
+      var sx0 = mesh.axis_box === true ? (bx0 - box.left) / Math.max(1, box.width) : bx0 / w;
+      var sx1 = mesh.axis_box === true ? (bx1 - box.left) / Math.max(1, box.width) : bx1 / w;
+      var sy0 = mesh.axis_box === true ? (box.bottom - by1) / Math.max(1, box.height) : 1 - by1 / h;
+      var sy1 = mesh.axis_box === true ? (box.bottom - by0) / Math.max(1, box.height) : 1 - by0 / h;
+      var start = axis2DRangeSnapshot(cfg);
+      plans.push({
+        cfg: cfg,
+        start: start,
+        target: {
+          x_min: start.x_min + sx0 * (start.x_max - start.x_min),
+          x_max: start.x_min + sx1 * (start.x_max - start.x_min),
+          y_min: start.y_min + sy0 * (start.y_max - start.y_min),
+          y_max: start.y_min + sy1 * (start.y_max - start.y_min)
+        }
+      });
+    }
+    if (!plans.length) { return; }
+    animateAxisRanges(260, function (a) {
+      for (var pi = 0; pi < plans.length; pi += 1) {
+        var p = plans[pi];
+        p.cfg.x_min = p.start.x_min + (p.target.x_min - p.start.x_min) * a;
+        p.cfg.x_max = p.start.x_max + (p.target.x_max - p.start.x_max) * a;
+        p.cfg.y_min = p.start.y_min + (p.target.y_min - p.start.y_min) * a;
+        p.cfg.y_max = p.start.y_max + (p.target.y_max - p.start.y_max) * a;
+        p.cfg.__vf_live_mutated = true;
+      }
+      drawSimple2DMarkerLineMeshes(fid, findFrameEl(geomTargetFrameId(fid)), meshes);
+      renderGeomTextOverlay(fid, findFrameEl(geomTargetFrameId(fid)), geom);
+    }, function () { schedulePlotCameraUpdate(fid); });
+  }
+
+  function smooth01(t) {
+    t = Math.max(0, Math.min(1, Number(t) || 0));
+    var s = Math.sin(t * Math.PI * 0.5);
+    return s * s;
+  }
+
+  function animateAxisRanges(durationMs, stepFn, doneFn) {
+    var start = global.performance && typeof global.performance.now === "function" ? global.performance.now() : Date.now();
+    function tick(now) {
+      now = Number(now) || Date.now();
+      var a = smooth01((now - start) / Math.max(1, Number(durationMs) || 240));
+      stepFn(a);
+      if (a < 1) {
+        global.requestAnimationFrame(tick);
+      } else if (typeof doneFn === "function") {
+        doneFn();
+      }
+    }
+    global.requestAnimationFrame(tick);
   }
 
   function ensureAxis2DControls(fid, frameEl, geomSpec) {
@@ -2974,6 +4915,12 @@
     if (!body || body.__vfAxis2DControlsAttached) { return; }
     body.__vfAxis2DControlsAttached = true;
     body.__vfAxis2DDragState = null;
+    body.addEventListener("contextmenu", function (e) {
+      if (body.__vfAxis2DDragState) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    });
 
     body.addEventListener("wheel", function (e) {
       if (!_lastDisplayPayload || !_lastDisplayPayload.geom || !_lastDisplayPayload.geom[fid]) { return; }
@@ -2986,6 +4933,7 @@
       var px = Math.max(0, Math.min(w, (Number(e.clientX) || 0) - (Number(rect.left) || 0)));
       var py = Math.max(0, Math.min(h, (Number(e.clientY) || 0) - (Number(rect.top) || 0)));
       mutateAxisViewport(fid, function (cfg, mesh) {
+        if (mesh && mesh.axis_box === true) { unfreezeAxis2DBoxTickPlacement(cfg); }
         var xMin = Number(cfg.x_min);
         var xMax = Number(cfg.x_max);
         var yMin = Number(cfg.y_min);
@@ -3004,9 +4952,14 @@
         if (isLogTickMode(cfg.x_mode) && xMin > 0 && xMax > xMin) {
           var lx0 = Math.log(xMin) / Math.LN10;
           var lx1 = Math.log(xMax) / Math.LN10;
-          var lxAnchor = lx0 + ux * (lx1 - lx0);
-          var lxSpan = (lx1 - lx0) * factor;
-          applyLogRange(cfg, "x", lxAnchor - ux * lxSpan, lxAnchor + (1.0 - ux) * lxSpan);
+          if (mesh && mesh.axis_box === true) {
+            var lxAnchor = lx0 + ux * (lx1 - lx0);
+            var lxSpan = (lx1 - lx0) * factor;
+            applyLogRange(cfg, "x", lxAnchor - ux * lxSpan, lxAnchor + (1.0 - ux) * lxSpan);
+          } else {
+            var lxRadius = Math.max(1e-9, Math.abs(lx0), Math.abs(lx1)) * factor;
+            applySymmetricCrosshairLogRange(cfg, "x", -lxRadius, lxRadius);
+          }
         } else {
           var dataX = view.vx0 + (px / w) * (view.vx1 - view.vx0);
           var visibleSpanX = (view.vx1 - view.vx0) * factor;
@@ -3022,9 +4975,14 @@
         if (isLogTickMode(cfg.y_mode) && yMin > 0 && yMax > yMin) {
           var ly0 = Math.log(yMin) / Math.LN10;
           var ly1 = Math.log(yMax) / Math.LN10;
-          var lyAnchor = ly0 + uy * (ly1 - ly0);
-          var lySpan = (ly1 - ly0) * factor;
-          applyLogRange(cfg, "y", lyAnchor - uy * lySpan, lyAnchor + (1.0 - uy) * lySpan);
+          if (mesh && mesh.axis_box === true) {
+            var lyAnchor = ly0 + uy * (ly1 - ly0);
+            var lySpan = (ly1 - ly0) * factor;
+            applyLogRange(cfg, "y", lyAnchor - uy * lySpan, lyAnchor + (1.0 - uy) * lySpan);
+          } else {
+            var lyRadius = Math.max(1e-9, Math.abs(ly0), Math.abs(ly1)) * factor;
+            applySymmetricCrosshairLogRange(cfg, "y", -lyRadius, lyRadius);
+          }
         } else {
           var dataY = view.vy1 - (py / h) * (view.vy1 - view.vy0);
           var visibleSpanY = (view.vy1 - view.vy0) * factor;
@@ -3041,17 +4999,71 @@
     }, { passive: false });
 
     body.addEventListener("pointerdown", function (e) {
-      if (Number(e.button || 0) !== 0) { return; }
-      body.__vfAxis2DDragState = { x: Number(e.clientX) || 0, y: Number(e.clientY) || 0 };
+      var button = Number(e.button || 0);
+      var action = e.ctrlKey && button === 0 ? "rotate" : e.ctrlKey && button === 2 ? "scale" : button === 0 ? "pan" : button === 2 ? "select" : "";
+      if (!action) { return; }
+      body.__vfAxis2DDragState = {
+        x: Number(e.clientX) || 0,
+        y: Number(e.clientY) || 0,
+        startX: Number(e.clientX) || 0,
+        startY: Number(e.clientY) || 0,
+        action: action,
+        totalDx: 0,
+        totalDy: 0,
+        sampleCount: 0,
+        panMode: null,
+        rangeSnapshots: null
+      };
+      if (action === "pan" || action === "scale") {
+        var rect = body.getBoundingClientRect ? body.getBoundingClientRect() : { left: 0, top: 0, width: 1, height: 1 };
+        var w = Math.max(1, Number(rect.width) || 1);
+        var h = Math.max(1, Number(rect.height) || 1);
+        var px = Math.max(0, Math.min(w, Number(e.clientX || 0) - Number(rect.left || 0)));
+        var py = Math.max(0, Math.min(h, Number(e.clientY || 0) - Number(rect.top || 0)));
+        var geom = _lastDisplayPayload && _lastDisplayPayload.geom ? _lastDisplayPayload.geom[fid] : null;
+        var meshes = geom && Array.isArray(geom.meshes) ? geom.meshes : [];
+        var axisHits = [];
+        for (var mi = 0; mi < meshes.length; mi += 1) {
+          var cfg = meshes[mi] && meshes[mi].axis_ticks;
+          if (!cfg || meshes[mi].axis_interactive === false) { continue; }
+          var axis = axis2DStartAxisLock(meshes[mi], cfg, px, py, w, h);
+          if (axis) { axisHits.push(axis); }
+        }
+        var uniqueAxis = axisHits.length === 1 ? axisHits[0] : null;
+        if (uniqueAxis) {
+          body.__vfAxis2DDragState.panMode = { kind: "axis", axis: uniqueAxis };
+        } else {
+          body.__vfAxis2DDragState.panMode = { kind: "free" };
+        }
+      }
       try { body.setPointerCapture(e.pointerId); } catch (_) {}
+      e.preventDefault();
       e.stopPropagation();
     });
     body.addEventListener("pointerup", function (e) {
+      var drag = body.__vfAxis2DDragState;
+      if (drag && drag.action === "select") {
+        applyAxis2DSelectionZoom(fid, body, drag);
+      } else if (drag) {
+        schedulePlotCameraUpdate(fid);
+        var frameEl = findFrameEl(geomTargetFrameId(fid));
+        var geom = _lastDisplayPayload && _lastDisplayPayload.geom ? _lastDisplayPayload.geom[fid] : null;
+        if (frameEl && geom) { scheduleGeomTextOverlayRender(String(fid), frameEl, geom); }
+      }
       body.__vfAxis2DDragState = null;
+      hideAxisSelectionOverlay(body);
       try { body.releasePointerCapture(e.pointerId); } catch (_) {}
     });
     body.addEventListener("pointercancel", function (e) {
+      var drag = body.__vfAxis2DDragState;
+      if (drag) {
+        schedulePlotCameraUpdate(fid);
+        var frameEl = findFrameEl(geomTargetFrameId(fid));
+        var geom = _lastDisplayPayload && _lastDisplayPayload.geom ? _lastDisplayPayload.geom[fid] : null;
+        if (frameEl && geom) { scheduleGeomTextOverlayRender(String(fid), frameEl, geom); }
+      }
       body.__vfAxis2DDragState = null;
+      hideAxisSelectionOverlay(body);
       try { body.releasePointerCapture(e.pointerId); } catch (_) {}
     });
     body.addEventListener("pointermove", function (e) {
@@ -3064,40 +5076,134 @@
       drag.x = x;
       drag.y = y;
       if (!dx && !dy) { return; }
+      drag.totalDx = Number(drag.totalDx || 0) + dx;
+      drag.totalDy = Number(drag.totalDy || 0) + dy;
+      drag.sampleCount = Number(drag.sampleCount || 0) + 1;
+      if (drag.action === "select") {
+        drag.pendingX = x;
+        drag.pendingY = y;
+        updateAxisSelectionOverlay(body, drag);
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      if (drag.action === "scale") {
+        mutateAxisViewport(fid, function (cfg) {
+          unfreezeAxis2DBoxTickPlacement(cfg);
+          var axis = drag.panMode && drag.panMode.kind === "axis" ? drag.panMode.axis : null;
+          var factor = Math.exp((axis === "y" ? dy : dx) * 0.006);
+          if (!axis || axis === "x") {
+            var cx = (Number(cfg.x_min) + Number(cfg.x_max)) * 0.5;
+            var hx = (Number(cfg.x_max) - Number(cfg.x_min)) * factor * 0.5;
+            applyLinearRange(cfg, "x", cx - hx, cx + hx);
+          }
+          if (!axis || axis === "y") {
+            var cy = (Number(cfg.y_min) + Number(cfg.y_max)) * 0.5;
+            var hy = (Number(cfg.y_max) - Number(cfg.y_min)) * factor * 0.5;
+            applyLinearRange(cfg, "y", cy - hy, cy + hy);
+          }
+        });
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      if (drag.action === "rotate") {
+        var rectRot = body.getBoundingClientRect ? body.getBoundingClientRect() : { left: 0, top: 0, width: 1, height: 1 };
+        var wRot = Math.max(1, Number(rectRot.width) || 1);
+        var hRot = Math.max(1, Number(rectRot.height) || 1);
+        var prevPx = (Number(drag.x) || 0) - (Number(rectRot.left) || 0) - dx;
+        var prevPy = (Number(drag.y) || 0) - (Number(rectRot.top) || 0) - dy;
+        var curPx = (Number(drag.x) || 0) - (Number(rectRot.left) || 0);
+        var curPy = (Number(drag.y) || 0) - (Number(rectRot.top) || 0);
+        mutateAxisViewport(fid, function (cfg, mesh) {
+          if (mesh && mesh.axis_box === true && !cfg.__frozen_box_tick_state) {
+            freezeAxis2DBoxTickPlacement(mesh, cfg, wRot, hRot);
+          }
+          var center = axis2DRotationCenter(mesh, cfg, wRot, hRot);
+          var a0 = Math.atan2(prevPy - center[1], prevPx - center[0]);
+          var a1 = Math.atan2(curPy - center[1], curPx - center[0]);
+          var da = a1 - a0;
+          while (da > Math.PI) { da -= Math.PI * 2; }
+          while (da < -Math.PI) { da += Math.PI * 2; }
+          if (!Number.isFinite(da) || Math.abs(prevPx - center[0]) + Math.abs(prevPy - center[1]) < 2 || Math.abs(curPx - center[0]) + Math.abs(curPy - center[1]) < 2) {
+            da = dx * (Math.PI / Math.max(1, wRot));
+          }
+          var raw = Number(cfg.__raw_rotation_deg);
+          if (!Number.isFinite(raw)) { raw = Number(cfg.rotation_deg) || 0; }
+          raw += da * 180 / Math.PI;
+          cfg.__raw_rotation_deg = raw;
+          cfg.rotation_deg = raw;
+        });
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      if (drag.action !== "pan") {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
       e.stopPropagation();
       var rect = body.getBoundingClientRect ? body.getBoundingClientRect() : { width: 1, height: 1 };
       var w = Math.max(1, Number(rect.width) || 1);
       var h = Math.max(1, Number(rect.height) || 1);
+      drag.__axis2DSnapshotIndex = 0;
       mutateAxisViewport(fid, function (cfg, mesh) {
+        if (!drag.rangeSnapshots) { drag.rangeSnapshots = []; }
+        if (!drag.rangeSnapshots.length) {
+          var meshes = _lastDisplayPayload && _lastDisplayPayload.geom && _lastDisplayPayload.geom[fid] && Array.isArray(_lastDisplayPayload.geom[fid].meshes)
+            ? _lastDisplayPayload.geom[fid].meshes
+            : [];
+          for (var si = 0; si < meshes.length; si += 1) {
+            if (meshes[si] && meshes[si].axis_ticks) { drag.rangeSnapshots.push(axis2DRangeSnapshot(meshes[si].axis_ticks)); }
+          }
+        }
+        var sampleNeed = axisGestureSampleCount(cfg);
+        if (!drag.panMode && drag.sampleCount >= sampleNeed) {
+          var lockedAxis = axisGestureLock2D(Number(drag.totalDx || 0), Number(drag.totalDy || 0), axisGestureLockAngle(cfg));
+          drag.panMode = lockedAxis ? { kind: "axis", axis: lockedAxis } : { kind: "free" };
+        }
+        var activeAxis = drag.panMode && drag.panMode.kind === "axis" ? drag.panMode.axis : null;
+        if (activeAxis) {
+          var snapIndex = Number(drag.__axis2DSnapshotIndex || 0);
+          axis2DRestoreUnlockedRange(cfg, drag.rangeSnapshots[snapIndex], activeAxis);
+          drag.__axis2DSnapshotIndex = snapIndex + 1;
+        }
+        if (mesh && mesh.axis_box === true && drag.action !== "rotate") {
+          unfreezeAxis2DBoxTickPlacement(cfg);
+        }
         var view = axisViewport(mesh, cfg, w, h);
         if (!view) { return; }
         var box = axisBoxRect(mesh, w, h);
         var axisW = mesh && mesh.axis_box === true ? Math.max(1, box.width) : w;
         var axisH = mesh && mesh.axis_box === true ? Math.max(1, box.height) : h;
-        if (isLogTickMode(cfg.x_mode) && Number(cfg.x_min) > 0 && Number(cfg.x_max) > Number(cfg.x_min)) {
+        if (activeAxis !== "y" && isLogTickMode(cfg.x_mode) && Number(cfg.x_min) > 0 && Number(cfg.x_max) > Number(cfg.x_min) && mesh && mesh.axis_box === true) {
           var px0 = Math.log(Number(cfg.x_min)) / Math.LN10;
           var px1 = Math.log(Number(cfg.x_max)) / Math.LN10;
           var pdx = (-dx / axisW) * (px1 - px0);
           applyLogRange(cfg, "x", px0 + pdx, px1 + pdx);
-        } else {
+        } else if (activeAxis !== "y" && !isLogTickMode(cfg.x_mode)) {
           var unitsPerPxX = mesh && mesh.axis_box === true
             ? (Number(cfg.x_max) - Number(cfg.x_min)) / axisW
             : (view.vx1 - view.vx0) / w;
           var tx = -dx * unitsPerPxX;
           applyLinearRange(cfg, "x", Number(cfg.x_min) + tx, Number(cfg.x_max) + tx);
         }
-        if (isLogTickMode(cfg.y_mode) && Number(cfg.y_min) > 0 && Number(cfg.y_max) > Number(cfg.y_min)) {
+        if (activeAxis !== "x" && isLogTickMode(cfg.y_mode) && Number(cfg.y_min) > 0 && Number(cfg.y_max) > Number(cfg.y_min) && mesh && mesh.axis_box === true) {
           var py0 = Math.log(Number(cfg.y_min)) / Math.LN10;
           var py1 = Math.log(Number(cfg.y_max)) / Math.LN10;
           var pdy = (dy / axisH) * (py1 - py0);
           applyLogRange(cfg, "y", py0 + pdy, py1 + pdy);
-        } else {
+        } else if (activeAxis !== "x" && !isLogTickMode(cfg.y_mode)) {
           var unitsPerPxY = mesh && mesh.axis_box === true
             ? (Number(cfg.y_max) - Number(cfg.y_min)) / axisH
             : (view.vy1 - view.vy0) / h;
           var ty = dy * unitsPerPxY;
           applyLinearRange(cfg, "y", Number(cfg.y_min) + ty, Number(cfg.y_max) + ty);
         }
+      }, {
+        scheduleFrameUpdate: false,
+        scheduleTextOverlay: true
       });
     });
   }
@@ -3185,6 +5291,12 @@
     if (!body || body.__vfAxis3DControlsAttached) { return; }
     body.__vfAxis3DControlsAttached = true;
     body.__vfAxis3DDragState = null;
+    body.addEventListener("contextmenu", function (e) {
+      if (body.__vfAxis3DDragState) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    });
 
     function claimAxis3DEvent(e) {
       if (!e) { return; }
@@ -3204,19 +5316,136 @@
       if (!dx && !dy) { return; }
       drag.totalDx = Number(drag.totalDx || 0) + dx;
       drag.totalDy = Number(drag.totalDy || 0) + dy;
-      mutateAxis3DCamera(fid, function (camera) {
-        var delta = axis3DDragWorldDelta(camera, body, dx, dy);
-        var pos = vec3Array(camera.pos, [4, 4, 5.657]);
-        var target = vec3Array(camera.target, [0, 0, 0]);
-        camera.pos = [pos[0] + delta[0], pos[1] + delta[1], pos[2] + delta[2]];
-        camera.target = [target[0] + delta[0], target[1] + delta[1], target[2] + delta[2]];
-      }, { skipTextOverlay: true });
-      repaintAxis3DHelperLines(fid);
+      drag.sampleCount = Number(drag.sampleCount || 0) + 1;
+      var geom = _lastDisplayPayload && _lastDisplayPayload.geom ? _lastDisplayPayload.geom[fid] : null;
+      try {
+        if (drag.action === "rotate") {
+          var rotCfg = axis3DBoxRuntime(geom);
+          if (rotCfg && !rotCfg.__frozen_tick_values) {
+            freezeAxis3DBoxTickPlacement(rotCfg, geom && geom.camera || {}, body);
+          }
+          mutateAxis3DCamera(fid, function (camera) {
+            axis3DRotateCameraDrag(camera, axis3DRuntimeConfig(geom) || {}, dx, dy, body, drag.shiftKey === true, drag);
+          }, { skipTextOverlay: true });
+          var rotateCfg = axis3DRuntimeConfig(geom);
+          if (rotateCfg && String(rotateCfg.mode || "crosshair").toLowerCase() !== "box") {
+            refreshAxis3DRuntimeFrame(fid, true);
+          } else {
+            repaintAxis3DHelperLines(fid);
+          }
+          return;
+        }
+        if (drag.action === "scale") {
+          var scaleCfg = axis3DBoxRuntime(geom);
+          if (scaleCfg) {
+            unfreezeAxis3DBoxTickPlacement(scaleCfg);
+            var scaleCamera = geom.camera || {};
+            var scaleDirs = axis3DBoxScreenAxisDirections(scaleCamera, body, scaleCfg);
+            var scaleAxis = null;
+            if (drag.boxPanMode && drag.boxPanMode.kind === "axis") {
+              for (var sdi = 0; sdi < scaleDirs.length; sdi += 1) {
+                if (scaleDirs[sdi].axisIndex === drag.boxPanMode.axisIndex) { scaleAxis = scaleDirs[sdi]; break; }
+              }
+            }
+            var factor3 = Math.exp(((scaleAxis ? (dx * scaleAxis.ux + dy * scaleAxis.uy) : dx) || 0) * 0.006);
+            var scaleAxes = scaleAxis ? [scaleAxis.axisIndex] : [0, 1, 2];
+            for (var sai = 0; sai < scaleAxes.length; sai += 1) {
+              var axisName = scaleAxes[sai] === 0 ? "x" : scaleAxes[sai] === 1 ? "y" : "z";
+              var lo3 = Number(scaleCfg[axisName + "_min"]);
+              var hi3 = Number(scaleCfg[axisName + "_max"]);
+              var c3 = (lo3 + hi3) * 0.5;
+              var h3 = (hi3 - lo3) * factor3 * 0.5;
+              scaleCfg[axisName + "_min"] = c3 - h3;
+              scaleCfg[axisName + "_max"] = c3 + h3;
+            }
+            repaintAxis3DHelperLines(fid);
+          }
+          return;
+        }
+        if (drag.action !== "pan") {
+          repaintAxis3DHelperLines(fid);
+          return;
+        }
+        var boxCfg = axis3DBoxRuntime(geom);
+        if (boxCfg) {
+          var cameraForBox = geom.camera || {};
+          var totalDx = Number(drag.totalDx || 0);
+          var totalDy = Number(drag.totalDy || 0);
+          var startCfg = drag.boxStartRanges ? Object.assign({}, boxCfg, drag.boxStartRanges) : boxCfg;
+          if (!drag.boxPanMode && drag.sampleCount >= axisGestureSampleCount(boxCfg)) {
+            var firstLockedAxis = axis3DBoxLockedDragAxis(cameraForBox, body, startCfg, totalDx, totalDy, axisGestureLockAngle(boxCfg));
+            drag.boxPanMode = firstLockedAxis
+              ? { kind: "axis", axisIndex: firstLockedAxis.axisIndex }
+              : { kind: "free" };
+            axis3DDebugLog("mode=" + drag.boxPanMode.kind + (drag.boxPanMode.kind === "axis" ? " axis=" + drag.boxPanMode.axisIndex : ""));
+          }
+          if (drag.boxPanMode && drag.boxPanMode.kind === "axis") {
+            var axis = drag.boxPanMode.axisIndex;
+            var dirs = axis3DBoxScreenAxisDirections(cameraForBox, body, startCfg);
+            var dir = null;
+            for (var di = 0; di < dirs.length; di += 1) {
+              if (dirs[di].axisIndex === axis) { dir = dirs[di]; break; }
+            }
+            if (dir && dir.pxPerUnit > 1e-9) {
+              var totalAlongAxis = totalDx * dir.ux + totalDy * dir.uy;
+              var delta = -totalAlongAxis / dir.pxPerUnit;
+              axis3DDebugLog("locked axis=" + axis + " total=(" + totalDx.toFixed(2) + "," + totalDy.toFixed(2) + ") delta=" + Number(delta || 0).toPrecision(6));
+              axis3DBoxApplyAxisDeltaFromSnapshot(boxCfg, drag.boxStartRanges, axis, delta);
+            }
+          } else if (drag.boxPanMode && drag.boxPanMode.kind === "free") {
+            axis3DDebugLog("free total=(" + totalDx.toFixed(2) + "," + totalDy.toFixed(2) + ")");
+            axis3DTranslateBoxRange(boxCfg, axis3DBoxDragDataDelta(cameraForBox, body, boxCfg, dx, dy));
+          } else {
+            axis3DTranslateBoxRange(boxCfg, axis3DBoxDragDataDelta(cameraForBox, body, boxCfg, dx, dy));
+          }
+          repaintAxis3DHelperLines(fid);
+          return;
+        }
+        if (!drag.panMode) {
+          var cfg3 = axis3DRuntimeConfig(geom) || {};
+          if (drag.sampleCount >= axisGestureSampleCount(cfg3)) {
+            var cameraForLock = geom && geom.camera || {};
+            var locked3 = axis3DLockedDragAxisFromDirs(
+              axis3DScreenAxisDirections(cameraForLock, body, cfg3),
+              Number(drag.totalDx || 0),
+              Number(drag.totalDy || 0),
+              axisGestureLockAngle(cfg3)
+            );
+            drag.panMode = locked3 ? { kind: "axis", axisIndex: locked3.axisIndex } : { kind: "free" };
+          }
+        }
+        mutateAxis3DCamera(fid, function (camera) {
+          var delta = axis3DDragWorldDelta(camera, body, dx, dy);
+          if (drag.panMode && drag.panMode.kind === "axis") {
+            var axisIndex = drag.panMode.axisIndex;
+            delta = [
+              axisIndex === 0 ? delta[0] : 0,
+              axisIndex === 1 ? delta[1] : 0,
+              axisIndex === 2 ? delta[2] : 0
+            ];
+          }
+          var pos = vec3Array(camera.pos, [4, 4, 5.657]);
+          var target = vec3Array(camera.target, [0, 0, 0]);
+          camera.pos = [pos[0] + delta[0], pos[1] + delta[1], pos[2] + delta[2]];
+          camera.target = [target[0] + delta[0], target[1] + delta[1], target[2] + delta[2]];
+        }, { skipTextOverlay: true });
+        repaintAxis3DHelperLines(fid);
+      } catch (err) {
+        try { console.error("[axis3d drag]", err); } catch (_) {}
+        unfreezeAxis3DBoxTickPlacement(axis3DBoxRuntime(geom));
+        resetAxis3DVisualLayers(fid);
+        body.__vfAxis3DDragState = null;
+        hideAxisSelectionOverlay(body);
+      }
     }
 
     function commitAxis3DDrag(drag) {
       if (!drag) { return; }
       flushAxis3DDrag();
+      var geom = _lastDisplayPayload && _lastDisplayPayload.geom ? _lastDisplayPayload.geom[fid] : null;
+      if (drag.action !== "rotate") {
+        unfreezeAxis3DBoxTickPlacement(axis3DBoxRuntime(geom));
+      }
       axis3DCommitAndRebuild(fid, body, drag);
       refreshAxis3DRuntimeFrame(fid, true);
     }
@@ -3233,6 +5462,19 @@
       claimAxis3DEvent(e);
       try { e.__vfHandledWheel = true; } catch (_) {}
       var factor = Math.exp(Math.max(-600, Math.min(600, Number(e.deltaY) || 0)) * 0.0028);
+      var geom = _lastDisplayPayload && _lastDisplayPayload.geom ? _lastDisplayPayload.geom[fid] : null;
+      var boxCfg = axis3DBoxRuntime(geom);
+      if (boxCfg) {
+        unfreezeAxis3DBoxTickPlacement(boxCfg);
+        axis3DScaleBoxRange(boxCfg, factor);
+        var recBox = frameRecs[String(fid)] || null;
+        if (recBox) {
+          recBox.axis3DHelperTickCache = null;
+          recBox.axis3DHelperStepCache = null;
+        }
+        repaintAxis3DHelperLines(fid);
+        return;
+      }
       mutateAxis3DCamera(fid, function (camera) {
         var anchorBefore = axis3DCursorPlanePoint(camera, body, e.clientX, e.clientY);
         var isOrtho = String(camera.projection || "").toLowerCase() === "orthographic";
@@ -3259,31 +5501,70 @@
         }
       }, { skipTextOverlay: true });
       var rec = frameRecs[String(fid)] || null;
-      if (rec) { rec.axis3DHelperTickCache = null; }
+      if (rec) {
+        rec.axis3DHelperTickCache = null;
+        rec.axis3DHelperStepCache = null;
+      }
       repaintAxis3DHelperLines(fid);
     }, { passive: false, capture: true });
 
     body.addEventListener("pointerdown", function (e) {
-      if (Number(e.button || 0) !== 0) { return; }
+      var button = Number(e.button || 0);
+      var action = e.ctrlKey && button === 0 ? "rotate" : e.ctrlKey && button === 2 ? "scale" : button === 0 ? "pan" : button === 2 ? "select" : "";
+      if (!action) { return; }
       var x = Number(e.clientX) || 0;
       var y = Number(e.clientY) || 0;
       resetAxis3DVisualLayers(fid);
-      body.__vfAxis3DDragState = { x: x, y: y, pendingX: x, pendingY: y, totalDx: 0, totalDy: 0, raf: 0 };
+      var geom = _lastDisplayPayload && _lastDisplayPayload.geom ? _lastDisplayPayload.geom[fid] : null;
+      var boxCfg = axis3DBoxRuntime(geom);
+      if (boxCfg && action !== "rotate") { unfreezeAxis3DBoxTickPlacement(boxCfg); }
+      var startAxisLock = null;
+      if (action === "pan" || action === "scale" || action === "rotate") {
+        startAxisLock = axis3DStartAxisLock(geom && geom.camera || {}, body, axis3DRuntimeConfig(geom) || {}, x, y);
+      }
+      body.__vfAxis3DDragState = {
+        x: x,
+        y: y,
+        pendingX: x,
+        pendingY: y,
+        action: action,
+        totalDx: 0,
+        totalDy: 0,
+        sampleCount: 0,
+        shiftKey: !!e.shiftKey,
+        rawYawRad: NaN,
+        rawPitchRad: NaN,
+        axis3DRawCamera: axis3DCloneCamera(geom && geom.camera || {}),
+        rotateStartAxisIndex: action === "rotate" ? startAxisLock : null,
+        rotateLockMode: null,
+        raf: 0,
+        panMode: startAxisLock != null ? { kind: "axis", axisIndex: startAxisLock } : { kind: "free" },
+        boxPanMode: startAxisLock != null ? { kind: "axis", axisIndex: startAxisLock } : { kind: "free" },
+        boxStartRanges: boxCfg ? axis3DBoxRangeSnapshot(boxCfg) : null
+      };
       try { body.setPointerCapture(e.pointerId); } catch (_) {}
       claimAxis3DEvent(e);
     }, true);
     body.addEventListener("pointerup", function (e) {
       var drag = body.__vfAxis3DDragState;
       cancelAxis3DDragRaf(body.__vfAxis3DDragState);
-      commitAxis3DDrag(drag);
+      if (drag && drag.action === "select") {
+        applyAxis3DSelectionZoom(fid, body, drag);
+      } else {
+        commitAxis3DDrag(drag);
+      }
       body.__vfAxis3DDragState = null;
+      hideAxisSelectionOverlay(body);
       try { body.releasePointerCapture(e.pointerId); } catch (_) {}
       claimAxis3DEvent(e);
     }, true);
     body.addEventListener("pointercancel", function (e) {
       cancelAxis3DDragRaf(body.__vfAxis3DDragState);
+      var geom = _lastDisplayPayload && _lastDisplayPayload.geom ? _lastDisplayPayload.geom[fid] : null;
+      unfreezeAxis3DBoxTickPlacement(axis3DBoxRuntime(geom));
       resetAxis3DVisualLayers(fid);
       body.__vfAxis3DDragState = null;
+      hideAxisSelectionOverlay(body);
       try { body.releasePointerCapture(e.pointerId); } catch (_) {}
       claimAxis3DEvent(e);
     }, true);
@@ -3301,6 +5582,10 @@
       var y = Number(latestEvent.clientY) || 0;
       drag.pendingX = x;
       drag.pendingY = y;
+      drag.shiftKey = !!latestEvent.shiftKey;
+      if (drag.action === "select") {
+        updateAxisSelectionOverlay(body, drag);
+      }
       claimAxis3DEvent(e);
       if (!drag.raf) {
         drag.raf = global.requestAnimationFrame(function () {
@@ -4056,6 +6341,55 @@
     return isLogTickMode(mode) ? formatLogAxisTickLabel(value, minValue, maxValue) : formatAxisTickLabel(value);
   }
 
+  function axisCrosshairTickValuesForMode(minValue, maxValue, step, explicitValues, mode, hints, pixelSpan, tickDist, minTickDist, maxTickDist) {
+    var values = axisTickValuesNoZeroForMode(minValue, maxValue, step, explicitValues, mode, false, hints, pixelSpan, tickDist, minTickDist, maxTickDist);
+    if (!isLogTickMode(mode)) { return values; }
+    return values.filter(function (v) {
+      return Math.abs((Number(v) || 0) - 1) > 1e-12;
+    });
+  }
+
+  function axisCrosshairLogCoordinateToValue(coord, centerValue) {
+    var c = Number(centerValue);
+    if (!Number.isFinite(c) || c <= 0) { c = 1; }
+    var exponent = Number(coord) - c;
+    if (!Number.isFinite(exponent)) { return null; }
+    if (exponent < LOG10_FLOAT_MIN || exponent > LOG10_FLOAT_MAX) { return null; }
+    return Math.pow(10, exponent);
+  }
+
+  function axisCrosshairLogTickCoords(loCoord, hiCoord, step, hints, pixelSpan, tickDist, minTickDist, maxTickDist, centerValue) {
+    var c = Number(centerValue);
+    if (!Number.isFinite(c) || c <= 0) { c = 1; }
+    var expLo = Number(loCoord) - c;
+    var expHi = Number(hiCoord) - c;
+    if (!Number.isFinite(expLo) || !Number.isFinite(expHi)) { return []; }
+    if (expHi < expLo) {
+      var t = expLo;
+      expLo = expHi;
+      expHi = t;
+    }
+    var expStep = Number(step);
+    if (!(expStep > 0)) {
+      expStep = chooseAxisTickStep(
+        Math.max(1e-12, (expHi - expLo) / Math.max(1, Number(pixelSpan) || 1)),
+        tickDist,
+        hints,
+        minTickDist,
+        maxTickDist
+      );
+    }
+    return axis3DZeroAnchoredTickValues(expLo, expHi, expStep)
+      .filter(function (exp) { return Math.abs(Number(exp) || 0) > 1e-12; })
+      .map(function (exp) {
+        var value = Math.pow(10, Number(exp));
+        return { coord: c + Number(exp), value: value };
+      })
+      .filter(function (tick) {
+        return Number.isFinite(tick.coord) && Number.isFinite(tick.value) && tick.value > 0;
+      });
+  }
+
   function axisValueToUnit(value, minValue, maxValue, mode) {
     var v = Number(value);
     var lo = Number(minValue);
@@ -4066,6 +6400,18 @@
       return ((Math.log(v) / Math.LN10) - l0) / Math.max(1e-12, l1 - l0);
     }
     return (v - lo) / Math.max(1e-12, hi - lo);
+  }
+
+  function axisUnitToValue(unit, minValue, maxValue, mode) {
+    var u = Number(unit);
+    var lo = Number(minValue);
+    var hi = Number(maxValue);
+    if (isLogTickMode(mode) && lo > 0 && hi > lo) {
+      var l0 = Math.log(lo) / Math.LN10;
+      var l1 = Math.log(hi) / Math.LN10;
+      return Math.pow(10, l0 + u * (l1 - l0));
+    }
+    return lo + u * (hi - lo);
   }
 
   var LOG10_FLOAT_MIN = -307;
@@ -4114,6 +6460,38 @@
     return true;
   }
 
+  function makeSymmetricLogRangeFromValues(loValue, hiValue) {
+    var lo = Number(loValue);
+    var hi = Number(hiValue);
+    if (!(lo > 0) || !(hi > lo)) {
+      return [0.1, 10.0];
+    }
+    var l0 = Math.log(lo) / Math.LN10;
+    var l1 = Math.log(hi) / Math.LN10;
+    var radius = Math.max(1, Math.abs(l0), Math.abs(l1));
+    radius = Math.min(LOG10_FLOAT_MAX, Math.max(1e-9, radius));
+    return [Math.pow(10, -radius), Math.pow(10, radius)];
+  }
+
+  function ensureSymmetricCrosshairLogRange(cfg, axis) {
+    if (!cfg) { return; }
+    var next = makeSymmetricLogRangeFromValues(cfg[axis + "_min"], cfg[axis + "_max"]);
+    cfg[axis + "_min"] = next[0];
+    cfg[axis + "_max"] = next[1];
+  }
+
+  function applySymmetricCrosshairLogRange(cfg, axis, l0, l1) {
+    var a = Number(l0);
+    var b = Number(l1);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) { return false; }
+    var radius = Math.max(1e-9, Math.abs(a), Math.abs(b));
+    var clamped = clampLogSpan(-radius, radius);
+    if (!clamped) { return false; }
+    cfg[axis + "_min"] = Math.pow(10, clamped[0]);
+    cfg[axis + "_max"] = Math.pow(10, clamped[1]);
+    return true;
+  }
+
   var LINEAR_FLOAT_LIMIT = 1e300;
 
   function clampLinearSpan(a, b) {
@@ -4159,10 +6537,16 @@
     var yMin = Number(cfg.y_min);
     var yMax = Number(cfg.y_max);
     if (!(xMax > xMin) || !(yMax > yMin)) { return null; }
-    var cx = (xMin + xMax) * 0.5;
-    var cy = (yMin + yMax) * 0.5;
-    var xSpan = xMax - xMin;
-    var ySpan = yMax - yMin;
+    var xLog = mesh && mesh.axis_box !== true && isLogTickMode(cfg.x_mode) && xMin > 0 && xMax > xMin;
+    var yLog = mesh && mesh.axis_box !== true && isLogTickMode(cfg.y_mode) && yMin > 0 && yMax > yMin;
+    var x0 = xLog ? Math.log(xMin) / Math.LN10 : xMin;
+    var x1 = xLog ? Math.log(xMax) / Math.LN10 : xMax;
+    var y0 = yLog ? Math.log(yMin) / Math.LN10 : yMin;
+    var y1 = yLog ? Math.log(yMax) / Math.LN10 : yMax;
+    var cx = xLog ? 0 : (x0 + x1) * 0.5;
+    var cy = yLog ? 0 : (y0 + y1) * 0.5;
+    var xSpan = x1 - x0;
+    var ySpan = y1 - y0;
     if (String(mesh.aspect || "").toLowerCase() === "equal") {
       if (w >= h) {
         xSpan = xSpan * (w / Math.max(1, h));
@@ -4170,18 +6554,104 @@
         ySpan = ySpan * (h / Math.max(1, w));
       }
     }
-    var vx0 = cx - xSpan * 0.5;
-    var vx1 = cx + xSpan * 0.5;
-    var vy0 = cy - ySpan * 0.5;
-    var vy1 = cy + ySpan * 0.5;
+    var vx0Coord = cx - xSpan * 0.5;
+    var vx1Coord = cx + xSpan * 0.5;
+    var vy0Coord = cy - ySpan * 0.5;
+    var vy1Coord = cy + ySpan * 0.5;
+    var vx0 = xLog ? Math.pow(10, vx0Coord) : vx0Coord;
+    var vx1 = xLog ? Math.pow(10, vx1Coord) : vx1Coord;
+    var vy0 = yLog ? Math.pow(10, vy0Coord) : vy0Coord;
+    var vy1 = yLog ? Math.pow(10, vy1Coord) : vy1Coord;
     return {
       vx0: vx0,
       vx1: vx1,
       vy0: vy0,
       vy1: vy1,
-      dataToX: function (x) { return ((x - vx0) / Math.max(1e-12, vx1 - vx0)) * w; },
-      dataToY: function (y) { return h - (((y - vy0) / Math.max(1e-12, vy1 - vy0)) * h); }
+      dataToX: function (x) { return axisValueToUnit(x, vx0, vx1, cfg.x_mode) * w; },
+      dataToY: function (y) { return h - (axisValueToUnit(y, vy0, vy1, cfg.y_mode) * h); },
+      dataToPoint: function (x, y) {
+        var px = axisValueToUnit(x, vx0, vx1, cfg.x_mode) * w;
+        var py = h - (axisValueToUnit(y, vy0, vy1, cfg.y_mode) * h);
+        return rotatePointAround(px, py, w * 0.5, h * 0.5, axis2DRotationDeg(cfg));
+      }
     };
+  }
+
+  function findAxis2DBindController(meshes, bindId) {
+    var target = String(bindId || "");
+    if (!target || !Array.isArray(meshes)) { return null; }
+    for (var i = 0; i < meshes.length; i += 1) {
+      var mesh = meshes[i];
+      if (!mesh || !mesh.axis_ticks) { continue; }
+      if (String(mesh.axis_bind_id || "") !== target) { continue; }
+      return mesh;
+    }
+    return null;
+  }
+
+  function axis2DPlotPointPx(mesh, controller, cfg, w, h, index) {
+    var meta = mesh && mesh.axis_plot2d || null;
+    if (!meta || !controller || !cfg) { return null; }
+    var xs = Array.isArray(meta.x_values) ? meta.x_values : null;
+    var ys = Array.isArray(meta.y_values) ? meta.y_values : null;
+    var ix = Number(index) || 0;
+    if (!xs || !ys || ix < 0 || ix >= xs.length || ix >= ys.length) { return null; }
+    var xVal = Number(xs[ix]);
+    var yVal = Number(ys[ix]);
+    if (!Number.isFinite(xVal) || !Number.isFinite(yVal)) { return null; }
+    if (controller.axis_box === true) {
+      var box = axisBoxRect(controller, w, h);
+      var px = box.left + axisValueToUnit(xVal, Number(cfg.x_min), Number(cfg.x_max), cfg.x_mode) * box.width;
+      var py = box.bottom - axisValueToUnit(yVal, Number(cfg.y_min), Number(cfg.y_max), cfg.y_mode) * box.height;
+      return [px, py];
+    }
+    var view = axisViewport(controller, cfg, w, h);
+    if (!view) { return null; }
+    return [view.dataToX(xVal), view.dataToY(yVal)];
+  }
+
+  function axis3DMapBoundValue(value, baseMin, baseMax, nextMin, nextMax) {
+    var v = Number(value);
+    var b0 = Number(baseMin);
+    var b1 = Number(baseMax);
+    var n0 = Number(nextMin);
+    var n1 = Number(nextMax);
+    if (!Number.isFinite(v) || !Number.isFinite(b0) || !Number.isFinite(b1) || !Number.isFinite(n0) || !Number.isFinite(n1)) {
+      return v;
+    }
+    var span = b1 - b0;
+    if (Math.abs(span) < 1e-9) { return (n0 + n1) * 0.5; }
+    return n0 + ((v - b0) / span) * (n1 - n0);
+  }
+
+  function applyAxis3DBoundMeshes(geomSpec) {
+    if (!geomSpec || !Array.isArray(geomSpec.meshes) || !geomSpec.meshes.length) { return; }
+    var cfg = axis3DRuntimeConfig(geomSpec);
+    if (!cfg || String(cfg.mode || "crosshair").toLowerCase() !== "box") { return; }
+    for (var i = 0; i < geomSpec.meshes.length; i += 1) {
+      var mesh = geomSpec.meshes[i];
+      if (!mesh || !mesh.axis_plot3d || mesh.axis3d_helper_lines === true || !Array.isArray(mesh.vertices)) { continue; }
+      if (!mesh.__axis3dPlotBaseVertices) {
+        mesh.__axis3dPlotBaseVertices = mesh.vertices.slice();
+        mesh.__axis3dPlotBaseRanges = {
+          x_min: Number(cfg.x_min), x_max: Number(cfg.x_max),
+          y_min: Number(cfg.y_min), y_max: Number(cfg.y_max),
+          z_min: Number(cfg.z_min), z_max: Number(cfg.z_max)
+        };
+      }
+      var baseVerts = Array.isArray(mesh.__axis3dPlotBaseVertices) ? mesh.__axis3dPlotBaseVertices : null;
+      var baseRanges = mesh.__axis3dPlotBaseRanges || null;
+      if (!baseVerts || !baseRanges) { continue; }
+      var nextVerts = mesh.vertices.slice();
+      for (var off = 0; off + 2 < nextVerts.length && off + 2 < baseVerts.length; off += 10) {
+        nextVerts[off] = axis3DMapBoundValue(baseVerts[off], baseRanges.x_min, baseRanges.x_max, cfg.x_min, cfg.x_max);
+        nextVerts[off + 1] = axis3DMapBoundValue(baseVerts[off + 1], baseRanges.y_min, baseRanges.y_max, cfg.y_min, cfg.y_max);
+        nextVerts[off + 2] = axis3DMapBoundValue(baseVerts[off + 2], baseRanges.z_min, baseRanges.z_max, cfg.z_min, cfg.z_max);
+      }
+      mesh.vertices = nextVerts;
+      mesh.__dataRevision = Number(mesh.__dataRevision || 0) + 1;
+      mesh.__revision = Number(mesh.__revision || 0) + 1;
+    }
   }
 
   function axisBoxRect(mesh, w, h) {
@@ -4206,17 +6676,29 @@
       var yMin = Number(cfg.y_min);
       var yMax = Number(cfg.y_max);
       if (xMax > xMin) {
-        var xStep = chooseAxisTickStep((xMax - xMin) / approxW, cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
-        xStep = chooseReadableLinearTickStep(xMin, xMax, xStep, cfg.x_ticks, cfg.x_mode, cfg.hints, approxW, cfg.dist, cfg.min_dist, cfg.max_dist, cfg.tick_label_font_size);
-        var xs = axisTickValuesForMode(xMin, xMax, xStep, cfg.x_ticks, cfg.x_mode, false, cfg.hints, approxW, cfg.dist, cfg.min_dist, cfg.max_dist);
+        var frozen2DX = cfg.__frozen_box_tick_state && cfg.__frozen_box_tick_state.x || null;
+        var xStep = frozen2DX && Number(frozen2DX.step) > 0
+          ? Number(frozen2DX.step)
+          : chooseAxisTickStep((xMax - xMin) / approxW, cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
+        if (!(frozen2DX && Number(frozen2DX.step) > 0)) {
+          xStep = chooseReadableLinearTickStep(xMin, xMax, xStep, cfg.x_ticks, cfg.x_mode, cfg.hints, approxW, cfg.dist, cfg.min_dist, cfg.max_dist, cfg.tick_label_font_size);
+        }
+        var xs = frozen2DX && Array.isArray(frozen2DX.values)
+          ? frozen2DX.values.slice()
+          : axisTickValuesForMode(xMin, xMax, xStep, cfg.x_ticks, cfg.x_mode, false, cfg.hints, approxW, cfg.dist, cfg.min_dist, cfg.max_dist);
         var xOffsetValue = axisLabelOffset(xs, xMin, xMax);
         var xOffsetWidth = xOffsetValue ? estimateTickLabelWidthPx(formatOffsetLabel(xOffsetValue), fontSize) : 0;
         bottomMargin = Math.max(bottomMargin, tickLen + 10 + fontSize + labelAxisPad + labelFontSize);
         rightMargin = Math.max(rightMargin, xOffsetWidth + 8);
       }
       if (yMax > yMin) {
-        var yStep = chooseAxisTickStep((yMax - yMin) / approxH, cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
-        var ys = axisTickValuesForMode(yMin, yMax, yStep, cfg.y_ticks, cfg.y_mode, false, cfg.hints, approxH, cfg.dist, cfg.min_dist, cfg.max_dist);
+        var frozen2DY = cfg.__frozen_box_tick_state && cfg.__frozen_box_tick_state.y || null;
+        var yStep = frozen2DY && Number(frozen2DY.step) > 0
+          ? Number(frozen2DY.step)
+          : chooseAxisTickStep((yMax - yMin) / approxH, cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
+        var ys = frozen2DY && Array.isArray(frozen2DY.values)
+          ? frozen2DY.values.slice()
+          : axisTickValuesForMode(yMin, yMax, yStep, cfg.y_ticks, cfg.y_mode, false, cfg.hints, approxH, cfg.dist, cfg.min_dist, cfg.max_dist);
         var yOffsetValue = axisLabelOffset(ys, yMin, yMax);
         var yLabelWidth = maxEstimatedTickLabelWidthPx(ys, cfg.y_mode, yMin, yMax, yOffsetValue, yStep, fontSize);
         var yOffsetWidth = yOffsetValue ? estimateTickLabelWidthPx(formatOffsetLabel(yOffsetValue), fontSize) : 0;
@@ -4234,7 +6716,59 @@
     var top = Math.min(h - 1, Math.max(0, topMargin));
     var right = Math.max(left + 1, w - Math.max(0, rightMargin));
     var bottom = Math.max(top + 1, h - Math.max(0, bottomMargin));
+    var rawWidth = Math.max(1, right - left);
+    var rawHeight = Math.max(1, bottom - top);
+    var rotDeg = axis2DRotationDeg(cfg);
+    if (Math.abs(rotDeg) > 1e-9) {
+      var rad = rotDeg * Math.PI / 180;
+      var c = Math.abs(Math.cos(rad));
+      var s = Math.abs(Math.sin(rad));
+      var fitScale = Math.min(
+        rawWidth / Math.max(1e-6, rawWidth * c + rawHeight * s),
+        rawHeight / Math.max(1e-6, rawWidth * s + rawHeight * c)
+      );
+      if (Number.isFinite(fitScale) && fitScale > 0 && fitScale < 1) {
+        var fitWidth = rawWidth * fitScale;
+        var fitHeight = rawHeight * fitScale;
+        var cx = (left + right) * 0.5;
+        var cy = (top + bottom) * 0.5;
+        left = cx - fitWidth * 0.5;
+        right = cx + fitWidth * 0.5;
+        top = cy - fitHeight * 0.5;
+        bottom = cy + fitHeight * 0.5;
+      }
+    }
     return { left: left, top: top, right: right, bottom: bottom, width: right - left, height: bottom - top };
+  }
+
+  function freezeAxis2DBoxTickPlacement(mesh, cfg, w, h) {
+    if (!mesh || mesh.axis_box !== true || !cfg) { return; }
+    var box = axisBoxRect(Object.assign({}, mesh, { axis_ticks: Object.assign({}, cfg, { __frozen_box_tick_state: null }) }), w, h);
+    var xMin = Number(cfg.x_min);
+    var xMax = Number(cfg.x_max);
+    var yMin = Number(cfg.y_min);
+    var yMax = Number(cfg.y_max);
+    var state = {};
+    if (xMax > xMin) {
+      var xStep = chooseAxisTickStep((xMax - xMin) / Math.max(1, box.width), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
+      xStep = chooseReadableLinearTickStep(xMin, xMax, xStep, cfg.x_ticks, cfg.x_mode, cfg.hints, box.width, cfg.dist, cfg.min_dist, cfg.max_dist, cfg.tick_label_font_size);
+      state.x = {
+        step: xStep,
+        values: axisTickValuesForMode(xMin, xMax, xStep, cfg.x_ticks, cfg.x_mode, false, cfg.hints, box.width, cfg.dist, cfg.min_dist, cfg.max_dist)
+      };
+    }
+    if (yMax > yMin) {
+      var yStep = chooseAxisTickStep((yMax - yMin) / Math.max(1, box.height), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
+      state.y = {
+        step: yStep,
+        values: axisTickValuesForMode(yMin, yMax, yStep, cfg.y_ticks, cfg.y_mode, false, cfg.hints, box.height, cfg.dist, cfg.min_dist, cfg.max_dist)
+      };
+    }
+    cfg.__frozen_box_tick_state = state;
+  }
+
+  function unfreezeAxis2DBoxTickPlacement(cfg) {
+    if (cfg) { delete cfg.__frozen_box_tick_state; }
   }
 
   function drawSimple2DMarkerLineMeshes(fid, frameEl, meshes) {
@@ -4276,11 +6810,14 @@
       if (!(xMax > xMin) || !(yMax > yMin)) { return; }
       var view = axisViewport(mesh, cfg, w, h);
       if (!view) { return; }
+      var localBounds = axis2DRotatedLocalBounds(mesh, cfg, w, h);
       var vx0 = view.vx0, vx1 = view.vx1, vy0 = view.vy0, vy1 = view.vy1;
+      var xVisible = axis2DVisibleDataRangeFromLocalBounds(view, cfg, w, h, localBounds, "x");
+      var yVisible = axis2DVisibleDataRangeFromLocalBounds(view, cfg, w, h, localBounds, "y");
       var dataToX = view.dataToX;
       var dataToY = view.dataToY;
-      var yAxisPx = dataToY(0);
-      var xAxisPx = dataToX(0);
+      var yAxisPx = dataToY(axisCrosshairBaseValue(cfg, "y"));
+      var xAxisPx = dataToX(axisCrosshairBaseValue(cfg, "x"));
       var tickLen = Math.max(0, Number(cfg.len) || 7);
       var xAlign = String(cfg.x_alignment || "center").toLowerCase();
       var yAlign = String(cfg.y_alignment || "center").toLowerCase();
@@ -4291,12 +6828,12 @@
         return [-tickLen * 0.5, tickLen * 0.5];
       }
 
-      var xStep = chooseAxisTickStep((vx1 - vx0) / Math.max(1, w), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
-      xStep = chooseReadableLinearTickStep(vx0, vx1, xStep, cfg.x_ticks, cfg.x_mode, cfg.hints, w, cfg.dist, cfg.min_dist, cfg.max_dist, cfg.tick_label_font_size);
-      var yStep = chooseAxisTickStep((vy1 - vy0) / Math.max(1, h), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
-      if (yAxisPx >= -tickLen && yAxisPx <= h + tickLen && xStep > 0) {
+      var xStep = chooseAxisTickStep((xVisible[1] - xVisible[0]) / Math.max(1, localBounds.width), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
+      xStep = chooseReadableLinearTickStep(xVisible[0], xVisible[1], xStep, cfg.x_ticks, cfg.x_mode, cfg.hints, localBounds.width, cfg.dist, cfg.min_dist, cfg.max_dist, cfg.tick_label_font_size);
+      var yStep = chooseAxisTickStep((yVisible[1] - yVisible[0]) / Math.max(1, localBounds.height), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
+      if (yAxisPx >= localBounds.top - tickLen && yAxisPx <= localBounds.bottom + tickLen && xStep > 0) {
         var xo = tickOffsets(xAlign, "top", "bottom");
-        var xs = axisTickValuesNoZeroForMode(vx0, vx1, xStep, cfg.x_ticks, cfg.x_mode, true, cfg.hints, w, cfg.dist, cfg.min_dist, cfg.max_dist);
+        var xs = axisCrosshairTickValuesForMode(xVisible[0], xVisible[1], xStep, cfg.x_ticks, cfg.x_mode, cfg.hints, localBounds.width, cfg.dist, cfg.min_dist, cfg.max_dist);
         for (var xi = 0; xi < xs.length; xi += 1) {
           var xv = xs[xi];
           var xp = dataToX(xv);
@@ -4304,9 +6841,9 @@
           ctx.lineTo(xp, yAxisPx + xo[1]);
         }
       }
-      if (xAxisPx >= -tickLen && xAxisPx <= w + tickLen && yStep > 0) {
+      if (xAxisPx >= localBounds.left - tickLen && xAxisPx <= localBounds.right + tickLen && yStep > 0) {
         var yo = tickOffsets(yAlign, "left", "right");
-        var ys = axisTickValuesNoZeroForMode(vy0, vy1, yStep, cfg.y_ticks, cfg.y_mode, true, cfg.hints, h, cfg.dist, cfg.min_dist, cfg.max_dist);
+        var ys = axisCrosshairTickValuesForMode(yVisible[0], yVisible[1], yStep, cfg.y_ticks, cfg.y_mode, cfg.hints, localBounds.height, cfg.dist, cfg.min_dist, cfg.max_dist);
         for (var yi = 0; yi < ys.length; yi += 1) {
           var yv = ys[yi];
           var yp = dataToY(yv);
@@ -4319,9 +6856,17 @@
     function drawAxisBoxTicks(mesh) {
       var cfg = mesh.axis_ticks || null;
       var box = axisBoxRect(mesh, w, h);
-      var xStep = chooseAxisTickStep((Number(cfg.x_max) - Number(cfg.x_min)) / Math.max(1, box.width), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
-      xStep = chooseReadableLinearTickStep(Number(cfg.x_min), Number(cfg.x_max), xStep, cfg.x_ticks, cfg.x_mode, cfg.hints, box.width, cfg.dist, cfg.min_dist, cfg.max_dist, cfg.tick_label_font_size);
-      var yStep = chooseAxisTickStep((Number(cfg.y_max) - Number(cfg.y_min)) / Math.max(1, box.height), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
+      var frozenX = cfg.__frozen_box_tick_state && cfg.__frozen_box_tick_state.x || null;
+      var frozenY = cfg.__frozen_box_tick_state && cfg.__frozen_box_tick_state.y || null;
+      var xStep = frozenX && Number(frozenX.step) > 0
+        ? Number(frozenX.step)
+        : chooseAxisTickStep((Number(cfg.x_max) - Number(cfg.x_min)) / Math.max(1, box.width), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
+      if (!(frozenX && Number(frozenX.step) > 0)) {
+        xStep = chooseReadableLinearTickStep(Number(cfg.x_min), Number(cfg.x_max), xStep, cfg.x_ticks, cfg.x_mode, cfg.hints, box.width, cfg.dist, cfg.min_dist, cfg.max_dist, cfg.tick_label_font_size);
+      }
+      var yStep = frozenY && Number(frozenY.step) > 0
+        ? Number(frozenY.step)
+        : chooseAxisTickStep((Number(cfg.y_max) - Number(cfg.y_min)) / Math.max(1, box.height), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
       var tickLen = Math.max(0, Number(cfg.len) || 7);
       var xAlign = String(cfg.x_alignment || "center").toLowerCase();
       var yAlign = String(cfg.y_alignment || "center").toLowerCase();
@@ -4335,14 +6880,18 @@
       }
 
       var xo = tickOffsets(xAlign, "top", "bottom");
-      var xs = axisTickValuesForMode(Number(cfg.x_min), Number(cfg.x_max), xStep, cfg.x_ticks, cfg.x_mode, false, cfg.hints, box.width, cfg.dist, cfg.min_dist, cfg.max_dist);
+      var xs = frozenX && Array.isArray(frozenX.values)
+        ? frozenX.values.slice()
+        : axisTickValuesForMode(Number(cfg.x_min), Number(cfg.x_max), xStep, cfg.x_ticks, cfg.x_mode, false, cfg.hints, box.width, cfg.dist, cfg.min_dist, cfg.max_dist);
       for (var xi = 0; xi < xs.length; xi += 1) {
         var xp = dataToX(xs[xi]);
         ctx.moveTo(xp, box.bottom + xo[0]);
         ctx.lineTo(xp, box.bottom + xo[1]);
       }
       var yo = tickOffsets(yAlign, "right", "left");
-      var ys = axisTickValuesForMode(Number(cfg.y_min), Number(cfg.y_max), yStep, cfg.y_ticks, cfg.y_mode, false, cfg.hints, box.height, cfg.dist, cfg.min_dist, cfg.max_dist);
+      var ys = frozenY && Array.isArray(frozenY.values)
+        ? frozenY.values.slice()
+        : axisTickValuesForMode(Number(cfg.y_min), Number(cfg.y_max), yStep, cfg.y_ticks, cfg.y_mode, false, cfg.hints, box.height, cfg.dist, cfg.min_dist, cfg.max_dist);
       for (var yi = 0; yi < ys.length; yi += 1) {
         var yp = dataToY(ys[yi]);
         ctx.moveTo(box.left + yo[0], yp);
@@ -4359,9 +6908,12 @@
       }
       var view = axisViewport(mesh, cfg, w, h);
       if (!view) { return; }
-      var xStep = chooseAxisTickStep((view.vx1 - view.vx0) / Math.max(1, w), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
-      xStep = chooseReadableLinearTickStep(view.vx0, view.vx1, xStep, cfg.x_ticks, cfg.x_mode, cfg.hints, w, cfg.dist, cfg.min_dist, cfg.max_dist, cfg.tick_label_font_size);
-      var yStep = chooseAxisTickStep((view.vy1 - view.vy0) / Math.max(1, h), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
+      var localBounds = axis2DRotatedLocalBounds(mesh, cfg, w, h);
+      var xVisible = axis2DVisibleDataRangeFromLocalBounds(view, cfg, w, h, localBounds, "x");
+      var yVisible = axis2DVisibleDataRangeFromLocalBounds(view, cfg, w, h, localBounds, "y");
+      var xStep = chooseAxisTickStep((xVisible[1] - xVisible[0]) / Math.max(1, localBounds.width), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
+      xStep = chooseReadableLinearTickStep(xVisible[0], xVisible[1], xStep, cfg.x_ticks, cfg.x_mode, cfg.hints, localBounds.width, cfg.dist, cfg.min_dist, cfg.max_dist, cfg.tick_label_font_size);
+      var yStep = chooseAxisTickStep((yVisible[1] - yVisible[0]) / Math.max(1, localBounds.height), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
       var alpha = Math.max(0, Math.min(1, Number(cfg.grid_alpha) || 0.18));
       var gridColor = parseRuntimeColor(cfg.grid_color || mesh.color || "white");
       ctx.save();
@@ -4372,17 +6924,17 @@
         Math.max(0, Math.min(1, gridColor[3] * alpha)) + ")";
       ctx.lineWidth = Math.max(0.5, Number(cfg.grid_width) || 1);
       ctx.beginPath();
-      var xs = axisTickValuesNoZeroForMode(view.vx0, view.vx1, xStep, cfg.x_ticks, cfg.x_mode, true, cfg.hints, w, cfg.dist, cfg.min_dist, cfg.max_dist);
+      var xs = axisCrosshairTickValuesForMode(xVisible[0], xVisible[1], xStep, cfg.x_ticks, cfg.x_mode, cfg.hints, localBounds.width, cfg.dist, cfg.min_dist, cfg.max_dist);
       for (var xi = 0; xi < xs.length; xi += 1) {
         var xp = view.dataToX(xs[xi]);
-        ctx.moveTo(xp, 0);
-        ctx.lineTo(xp, h);
+        ctx.moveTo(xp, localBounds.top);
+        ctx.lineTo(xp, localBounds.bottom);
       }
-      var ys = axisTickValuesNoZeroForMode(view.vy0, view.vy1, yStep, cfg.y_ticks, cfg.y_mode, true, cfg.hints, h, cfg.dist, cfg.min_dist, cfg.max_dist);
+      var ys = axisCrosshairTickValuesForMode(yVisible[0], yVisible[1], yStep, cfg.y_ticks, cfg.y_mode, cfg.hints, localBounds.height, cfg.dist, cfg.min_dist, cfg.max_dist);
       for (var yi = 0; yi < ys.length; yi += 1) {
         var yp = view.dataToY(ys[yi]);
-        ctx.moveTo(0, yp);
-        ctx.lineTo(w, yp);
+        ctx.moveTo(localBounds.left, yp);
+        ctx.lineTo(localBounds.right, yp);
       }
       ctx.stroke();
       ctx.restore();
@@ -4392,9 +6944,17 @@
     function drawAxisBoxGrid(mesh) {
       var cfg = mesh.axis_ticks || null;
       var box = axisBoxRect(mesh, w, h);
-      var xStep = chooseAxisTickStep((Number(cfg.x_max) - Number(cfg.x_min)) / Math.max(1, box.width), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
-      xStep = chooseReadableLinearTickStep(Number(cfg.x_min), Number(cfg.x_max), xStep, cfg.x_ticks, cfg.x_mode, cfg.hints, box.width, cfg.dist, cfg.min_dist, cfg.max_dist, cfg.tick_label_font_size);
-      var yStep = chooseAxisTickStep((Number(cfg.y_max) - Number(cfg.y_min)) / Math.max(1, box.height), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
+      var frozenX = cfg.__frozen_box_tick_state && cfg.__frozen_box_tick_state.x || null;
+      var frozenY = cfg.__frozen_box_tick_state && cfg.__frozen_box_tick_state.y || null;
+      var xStep = frozenX && Number(frozenX.step) > 0
+        ? Number(frozenX.step)
+        : chooseAxisTickStep((Number(cfg.x_max) - Number(cfg.x_min)) / Math.max(1, box.width), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
+      if (!(frozenX && Number(frozenX.step) > 0)) {
+        xStep = chooseReadableLinearTickStep(Number(cfg.x_min), Number(cfg.x_max), xStep, cfg.x_ticks, cfg.x_mode, cfg.hints, box.width, cfg.dist, cfg.min_dist, cfg.max_dist, cfg.tick_label_font_size);
+      }
+      var yStep = frozenY && Number(frozenY.step) > 0
+        ? Number(frozenY.step)
+        : chooseAxisTickStep((Number(cfg.y_max) - Number(cfg.y_min)) / Math.max(1, box.height), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
       var alpha = Math.max(0, Math.min(1, Number(cfg.grid_alpha) || 0.18));
       var gridColor = parseRuntimeColor(cfg.grid_color || mesh.color || "white");
       var dataToX = function (x) { return box.left + axisValueToUnit(x, cfg.x_min, cfg.x_max, cfg.x_mode) * box.width; };
@@ -4407,13 +6967,17 @@
         Math.max(0, Math.min(1, gridColor[3] * alpha)) + ")";
       ctx.lineWidth = Math.max(0.5, Number(cfg.grid_width) || 1);
       ctx.beginPath();
-      var xs = axisTickValuesForMode(Number(cfg.x_min), Number(cfg.x_max), xStep, cfg.x_ticks, cfg.x_mode, false, cfg.hints, box.width, cfg.dist, cfg.min_dist, cfg.max_dist);
+      var xs = frozenX && Array.isArray(frozenX.values)
+        ? frozenX.values.slice()
+        : axisTickValuesForMode(Number(cfg.x_min), Number(cfg.x_max), xStep, cfg.x_ticks, cfg.x_mode, false, cfg.hints, box.width, cfg.dist, cfg.min_dist, cfg.max_dist);
       for (var xi = 0; xi < xs.length; xi += 1) {
         var xp = dataToX(xs[xi]);
         ctx.moveTo(xp, box.top);
         ctx.lineTo(xp, box.bottom);
       }
-      var ys = axisTickValuesForMode(Number(cfg.y_min), Number(cfg.y_max), yStep, cfg.y_ticks, cfg.y_mode, false, cfg.hints, box.height, cfg.dist, cfg.min_dist, cfg.max_dist);
+      var ys = frozenY && Array.isArray(frozenY.values)
+        ? frozenY.values.slice()
+        : axisTickValuesForMode(Number(cfg.y_min), Number(cfg.y_max), yStep, cfg.y_ticks, cfg.y_mode, false, cfg.hints, box.height, cfg.dist, cfg.min_dist, cfg.max_dist);
       for (var yi = 0; yi < ys.length; yi += 1) {
         var yp = dataToY(ys[yi]);
         ctx.moveTo(box.left, yp);
@@ -4438,21 +7002,25 @@
       var cfg = mesh.axis_ticks || null;
       var view = cfg ? axisViewport(mesh, cfg, w, h) : null;
       if (!view) { return false; }
-      var yAxisPx = view.dataToY(0);
-      var xAxisPx = view.dataToX(0);
-      if (yAxisPx >= 0 && yAxisPx <= h) {
-        ctx.moveTo(0, yAxisPx);
-        ctx.lineTo(w, yAxisPx);
+      var localBounds = axis2DRotatedLocalBounds(mesh, cfg, w, h);
+      var yAxisPx = view.dataToY(axisCrosshairBaseValue(cfg, "y"));
+      var xAxisPx = view.dataToX(axisCrosshairBaseValue(cfg, "x"));
+      if (yAxisPx >= localBounds.top && yAxisPx <= localBounds.bottom) {
+        ctx.moveTo(localBounds.left, yAxisPx);
+        ctx.lineTo(localBounds.right, yAxisPx);
       }
-      if (xAxisPx >= 0 && xAxisPx <= w) {
-        ctx.moveTo(xAxisPx, 0);
-        ctx.lineTo(xAxisPx, h);
+      if (xAxisPx >= localBounds.left && xAxisPx <= localBounds.right) {
+        ctx.moveTo(xAxisPx, localBounds.top);
+        ctx.lineTo(xAxisPx, localBounds.bottom);
       }
       return true;
     }
 
     for (var m = 0; m < meshes.length; m += 1) {
       var mesh = meshes[m];
+      var boundController = mesh && mesh.axis_plot2d ? findAxis2DBindController(meshes, mesh.axis_bind_id) : null;
+      var drawController = boundController || mesh;
+      var drawCfg = drawController && drawController.axis_ticks || {};
       var color = parseRuntimeColor(mesh.color || "white");
       ctx.save();
       ctx.strokeStyle = "rgba(" +
@@ -4463,17 +7031,30 @@
       ctx.lineWidth = Math.max(0.5, Number(mesh.edge_width || 1));
       ctx.lineCap = "butt";
       ctx.lineJoin = "miter";
-      drawAxisGrid(mesh, color);
+      applyAxis2DRotationTransform(ctx, drawController, drawCfg, w, h);
+      if (boundController && drawController && drawController.axis_box === true) {
+        var clipBox = axisBoxRect(drawController, w, h);
+        ctx.beginPath();
+        ctx.rect(clipBox.left, clipBox.top, clipBox.width, clipBox.height);
+        ctx.clip();
+      }
+      if (!boundController) {
+        drawAxisGrid(mesh, color);
+      }
       ctx.beginPath();
       if (!(mesh.axis_box === true && drawAxisBoxFrame(mesh)) && !(mesh.axis_full_frame === true && drawAxisFullFrameLines(mesh))) {
         for (var i = 0; i + 1 < mesh.indices.length; i += 2) {
           var ia = Number(mesh.indices[i]) || 0;
           var ib = Number(mesh.indices[i + 1]) || 0;
-          var ao = ia * 10;
-          var bo = ib * 10;
-          if (ao + 1 >= mesh.vertices.length || bo + 1 >= mesh.vertices.length) { continue; }
-          var a = toPx(mesh.vertices[ao], mesh.vertices[ao + 1], mesh.aspect);
-          var b = toPx(mesh.vertices[bo], mesh.vertices[bo + 1], mesh.aspect);
+          var a = boundController ? axis2DPlotPointPx(mesh, boundController, drawCfg, w, h, ia) : null;
+          var b = boundController ? axis2DPlotPointPx(mesh, boundController, drawCfg, w, h, ib) : null;
+          if (!a || !b) {
+            var ao = ia * 10;
+            var bo = ib * 10;
+            if (ao + 1 >= mesh.vertices.length || bo + 1 >= mesh.vertices.length) { continue; }
+            a = toPx(mesh.vertices[ao], mesh.vertices[ao + 1], mesh.aspect);
+            b = toPx(mesh.vertices[bo], mesh.vertices[bo + 1], mesh.aspect);
+          }
           if (mesh.axis_full_frame === true) {
             if (Math.abs(a[1] - b[1]) <= 1e-6) {
               a[0] = 0;
@@ -4487,7 +7068,9 @@
           ctx.lineTo(b[0], b[1]);
         }
       }
-      drawAxisTicks(mesh);
+      if (!boundController) {
+        drawAxisTicks(mesh);
+      }
       ctx.stroke();
       ctx.restore();
     }
@@ -4649,6 +7232,35 @@
     ];
   }
 
+  function clipPixelSegmentToRect(a, b, left, top, right, bottom) {
+    var ax = a[0], ay = a[1], bx = b[0], by = b[1];
+    var dx = bx - ax, dy = by - ay;
+    if (Math.abs(dx) < 1e-9 && Math.abs(dy) < 1e-9) { return null; }
+    var t0 = 0;
+    var t1 = 1;
+    function clip(p, q) {
+      if (Math.abs(p) < 1e-12) { return q >= 0; }
+      var r = q / p;
+      if (p < 0) {
+        if (r > t1) { return false; }
+        if (r > t0) { t0 = r; }
+      } else {
+        if (r < t0) { return false; }
+        if (r < t1) { t1 = r; }
+      }
+      return true;
+    }
+    if (!clip(-dx, ax - left)) { return null; }
+    if (!clip(dx, right - ax)) { return null; }
+    if (!clip(-dy, ay - top)) { return null; }
+    if (!clip(dy, bottom - ay)) { return null; }
+    if (!(t1 >= t0)) { return null; }
+    return [
+      [ax + dx * t0, ay + dy * t0],
+      [ax + dx * t1, ay + dy * t1]
+    ];
+  }
+
   function renderGeomLineOverlay(fid, frameEl, geomSpec, w, h) {
     var canvas = ensureGeomLineOverlay(frameEl, fid);
     if (!canvas) { return; }
@@ -4661,19 +7273,348 @@
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     var camera = geomSpec && geomSpec.camera || null;
     var meshes = geomSpec && Array.isArray(geomSpec.meshes) ? geomSpec.meshes : [];
-    if (geomSpec && geomSpec.axis3d_runtime && camera && Array.isArray(camera.pos) && Array.isArray(camera.target)) {
-      var cfg = geomSpec.axis3d_runtime || {};
+    var axis3DCfg = axis3DRuntimeConfig(geomSpec);
+    if (geomSpec && axis3DCfg && camera && Array.isArray(camera.pos) && Array.isArray(camera.target)) {
+      function strokeAxis3DPlotMeshProjected(mesh, projector) {
+        if (!mesh || !mesh.axis_plot3d || !Array.isArray(mesh.vertices) || !Array.isArray(mesh.indices) || typeof projector !== "function") { return; }
+        var lineColor = parseRuntimeColor(mesh.color || axis3DCfg.color || "white");
+        ctx.save();
+        ctx.strokeStyle = "rgba(" + Math.round(lineColor[0] * 255) + "," + Math.round(lineColor[1] * 255) + "," + Math.round(lineColor[2] * 255) + "," + Math.max(0, Math.min(1, lineColor[3])) + ")";
+        ctx.lineWidth = Math.max(0.5, Number(mesh.edge_width || axis3DCfg.grid_width || 1));
+        ctx.beginPath();
+        for (var pi = 0; pi + 1 < mesh.indices.length; pi += 2) {
+          var ia = (Number(mesh.indices[pi]) || 0) * 10;
+          var ib = (Number(mesh.indices[pi + 1]) || 0) * 10;
+          if (ia + 2 >= mesh.vertices.length || ib + 2 >= mesh.vertices.length) { continue; }
+          var pa = projector([mesh.vertices[ia], mesh.vertices[ia + 1], mesh.vertices[ia + 2]]);
+          var pb = projector([mesh.vertices[ib], mesh.vertices[ib + 1], mesh.vertices[ib + 2]]);
+          if (!pa || !pb) { continue; }
+          var seg = clipPixelSegmentToRect(pa, pb, 0, 0, w, h);
+          if (!seg) { continue; }
+          ctx.moveTo(seg[0][0], seg[0][1]);
+          ctx.lineTo(seg[1][0], seg[1][1]);
+        }
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      var cfg = axis3DCfg || {};
       var cam = Object.assign({}, camera, {
         viewport_width_px: w,
         viewport_height_px: h
       });
-      var target = [0, 0, 0];
+      var target = [
+        axisCrosshairBaseValue(cfg, "x"),
+        axisCrosshairBaseValue(cfg, "y"),
+        axisCrosshairBaseValue(cfg, "z")
+      ];
       var p0 = projectWorldToPixel(cam, w, h, target);
       var rec3 = frameRecs[String(fid)] || null;
       var color3 = parseRuntimeColor(cfg.color || "white");
-      if (p0) {
+      if (String(cfg.mode || "crosshair").toLowerCase() === "box") {
         ctx.save();
         ctx.strokeStyle = "rgba(" + Math.round(color3[0] * 255) + "," + Math.round(color3[1] * 255) + "," + Math.round(color3[2] * 255) + "," + Math.max(0, Math.min(1, color3[3])) + ")";
+        ctx.fillStyle = ctx.strokeStyle;
+        ctx.lineWidth = Math.max(0.5, Number(cfg.width || (meshes[0] && meshes[0].edge_width) || 1));
+        var xMin = Number(cfg.x_min);
+        var xMax = Number(cfg.x_max);
+        var yMin = Number(cfg.y_min);
+        var yMax = Number(cfg.y_max);
+        var zMin = Number(cfg.z_min);
+        var zMax = Number(cfg.z_max);
+        if ([xMin, xMax, yMin, yMax, zMin, zMax].every(Number.isFinite)) {
+          var boxCorners = [
+            [xMin, yMin, zMin], [xMax, yMin, zMin], [xMin, yMax, zMin], [xMax, yMax, zMin],
+            [xMin, yMin, zMax], [xMax, yMin, zMax], [xMin, yMax, zMax], [xMax, yMax, zMax]
+          ];
+          var rawBoxPixels = boxCorners.map(function (p) { return projectWorldToPixel(cam, w, h, axis3DBoxAspectPoint(cfg, p)); });
+          var finiteBoxPixels = rawBoxPixels.filter(function (p) {
+            return p && Number.isFinite(p[0]) && Number.isFinite(p[1]);
+          });
+          if (finiteBoxPixels.length < 2) {
+            ctx.restore();
+            return;
+          }
+          var rawMinX = finiteBoxPixels[0][0];
+          var rawMaxX = finiteBoxPixels[0][0];
+          var rawMinY = finiteBoxPixels[0][1];
+          var rawMaxY = finiteBoxPixels[0][1];
+          for (var bp = 1; bp < finiteBoxPixels.length; bp += 1) {
+            rawMinX = Math.min(rawMinX, finiteBoxPixels[bp][0]);
+            rawMaxX = Math.max(rawMaxX, finiteBoxPixels[bp][0]);
+            rawMinY = Math.min(rawMinY, finiteBoxPixels[bp][1]);
+            rawMaxY = Math.max(rawMaxY, finiteBoxPixels[bp][1]);
+          }
+          var rawCx = (rawMinX + rawMaxX) * 0.5;
+          var rawCy = (rawMinY + rawMaxY) * 0.5;
+          var rawW = Math.max(1e-6, rawMaxX - rawMinX);
+          var rawH = Math.max(1e-6, rawMaxY - rawMinY);
+          var fitMargin = Math.max(24, Number(cfg.fit_margin_px) || 48);
+          var fitW = Math.max(1, w - 2 * fitMargin);
+          var fitH = Math.max(1, h - 2 * fitMargin);
+          var fitScale = Math.min(fitW / rawW, fitH / rawH);
+          if (!Number.isFinite(fitScale) || !(fitScale > 0)) { fitScale = 1; }
+          function fitBoxPixel(p) {
+            if (!p) { return null; }
+            return [
+              (w * 0.5) + (p[0] - rawCx) * fitScale,
+              (h * 0.5) + (p[1] - rawCy) * fitScale
+            ];
+          }
+          function projectBoxPoint(p) {
+            return fitBoxPixel(projectWorldToPixel(cam, w, h, axis3DBoxAspectPoint(cfg, p)));
+          }
+          var boxPixels = rawBoxPixels.map(fitBoxPixel);
+          var boxEdges = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 4], [1, 5], [2, 6], [3, 7]];
+          function strokeBoxSegment(a, b) {
+            var pa = projectBoxPoint(a);
+            var pb = projectBoxPoint(b);
+            if (!pa || !pb) { return; }
+            var clippedSeg = clipPixelSegmentToRect(pa, pb, 0, 0, w, h);
+            if (!clippedSeg) { return; }
+            ctx.moveTo(clippedSeg[0][0], clippedSeg[0][1]);
+            ctx.lineTo(clippedSeg[1][0], clippedSeg[1][1]);
+          }
+          ctx.beginPath();
+          for (var be = 0; be < boxEdges.length; be += 1) {
+            var ep = boxEdges[be];
+            var ea = boxPixels[ep[0]];
+            var eb = boxPixels[ep[1]];
+            if (!ea || !eb) { continue; }
+            var ec = clipPixelSegmentToRect(ea, eb, 0, 0, w, h);
+            if (!ec) { continue; }
+            ctx.moveTo(ec[0][0], ec[0][1]);
+            ctx.lineTo(ec[1][0], ec[1][1]);
+          }
+          ctx.stroke();
+
+          var boxTextSpecs = [];
+          function boxTickText(v, axisName, lo, hi) {
+            var mode = String(cfg[axisName + "_mode"] || cfg[axisName + "_tick_mode"] || "linear").toLowerCase();
+            if (isLogTickMode(mode)) {
+              return axisTickLabelForMode(v, mode, Math.min(lo, hi), Math.max(lo, hi));
+            }
+            var s = Math.abs(v) < 1e-10 ? "0" : Number(v).toPrecision(12).replace(/\.?0+$/, "");
+            return "$" + s + "$";
+          }
+          function boxEdgeInfo(axisIndex, a, b) {
+            var pa = projectBoxPoint(a);
+            var pb = projectBoxPoint(b);
+            if (!pa || !pb) { return null; }
+            var dx = pb[0] - pa[0];
+            var dy = pb[1] - pa[1];
+            var len = Math.sqrt(dx * dx + dy * dy);
+            var lo = Number(a[axisIndex]);
+            var hi = Number(b[axisIndex]);
+            var span = Math.abs(hi - lo);
+            if (!(span > 1e-12)) { return null; }
+            return { axisIndex: axisIndex, pa: pa, pb: pb, len: len, ux: len > 1e-6 ? dx / len : 0, uy: len > 1e-6 ? dy / len : -1, lo: lo, hi: hi, span: span };
+          }
+          function drawCollapsedAxisMarker(info) {
+            if (!info || info.len > 3) { return; }
+            var r = Math.max(4, Number(cfg.tick_len_px) || 7);
+            var pos = vec3Array(cam && cam.pos, [0, 0, 1]);
+            var tgt = vec3Array(cam && cam.target, [0, 0, 0]);
+            var forward = normalizeVec3Local([tgt[0] - pos[0], tgt[1] - pos[1], tgt[2] - pos[2]], [0, 0, -1]);
+            var basis = info.axisIndex === 0 ? [1, 0, 0] : info.axisIndex === 1 ? [0, 1, 0] : [0, 0, 1];
+            var positiveAway = dot3(basis, forward) > 0;
+            ctx.beginPath();
+            ctx.arc(info.pa[0], info.pa[1], r, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.beginPath();
+            if (positiveAway) {
+              var cr = Math.max(2.2, r * 0.48);
+              ctx.moveTo(info.pa[0] - cr, info.pa[1] - cr);
+              ctx.lineTo(info.pa[0] + cr, info.pa[1] + cr);
+              ctx.moveTo(info.pa[0] + cr, info.pa[1] - cr);
+              ctx.lineTo(info.pa[0] - cr, info.pa[1] + cr);
+              ctx.stroke();
+            } else {
+              ctx.arc(info.pa[0], info.pa[1], Math.max(1.5, r * 0.28), 0, Math.PI * 2);
+              ctx.fill();
+            }
+          }
+          var boxTickCache = {};
+          function getBoxTickInfo(axisName, axisIndex, a, b) {
+            if (boxTickCache[axisName]) { return boxTickCache[axisName]; }
+            var info = boxEdgeInfo(axisIndex, a, b);
+            if (!info || info.len <= 3) {
+              boxTickCache[axisName] = { info: info, values: [], collapsed: !!info };
+              return boxTickCache[axisName];
+            }
+            var frozenValues = axis3DBoxFrozenTickValues(cfg, axisName);
+            if (frozenValues) {
+              boxTickCache[axisName] = {
+                info: info,
+                step: 0,
+                values: frozenValues,
+                collapsed: false
+              };
+              return boxTickCache[axisName];
+            }
+            var hints = Array.isArray(cfg.tick_hints) && cfg.tick_hints.length ? cfg.tick_hints : [1, 2, 5];
+            var mode = String(cfg[axisName + "_mode"] || cfg[axisName + "_tick_mode"] || "linear").toLowerCase();
+            var dataPerPixel = info.span / Math.max(1, info.len);
+            var step = chooseAxisTickStep(
+              dataPerPixel,
+              Number(cfg.tick_dist) || 120,
+              hints,
+              Number(cfg.min_tick_dist) || 72,
+              Number(cfg.max_tick_dist) || 180
+            );
+            if (!isLogTickMode(mode)) {
+              step = chooseReadableLinearTickStep(
+                Math.min(info.lo, info.hi),
+                Math.max(info.lo, info.hi),
+                step,
+                null,
+                "linear",
+                hints,
+                Math.max(1, info.len),
+                Number(cfg.tick_dist) || 120,
+                Number(cfg.min_tick_dist) || 72,
+                Number(cfg.max_tick_dist) || 180,
+                Number(cfg.tick_label_font_size) || 11
+              );
+            }
+            boxTickCache[axisName] = {
+              info: info,
+              step: step,
+              values: axisTickValuesForMode(
+                Math.min(info.lo, info.hi),
+                Math.max(info.lo, info.hi),
+                step,
+                null,
+                mode,
+                false,
+                hints,
+                Math.max(1, info.len),
+                Number(cfg.tick_dist) || 120,
+                Number(cfg.min_tick_dist) || 72,
+                Number(cfg.max_tick_dist) || 180
+              ),
+              collapsed: false
+            };
+            return boxTickCache[axisName];
+          }
+          function drawBoxGridFromTicks() {
+            if (cfg.grid !== true) { return; }
+            function faceGridValues(axisName, axisIndex, a, b, lo, hi) {
+              var values = getBoxTickInfo(axisName, axisIndex, a, b).values.slice();
+              values.push(lo, hi);
+              values = values
+                .map(function (v) { return Number(v); })
+                .filter(function (v) { return Number.isFinite(v) && v >= Math.min(lo, hi) - 1e-9 && v <= Math.max(lo, hi) + 1e-9; })
+                .sort(function (a2, b2) { return a2 - b2; });
+              var out = [];
+              for (var vi = 0; vi < values.length; vi += 1) {
+                if (!out.length || Math.abs(values[vi] - out[out.length - 1]) > 1e-9) { out.push(values[vi]); }
+              }
+              return out;
+            }
+            var xTicks = faceGridValues("x", 0, [xMin, yMin, zMin], [xMax, yMin, zMin], xMin, xMax);
+            var yTicks = faceGridValues("y", 1, [xMin, yMin, zMin], [xMin, yMax, zMin], yMin, yMax);
+            var zTicks = faceGridValues("z", 2, [xMin, yMin, zMin], [xMin, yMin, zMax], zMin, zMax);
+            var alpha = Math.max(0, Math.min(1, Number(cfg.grid_alpha) || 0.16));
+            ctx.save();
+            ctx.strokeStyle = "rgba(" + Math.round(color3[0] * 255) + "," + Math.round(color3[1] * 255) + "," + Math.round(color3[2] * 255) + "," + alpha + ")";
+            ctx.lineWidth = Math.max(0.5, Number(cfg.grid_width) || 1);
+            ctx.beginPath();
+            for (var zFace = 0; zFace < 2; zFace += 1) {
+              var zPlane = zFace === 0 ? zMin : zMax;
+              for (var yi = 0; yi < yTicks.length; yi += 1) {
+                strokeBoxSegment([xMin, Number(yTicks[yi]), zPlane], [xMax, Number(yTicks[yi]), zPlane]);
+              }
+              for (var xi = 0; xi < xTicks.length; xi += 1) {
+                strokeBoxSegment([Number(xTicks[xi]), yMin, zPlane], [Number(xTicks[xi]), yMax, zPlane]);
+              }
+            }
+            for (var yFace = 0; yFace < 2; yFace += 1) {
+              var yPlane = yFace === 0 ? yMin : yMax;
+              for (var zi = 0; zi < zTicks.length; zi += 1) {
+                strokeBoxSegment([xMin, yPlane, Number(zTicks[zi])], [xMax, yPlane, Number(zTicks[zi])]);
+              }
+              for (var xj = 0; xj < xTicks.length; xj += 1) {
+                strokeBoxSegment([Number(xTicks[xj]), yPlane, zMin], [Number(xTicks[xj]), yPlane, zMax]);
+              }
+            }
+            for (var xFace = 0; xFace < 2; xFace += 1) {
+              var xPlane = xFace === 0 ? xMin : xMax;
+              for (var zk = 0; zk < zTicks.length; zk += 1) {
+                strokeBoxSegment([xPlane, yMin, Number(zTicks[zk])], [xPlane, yMax, Number(zTicks[zk])]);
+              }
+              for (var yj = 0; yj < yTicks.length; yj += 1) {
+                strokeBoxSegment([xPlane, Number(yTicks[yj]), zMin], [xPlane, Number(yTicks[yj]), zMax]);
+              }
+            }
+            ctx.stroke();
+            ctx.restore();
+          }
+          function drawBoxTicks(axisName, axisIndex, a, b) {
+            if (cfg.ticks === false) { return; }
+            var tickInfo = getBoxTickInfo(axisName, axisIndex, a, b);
+            var info = tickInfo.info;
+            if (!info) { return; }
+            if (info.len <= 3) {
+              drawCollapsedAxisMarker(info);
+              return;
+            }
+            var values = tickInfo.values;
+            var tickLenPx = Math.max(3, Number(cfg.tick_len_px) || 7);
+            var nx = -info.uy;
+            var ny = info.ux;
+            var align = String(cfg[axisName + "_tick_alignment"] || "negative").toLowerCase();
+            var side = align === "positive" ? 1 : align === "center" || align === "centre" ? 0 : -1;
+            ctx.beginPath();
+            for (var vi = 0; vi < values.length; vi += 1) {
+              var v = Number(values[vi]);
+              var mode = String(cfg[axisName + "_mode"] || cfg[axisName + "_tick_mode"] || "linear").toLowerCase();
+              var t = axisValueToUnit(v, info.lo, info.hi, mode);
+              if (!Number.isFinite(t) || t < -1e-8 || t > 1 + 1e-8) { continue; }
+              var px = info.pa[0] + (info.pb[0] - info.pa[0]) * t;
+              var py = info.pa[1] + (info.pb[1] - info.pa[1]) * t;
+              if (side === 0) {
+                ctx.moveTo(px - nx * tickLenPx * 0.5, py - ny * tickLenPx * 0.5);
+                ctx.lineTo(px + nx * tickLenPx * 0.5, py + ny * tickLenPx * 0.5);
+                boxTextSpecs.push({ pixel: true, x: px + nx * (tickLenPx * 0.5 + 5), y: py + ny * (tickLenPx * 0.5 + 5), text: boxTickText(v, axisName, info.lo, info.hi), font_size: Number(cfg.tick_label_font_size) || 11, ha: "center", va: "center", color: cfg.color || "white" });
+              } else {
+                ctx.moveTo(px, py);
+                ctx.lineTo(px + nx * tickLenPx * side, py + ny * tickLenPx * side);
+                boxTextSpecs.push({ pixel: true, x: px + nx * side * (tickLenPx + 5), y: py + ny * side * (tickLenPx + 5), text: boxTickText(v, axisName, info.lo, info.hi), font_size: Number(cfg.tick_label_font_size) || 11, ha: "center", va: "center", color: cfg.color || "white" });
+              }
+            }
+            ctx.stroke();
+            var label = cfg[axisName + "_label"] || "";
+            if (label) {
+              var labelPad = Math.max(10, Number(cfg.label_offset_px) || 28);
+              boxTextSpecs.push({ pixel: true, x: info.pb[0] + nx * side * labelPad, y: info.pb[1] + ny * side * labelPad, text: label, font_size: Number(cfg.label_font_size) || 14, ha: "center", va: "center", color: cfg.color || "white" });
+            }
+          }
+          drawBoxGridFromTicks();
+          drawBoxTicks("x", 0, [xMin, yMin, zMin], [xMax, yMin, zMin]);
+          drawBoxTicks("y", 1, [xMin, yMin, zMin], [xMin, yMax, zMin]);
+          drawBoxTicks("z", 2, [xMin, yMin, zMin], [xMin, yMin, zMax]);
+          for (var boxMeshIndex = 0; boxMeshIndex < meshes.length; boxMeshIndex += 1) {
+            if (meshes[boxMeshIndex] && meshes[boxMeshIndex].axis_plot3d) {
+              strokeAxis3DPlotMeshProjected(meshes[boxMeshIndex], projectBoxPoint);
+            }
+          }
+          geomSpec.texts = boxTextSpecs;
+        }
+        ctx.restore();
+      } else
+      if (p0) {
+        if (!rec3) {
+          rec3 = frameRecs[String(fid)] = frameRecs[String(fid)] || { entries: [] };
+        }
+        var rawOrientation = axis3DCrosshairCollapsedMarkerState(cam);
+        var snapState = axis3DCrosshairSnapState(rawOrientation, rec3.axis3DHelperSnappedOrientation || null, cfg);
+        rec3.axis3DHelperRawOrientation = snapState.raw;
+        rec3.axis3DHelperSnappedOrientation = snapState.snapped;
+        rec3.axis3DHelperSnapState = snapState;
+        ctx.save();
+        ctx.strokeStyle = "rgba(" + Math.round(color3[0] * 255) + "," + Math.round(color3[1] * 255) + "," + Math.round(color3[2] * 255) + "," + Math.max(0, Math.min(1, color3[3])) + ")";
+        ctx.fillStyle = ctx.strokeStyle;
         ctx.lineWidth = Math.max(0.5, Number(cfg.width || (meshes[0] && meshes[0].edge_width) || 1));
         ctx.beginPath();
         var reach = Math.max(w, h) * 4.0;
@@ -4705,69 +7646,210 @@
             centerValue: Number(target[axisIndex]) || 0
           };
         }
-        function drawAxisLine(axisIndex) {
-          var info = axisLineInfo(axisIndex);
-          axisInfos[axisIndex] = info;
-          if (!info) { return; }
-          var clipped = info.clipped;
+        for (var axisLineIndex = 0; axisLineIndex < 3; axisLineIndex += 1) {
+          axisInfos[axisLineIndex] = axisLineInfo(axisLineIndex);
+        }
+        var projectedSnapState = axis3DProjectedAxisSnapState(axisInfos, rec3.axis3DProjectedRawAngles || null, cfg);
+        rec3.axis3DProjectedRawAngles = projectedSnapState.rawAngles;
+        rec3.axis3DProjectedSnapState = projectedSnapState;
+        for (var axisDrawIndex = 0; axisDrawIndex < 3; axisDrawIndex += 1) {
+          var drawInfo = axisInfos[axisDrawIndex];
+          if (!drawInfo) { continue; }
+          if (snapState.snapped && snapState.snapped.axisIndex === axisDrawIndex) { continue; }
+          if (projectedSnapState.hiddenAxes[axisDrawIndex] != null) { continue; }
+          var clipped = drawInfo.clipped;
           ctx.moveTo(clipped[0][0], clipped[0][1]);
           ctx.lineTo(clipped[1][0], clipped[1][1]);
         }
-        drawAxisLine(0);
-        drawAxisLine(1);
-        drawAxisLine(2);
         ctx.stroke();
+        if (snapState.snapped) {
+          drawAxisCollapsedMarker(ctx, cfg, p0[0], p0[1], snapState.snapped, color3);
+        }
         if (cfg.ticks !== false) {
-          var recKey = cameraRevisionKey(Object.assign({}, cam, { target: [0, 0, 0] })) + ":w" + w + ":h" + h;
-          if (!rec3) {
-            rec3 = frameRecs[String(fid)] = frameRecs[String(fid)] || { entries: [] };
+          var stepAxes = axis3DCrosshairTickSteps(fid, cfg, cam, target, axisInfos, w, h, rec3);
+          var tickAxes = [];
+          var tickHints3D = Array.isArray(cfg.tick_hints) && cfg.tick_hints.length ? cfg.tick_hints : [1, 2, 5];
+          for (var ai = 0; ai < axisInfos.length; ai += 1) {
+            var infoForTicks = axisInfos[ai];
+            var cachedStep = stepAxes[ai] || { step: 1, mode: "linear" };
+            if (!infoForTicks) { tickAxes[ai] = { step: cachedStep.step, mode: cachedStep.mode, values: [] }; continue; }
+            var c0 = infoForTicks.clipped[0];
+            var c1 = infoForTicks.clipped[1];
+            var d0 = (((c0[0] - p0[0]) * infoForTicks.ux) + ((c0[1] - p0[1]) * infoForTicks.uy)) / infoForTicks.len;
+            var d1 = (((c1[0] - p0[0]) * infoForTicks.ux) + ((c1[1] - p0[1]) * infoForTicks.uy)) / infoForTicks.len;
+            var lo = infoForTicks.centerValue + Math.min(d0, d1);
+            var hi = infoForTicks.centerValue + Math.max(d0, d1);
+            var pixelSpan = Math.sqrt(Math.pow(c1[0] - c0[0], 2) + Math.pow(c1[1] - c0[1], 2));
+            var step = cachedStep.step;
+            var tickMode = String(cachedStep.mode || "linear").toLowerCase();
+            tickAxes[ai] = {
+              step: step,
+              lo: lo,
+              hi: hi,
+              mode: tickMode,
+              values: isLogTickMode(tickMode)
+                ? axisCrosshairLogTickCoords(lo, hi, step, tickHints3D, pixelSpan, Number(cfg.tick_dist) || 120, Number(cfg.min_tick_dist) || 72, Number(cfg.max_tick_dist) || 180, infoForTicks.centerValue)
+                : axis3DZeroAnchoredTickValues(lo, hi, step)
+            };
           }
-          if (!rec3.axis3DHelperTickCache || rec3.axis3DHelperTickCache.key !== recKey) {
-            var tickAxes = [];
-            for (var ai = 0; ai < axisInfos.length; ai += 1) {
-              var infoForTicks = axisInfos[ai];
-              if (!infoForTicks) { tickAxes[ai] = { step: 1 }; continue; }
-              var c0 = infoForTicks.clipped[0];
-              var c1 = infoForTicks.clipped[1];
-              var d0 = (((c0[0] - p0[0]) * infoForTicks.ux) + ((c0[1] - p0[1]) * infoForTicks.uy)) / infoForTicks.len;
-              var d1 = (((c1[0] - p0[0]) * infoForTicks.ux) + ((c1[1] - p0[1]) * infoForTicks.uy)) / infoForTicks.len;
-              var lo = infoForTicks.centerValue + Math.min(d0, d1);
-              var hi = infoForTicks.centerValue + Math.max(d0, d1);
-              var pixelSpan = Math.sqrt(Math.pow(c1[0] - c0[0], 2) + Math.pow(c1[1] - c0[1], 2));
-              var dataPerPixel = 1 / Math.max(1e-9, infoForTicks.len);
-              var hints = Array.isArray(cfg.tick_hints) && cfg.tick_hints.length ? cfg.tick_hints : [1, 2, 5];
-              var step = chooseAxisTickStep(
-                dataPerPixel,
-                Number(cfg.tick_dist) || 120,
-                hints,
-                Number(cfg.min_tick_dist) || 72,
-                Number(cfg.max_tick_dist) || 180
-              );
-              step = chooseReadableLinearTickStep(
-                lo,
-                hi,
-                step,
-                null,
-                "linear",
-                hints,
-                pixelSpan,
-                Number(cfg.tick_dist) || 120,
-                Number(cfg.min_tick_dist) || 72,
-                Number(cfg.max_tick_dist) || 180,
-                Number(cfg.tick_label_font_size) || 11
-              );
-              tickAxes[ai] = { step: step };
+          rec3.axis3DHelperTickCache = { key: "visible", axes: tickAxes };
+          if (cfg.grid === true) {
+            ctx.save();
+            ctx.strokeStyle = "rgba(" + Math.round(color3[0] * 255) + "," + Math.round(color3[1] * 255) + "," + Math.round(color3[2] * 255) + "," + Math.max(0, Math.min(1, Number(cfg.grid_alpha) || 0.16)) + ")";
+            ctx.lineWidth = Math.max(0.5, Number(cfg.grid_width) || 1);
+            ctx.beginPath();
+            var cachedAxes = rec3.axis3DHelperTickCache && rec3.axis3DHelperTickCache.axes ? rec3.axis3DHelperTickCache.axes : [];
+            function cachedTickValues(axisIndex) {
+              return cachedAxes[axisIndex] && Array.isArray(cachedAxes[axisIndex].values)
+                ? cachedAxes[axisIndex].values
+                : [];
             }
-            rec3.axis3DHelperTickCache = { key: recKey, axes: tickAxes };
+            function cachedTickCoord(tick) {
+              if (tick && typeof tick === "object") { return Number(tick.coord); }
+              return Number(tick);
+            }
+            function drawCrosshairGridLine(lineAxis, fixedA, fixedB, sourceAxis) {
+              if (
+                snapState.hiddenAxisIndex === lineAxis ||
+                snapState.hiddenAxisIndex === sourceAxis ||
+                projectedSnapState.hiddenAxes[lineAxis] != null ||
+                projectedSnapState.hiddenAxes[sourceAxis] != null
+              ) { return; }
+              var lineInfo = axisInfos[lineAxis];
+              if (!lineInfo) { return; }
+              var p = target.slice();
+              var axes = [0, 1, 2].filter(function (axisIndex) { return axisIndex !== lineAxis; });
+              p[axes[0]] = fixedA;
+              p[axes[1]] = fixedB;
+              var pGrid = projectWorldToPixel(cam, w, h, p);
+              if (!pGrid) { return; }
+              var gridClip = clipPixelLineToRect(
+                [pGrid[0] - lineInfo.ux * reach, pGrid[1] - lineInfo.uy * reach],
+                [pGrid[0] + lineInfo.ux * reach, pGrid[1] + lineInfo.uy * reach],
+                0,
+                0,
+                w,
+                h
+              );
+              if (!gridClip) { return; }
+              ctx.moveTo(gridClip[0][0], gridClip[0][1]);
+              ctx.lineTo(gridClip[1][0], gridClip[1][1]);
+            }
+            var xTickGrid = cachedTickValues(0);
+            var yTickGrid = cachedTickValues(1);
+            var zTickGrid = cachedTickValues(2);
+            var xPlaneBase = target[0];
+            var yPlaneBase = target[1];
+            var zPlaneBase = target[2];
+            for (var gyx = 0; gyx < yTickGrid.length; gyx += 1) {
+              drawCrosshairGridLine(0, cachedTickCoord(yTickGrid[gyx]), zPlaneBase, 1);
+            }
+            for (var gxy = 0; gxy < xTickGrid.length; gxy += 1) {
+              drawCrosshairGridLine(1, cachedTickCoord(xTickGrid[gxy]), zPlaneBase, 0);
+            }
+            for (var gzx = 0; gzx < zTickGrid.length; gzx += 1) {
+              drawCrosshairGridLine(0, yPlaneBase, cachedTickCoord(zTickGrid[gzx]), 2);
+            }
+            for (var gxz = 0; gxz < xTickGrid.length; gxz += 1) {
+              drawCrosshairGridLine(2, cachedTickCoord(xTickGrid[gxz]), yPlaneBase, 0);
+            }
+            for (var gzy = 0; gzy < zTickGrid.length; gzy += 1) {
+              drawCrosshairGridLine(1, xPlaneBase, cachedTickCoord(zTickGrid[gzy]), 2);
+            }
+            for (var gyz = 0; gyz < yTickGrid.length; gyz += 1) {
+              drawCrosshairGridLine(2, xPlaneBase, cachedTickCoord(yTickGrid[gyz]), 1);
+            }
+            ctx.stroke();
+            ctx.restore();
           }
           var tickLenPx = Math.max(3, Number(cfg.tick_len_px) || 7);
           var tickLabelSpecs = [];
-          function tickLabelText(v) {
+          var axisNameLabelSpecs = [];
+          var baseAxis3DTexts = Array.isArray(geomSpec.__axis3d_base_texts)
+            ? geomSpec.__axis3d_base_texts.slice()
+            : (Array.isArray(geomSpec.texts) ? geomSpec.texts.slice() : []);
+          geomSpec.__axis3d_base_texts = baseAxis3DTexts.slice();
+          var preservedAxis3DTexts = baseAxis3DTexts.filter(function (item) {
+            return !(item && item.world === true && item.edge_anchor === true);
+          });
+          function axis3DNameLabelText(axisIndex) {
+            var key = axisIndex === 0 ? "x_label" : axisIndex === 1 ? "y_label" : "z_label";
+            var value = cfg[key];
+            if (value == null || value === false) { return ""; }
+            var text = String(value);
+            return text && text !== "true" ? text : "";
+          }
+          function axis3DNameLabelSpec(axisIndex) {
+            if (snapState.hiddenAxisIndex === axisIndex || projectedSnapState.hiddenAxes[axisIndex] != null) { return null; }
+            var labelText = axis3DNameLabelText(axisIndex);
+            if (!labelText) { return null; }
+            var info = axisInfos[axisIndex];
+            if (!info || !Array.isArray(info.clipped) || info.clipped.length < 2) { return null; }
+            var axisBoundaryPoint = info.clipped[1];
+            var labelFramePad = Math.max(0, Number(cfg.label_frame_pad) || 28);
+            var labelAxisPad = Math.max(0, Number(cfg.label_axis_pad) || 28);
+            var alignKey = axisIndex === 0 ? "x_tick_alignment" : axisIndex === 1 ? "y_tick_alignment" : "z_tick_alignment";
+            var align = String(cfg[alignKey] || "negative").toLowerCase();
+            var side = align === "positive" ? 1 : align === "center" || align === "centre" ? 0 : -1;
+            if (side === 0) { side = -1; }
+            var normalDx = -info.uy * side * labelAxisPad;
+            var normalDy = info.ux * side * labelAxisPad;
+            var boundaryInfo = axis2DBoundaryAnchorInfo(axisBoundaryPoint[0], axisBoundaryPoint[1], p0[0], p0[1], labelFramePad, w, h);
+            var preferredNormalPoint = [
+              axisBoundaryPoint[0] + normalDx,
+              axisBoundaryPoint[1] + normalDy
+            ];
+            var solved = axis2DPlaceBoundaryHorizontalLabel(
+              {
+                text: labelText,
+                font_size: Number(cfg.label_font_size) || 13,
+                boundary_inset_px: labelFramePad,
+                axis_gap_px: labelAxisPad
+              },
+              p0,
+              boundaryInfo && boundaryInfo.point ? boundaryInfo.point : axisBoundaryPoint,
+              axisBoundaryPoint,
+              preferredNormalPoint,
+              preferredNormalPoint,
+              boundaryInfo,
+              w,
+              h
+            );
+            if (!solved) { return null; }
+            return {
+              pixel: true,
+              keep_horizontal: true,
+              x: solved.x,
+              y: solved.y,
+              text: labelText,
+              font_size: Number(cfg.label_font_size) || 13,
+              ha: solved.ha || "center",
+              va: solved.va || "center",
+              color: cfg.color || "white"
+            };
+          }
+          for (var axisLabelIndex = 0; axisLabelIndex < 3; axisLabelIndex += 1) {
+            var axisNameLabel = axis3DNameLabelSpec(axisLabelIndex);
+            if (axisNameLabel) { axisNameLabelSpecs.push(axisNameLabel); }
+          }
+          for (var crosshairMeshIndex = 0; crosshairMeshIndex < meshes.length; crosshairMeshIndex += 1) {
+            if (meshes[crosshairMeshIndex] && meshes[crosshairMeshIndex].axis_plot3d) {
+              strokeAxis3DPlotMeshProjected(meshes[crosshairMeshIndex], function (p) { return projectWorldToPixel(cam, w, h, p); });
+            }
+          }
+          function tickLabelText(v, mode, lo, hi) {
+            if (isLogTickMode(mode)) {
+              var lv = Math.max(Number.MIN_VALUE, Number(v) || Number.MIN_VALUE);
+              var l0 = Number(lo) > 0 ? Number(lo) : lv / 1000;
+              var l1 = Number(hi) > l0 ? Number(hi) : lv * 1000;
+              return axisTickLabelForMode(lv, mode, l0, l1);
+            }
             var s = Math.abs(v) < 1e-10 ? "0" : Number(v).toPrecision(12).replace(/\.?0+$/, "");
             return "$" + s + "$";
           }
           ctx.beginPath();
           for (var ti = 0; ti < axisInfos.length; ti += 1) {
+            if (snapState.hiddenAxisIndex === ti || projectedSnapState.hiddenAxes[ti] != null) { continue; }
             var tickInfo = axisInfos[ti];
             var tickAxis = rec3.axis3DHelperTickCache && rec3.axis3DHelperTickCache.axes ? rec3.axis3DHelperTickCache.axes[ti] : null;
             if (!tickInfo || !tickAxis || !(Number(tickAxis.step) > 0)) { continue; }
@@ -4777,49 +7859,60 @@
             var td1 = (((tc1[0] - p0[0]) * tickInfo.ux) + ((tc1[1] - p0[1]) * tickInfo.uy)) / tickInfo.len;
             var tlo = tickInfo.centerValue + Math.min(td0, td1);
             var thi = tickInfo.centerValue + Math.max(td0, td1);
-            var tickValues = axis3DZeroAnchoredTickValues(tlo, thi, tickAxis.step).filter(function (v) { return Math.abs(v) > 1e-10; });
+            var tickMode2 = String(tickAxis.mode || "linear").toLowerCase();
+            var tickValues = (Array.isArray(tickAxis.values) ? tickAxis.values : axis3DZeroAnchoredTickValues(tlo, thi, tickAxis.step)).filter(function (v) {
+              if (isLogTickMode(tickMode2)) { return true; }
+              return Math.abs(v) > 1e-10;
+            });
             var nx = -tickInfo.uy;
             var ny = tickInfo.ux;
             var alignKey = ti === 0 ? "x_tick_alignment" : ti === 1 ? "y_tick_alignment" : "z_tick_alignment";
             var align = String(cfg[alignKey] || "negative").toLowerCase();
             var side = align === "positive" ? 1 : align === "center" || align === "centre" ? 0 : -1;
             for (var vi = 0; vi < tickValues.length; vi += 1) {
-              var v = Number(tickValues[vi]);
-              var scalar = (v - tickInfo.centerValue) * tickInfo.len;
-              var px = p0[0] + tickInfo.ux * scalar;
-              var py = p0[1] + tickInfo.uy * scalar;
+              var rawTick = tickValues[vi];
+              var coord = rawTick && typeof rawTick === "object" ? Number(rawTick.coord) : Number(rawTick);
+              var labelValue = rawTick && typeof rawTick === "object" ? Number(rawTick.value) : coord;
+              var tAxis = isLogTickMode(tickMode2)
+                ? (coord - tlo) / Math.max(1e-12, thi - tlo)
+                : axisValueToUnit(coord, tlo, thi, tickMode2);
+              if (!Number.isFinite(tAxis)) { continue; }
+              var px = tc0[0] + (tc1[0] - tc0[0]) * tAxis;
+              var py = tc0[1] + (tc1[1] - tc0[1]) * tAxis;
               if (px < -tickLenPx || px > w + tickLenPx || py < -tickLenPx || py > h + tickLenPx) { continue; }
               if (side === 0) {
                 ctx.moveTo(px - nx * tickLenPx * 0.5, py - ny * tickLenPx * 0.5);
                 ctx.lineTo(px + nx * tickLenPx * 0.5, py + ny * tickLenPx * 0.5);
+                var centeredAnchor = axisTextAnchorFromAxisOffset(nx * (tickLenPx * 0.5 + 5), ny * (tickLenPx * 0.5 + 5));
                 tickLabelSpecs.push({
                   pixel: true,
                   x: px + nx * (tickLenPx * 0.5 + 5),
                   y: py + ny * (tickLenPx * 0.5 + 5),
-                  text: tickLabelText(v),
+                  text: tickLabelText(labelValue, tickMode2, tlo, thi),
                   font_size: Number(cfg.tick_label_font_size) || 11,
-                  ha: "center",
-                  va: "center",
+                  ha: centeredAnchor.ha,
+                  va: centeredAnchor.va,
                   color: cfg.color || "white"
                 });
               } else {
                 ctx.moveTo(px, py);
                 ctx.lineTo(px + nx * tickLenPx * side, py + ny * tickLenPx * side);
+                var sidedAnchor = axisTextAnchorFromAxisOffset(nx * side * (tickLenPx + 5), ny * side * (tickLenPx + 5));
                 tickLabelSpecs.push({
                   pixel: true,
                   x: px + nx * side * (tickLenPx + 5),
                   y: py + ny * side * (tickLenPx + 5),
-                  text: tickLabelText(v),
+                  text: tickLabelText(labelValue, tickMode2, tlo, thi),
                   font_size: Number(cfg.tick_label_font_size) || 11,
-                  ha: "center",
-                  va: "center",
+                  ha: sidedAnchor.ha,
+                  va: sidedAnchor.va,
                   color: cfg.color || "white"
                 });
               }
             }
           }
           ctx.stroke();
-          geomSpec.texts = tickLabelSpecs;
+          geomSpec.texts = preservedAxis3DTexts.concat(axisNameLabelSpecs, tickLabelSpecs);
         }
         ctx.restore();
       }
@@ -4902,7 +7995,7 @@
     el.innerHTML = scratch.innerHTML;
   }
 
-  function edgeAnchorPixelFromWorld(camera, w, h, item) {
+  function edgeAnchorPixelInfoFromWorld(camera, w, h, item) {
     var target = [Number(item.x) || 0, Number(item.y) || 0, Number(item.z) || 0];
     var origin = Array.isArray(item.anchor_origin) && item.anchor_origin.length >= 3
       ? [Number(item.anchor_origin[0]) || 0, Number(item.anchor_origin[1]) || 0, Number(item.anchor_origin[2]) || 0]
@@ -4920,6 +8013,14 @@
     var inset = Math.max(0, Number(item.inset_px || 20));
     var clipped = clipPixelLineToRect(po, pt, inset, inset, w - inset, h - inset);
     var p = clipped ? clipped[1] : pt;
+    var side = null;
+    var eps = 1e-3;
+    if (clipped) {
+      if (Math.abs(p[0] - inset) <= eps) { side = "left"; }
+      else if (Math.abs(p[0] - (w - inset)) <= eps) { side = "right"; }
+      else if (Math.abs(p[1] - inset) <= eps) { side = "top"; }
+      else if (Math.abs(p[1] - (h - inset)) <= eps) { side = "bottom"; }
+    }
     var offset = Math.max(0, Number(item.offset_px || 0));
     if (offset > 0) {
       var dx = pt[0] - po[0];
@@ -4935,7 +8036,12 @@
         p = [p[0] + nx * offset * sign, p[1] + ny * offset * sign];
       }
     }
-    return p;
+    return { point: p, side: side };
+  }
+
+  function edgeAnchorPixelFromWorld(camera, w, h, item) {
+    var info = edgeAnchorPixelInfoFromWorld(camera, w, h, item);
+    return info ? info.point : null;
   }
 
   function geomTextToPx(item, w, h, camera) {
@@ -4969,34 +8075,41 @@
     }
     var view = axisViewport(mesh, cfg, w, h);
     if (!view) { return []; }
+    var localBounds = axis2DRotatedLocalBounds(mesh, cfg, w, h);
+    var xVisible = axis2DVisibleDataRangeFromLocalBounds(view, cfg, w, h, localBounds, "x");
+    var yVisible = axis2DVisibleDataRangeFromLocalBounds(view, cfg, w, h, localBounds, "y");
     var vx0 = view.vx0, vx1 = view.vx1, vy0 = view.vy0, vy1 = view.vy1;
     var dataToX = view.dataToX;
     var dataToY = view.dataToY;
-    var yAxisPx = dataToY(0);
-    var xAxisPx = dataToX(0);
+    var yAxisPx = dataToY(axisCrosshairBaseValue(cfg, "y"));
+    var xAxisPx = dataToX(axisCrosshairBaseValue(cfg, "x"));
     var tickLen = Math.max(0, Number(cfg.len) || 7);
-    var xStep = chooseAxisTickStep((vx1 - vx0) / Math.max(1, w), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
-    xStep = chooseReadableLinearTickStep(vx0, vx1, xStep, cfg.x_ticks, cfg.x_mode, cfg.hints, w, cfg.dist, cfg.min_dist, cfg.max_dist, cfg.tick_label_font_size);
-    var yStep = chooseAxisTickStep((vy1 - vy0) / Math.max(1, h), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
+    var xStep = chooseAxisTickStep((xVisible[1] - xVisible[0]) / Math.max(1, localBounds.width), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
+    xStep = chooseReadableLinearTickStep(xVisible[0], xVisible[1], xStep, cfg.x_ticks, cfg.x_mode, cfg.hints, localBounds.width, cfg.dist, cfg.min_dist, cfg.max_dist, cfg.tick_label_font_size);
+    var yStep = chooseAxisTickStep((yVisible[1] - yVisible[0]) / Math.max(1, localBounds.height), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
     var out = [];
     var labelColor = mesh.color || "white";
     var xOffsetValue = 0;
     var yOffsetValue = 0;
 
-    if (yAxisPx >= -tickLen && yAxisPx <= h + tickLen && xStep > 0) {
+    if (yAxisPx >= localBounds.top - tickLen && yAxisPx <= localBounds.bottom + tickLen && xStep > 0) {
       var xLabels = Array.isArray(cfg.x_tick_labels) ? cfg.x_tick_labels : null;
       var xTickPlacement = String(cfg.x_tick_label_placement || "below").toLowerCase();
       var xOffset = xTickPlacement === "above" ? -tickLen - 5 : tickLen + 5;
       var xVa = xTickPlacement === "above" ? "bottom" : "top";
-      var xs = axisTickValuesNoZeroForMode(vx0, vx1, xStep, cfg.x_ticks, cfg.x_mode, true, cfg.hints, w, cfg.dist, cfg.min_dist, cfg.max_dist);
-      xOffsetValue = axisLabelOffset(xs, vx0, vx1);
+      var xs = axisCrosshairTickValuesForMode(xVisible[0], xVisible[1], xStep, cfg.x_ticks, cfg.x_mode, cfg.hints, localBounds.width, cfg.dist, cfg.min_dist, cfg.max_dist);
+      xOffsetValue = axisLabelOffset(xs, xVisible[0], xVisible[1]);
       for (var xi = 0; xi < xs.length; xi += 1) {
         var xv = xs[xi];
         out.push({
           pixel: true,
+          keep_horizontal: true,
+          anchor_to_axis: true,
+          axis_anchor_px: dataToX(xv),
+          axis_anchor_py: yAxisPx,
           x: dataToX(xv),
           y: yAxisPx + xOffset,
-          text: xLabels && xi < xLabels.length ? String(xLabels[xi]) : axisTickLabelWithOffset(xv, cfg.x_mode, vx0, vx1, xOffsetValue, xStep),
+          text: xLabels && xi < xLabels.length ? String(xLabels[xi]) : axisTickLabelWithOffset(xv, cfg.x_mode, xVisible[0], xVisible[1], xOffsetValue, xStep),
           font_size: Number(cfg.tick_label_font_size) || 11,
           ha: "center",
           va: xVa,
@@ -5004,20 +8117,24 @@
         });
       }
     }
-    if (xAxisPx >= -tickLen && xAxisPx <= w + tickLen && yStep > 0) {
+    if (xAxisPx >= localBounds.left - tickLen && xAxisPx <= localBounds.right + tickLen && yStep > 0) {
       var yLabels = Array.isArray(cfg.y_tick_labels) ? cfg.y_tick_labels : null;
       var yTickPlacement = String(cfg.y_tick_label_placement || "left").toLowerCase();
       var yOffset = yTickPlacement === "right" ? tickLen + 5 : -tickLen - 5;
       var yHa = yTickPlacement === "right" ? "left" : "right";
-      var ys = axisTickValuesNoZeroForMode(vy0, vy1, yStep, cfg.y_ticks, cfg.y_mode, true, cfg.hints, h, cfg.dist, cfg.min_dist, cfg.max_dist);
-      yOffsetValue = axisLabelOffset(ys, vy0, vy1);
+      var ys = axisCrosshairTickValuesForMode(yVisible[0], yVisible[1], yStep, cfg.y_ticks, cfg.y_mode, cfg.hints, localBounds.height, cfg.dist, cfg.min_dist, cfg.max_dist);
+      yOffsetValue = axisLabelOffset(ys, yVisible[0], yVisible[1]);
       for (var yi = 0; yi < ys.length; yi += 1) {
         var yv = ys[yi];
         out.push({
           pixel: true,
+          keep_horizontal: true,
+          anchor_to_axis: true,
+          axis_anchor_px: xAxisPx,
+          axis_anchor_py: dataToY(yv),
           x: xAxisPx + yOffset,
           y: dataToY(yv),
-          text: yLabels && yi < yLabels.length ? String(yLabels[yi]) : axisTickLabelWithOffset(yv, cfg.y_mode, vy0, vy1, yOffsetValue, yStep),
+          text: yLabels && yi < yLabels.length ? String(yLabels[yi]) : axisTickLabelWithOffset(yv, cfg.y_mode, yVisible[0], yVisible[1], yOffsetValue, yStep),
           font_size: Number(cfg.tick_label_font_size) || 11,
           ha: yHa,
           va: "center",
@@ -5034,18 +8151,29 @@
     if (cfg.x_label) {
       out.push({
         pixel: true,
+        boundary_anchor: true,
+        boundary_inset_px: labelFramePad,
+        solve_boundary_and_axis: true,
+        keep_horizontal: true,
+        axis_anchor_px: w - labelFramePad,
+        axis_anchor_py: yAxisPx,
+        preferred_normal_dx: 0,
+        preferred_normal_dy: xLabelBelow ? labelAxisPad : -labelAxisPad,
+        axis_gap_px: labelAxisPad,
         x: w - labelFramePad,
         y: yAxisPx + (xLabelBelow ? labelAxisPad : -labelAxisPad),
         text: String(cfg.x_label),
         font_size: Number(cfg.label_font_size) || 13,
-        ha: "right",
-        va: xLabelBelow ? "top" : "bottom",
+        ha: "center",
+        va: "center",
         color: labelColor
       });
     }
     if (xOffsetValue !== 0) {
       out.push({
         pixel: true,
+        boundary_anchor: true,
+        boundary_inset_px: labelFramePad,
         x: w - labelFramePad,
         y: yAxisPx + (xLabelBelow ? -labelAxisPad : labelAxisPad),
         text: formatOffsetLabel(xOffsetValue),
@@ -5058,19 +8186,29 @@
     if (cfg.y_label) {
       out.push({
         pixel: true,
+        boundary_anchor: true,
+        boundary_inset_px: labelFramePad,
+        solve_boundary_and_axis: true,
+        keep_horizontal: true,
+        axis_anchor_px: xAxisPx,
+        axis_anchor_py: labelFramePad,
+        preferred_normal_dx: yLabelRight ? labelAxisPad : -labelAxisPad,
+        preferred_normal_dy: 0,
+        axis_gap_px: labelAxisPad,
         x: xAxisPx + (yLabelRight ? labelAxisPad : -labelAxisPad),
         y: labelFramePad,
         text: String(cfg.y_label),
         font_size: Number(cfg.label_font_size) || 13,
-        ha: yLabelRight ? "left" : "right",
-        va: "top",
-        rotate: yLabelRight ? 90 : -90,
+        ha: "center",
+        va: "center",
         color: labelColor
       });
     }
     if (yOffsetValue !== 0) {
       out.push({
         pixel: true,
+        boundary_anchor: true,
+        boundary_inset_px: labelFramePad,
         x: xAxisPx + (yLabelRight ? -labelAxisPad : labelAxisPad),
         y: labelFramePad,
         text: formatOffsetLabel(yOffsetValue),
@@ -5080,7 +8218,7 @@
         color: labelColor
       });
     }
-    return out;
+    return rotateAxis2DLabelSpecs(out, mesh, cfg, w, h);
   }
 
   function collectAxisBoxLabelSpecs(mesh, w, h) {
@@ -5092,9 +8230,17 @@
     var yMin = Number(cfg.y_min);
     var yMax = Number(cfg.y_max);
     if (!(xMax > xMin) || !(yMax > yMin)) { return []; }
-    var xStep = chooseAxisTickStep((xMax - xMin) / Math.max(1, box.width), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
-    xStep = chooseReadableLinearTickStep(xMin, xMax, xStep, cfg.x_ticks, cfg.x_mode, cfg.hints, box.width, cfg.dist, cfg.min_dist, cfg.max_dist, cfg.tick_label_font_size);
-    var yStep = chooseAxisTickStep((yMax - yMin) / Math.max(1, box.height), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
+    var frozenX = cfg.__frozen_box_tick_state && cfg.__frozen_box_tick_state.x || null;
+    var frozenY = cfg.__frozen_box_tick_state && cfg.__frozen_box_tick_state.y || null;
+    var xStep = frozenX && Number(frozenX.step) > 0
+      ? Number(frozenX.step)
+      : chooseAxisTickStep((xMax - xMin) / Math.max(1, box.width), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
+    if (!(frozenX && Number(frozenX.step) > 0)) {
+      xStep = chooseReadableLinearTickStep(xMin, xMax, xStep, cfg.x_ticks, cfg.x_mode, cfg.hints, box.width, cfg.dist, cfg.min_dist, cfg.max_dist, cfg.tick_label_font_size);
+    }
+    var yStep = frozenY && Number(frozenY.step) > 0
+      ? Number(frozenY.step)
+      : chooseAxisTickStep((yMax - yMin) / Math.max(1, box.height), cfg.dist, cfg.hints, cfg.min_dist, cfg.max_dist);
     var tickLen = Math.max(0, Number(cfg.len) || 7);
     var labelColor = mesh.color || "white";
     var dataToX = function (x) { return box.left + axisValueToUnit(x, xMin, xMax, cfg.x_mode) * box.width; };
@@ -5105,7 +8251,9 @@
     var xTickPlacement = String(cfg.x_tick_label_placement || "below").toLowerCase();
     var xOffset = xTickPlacement === "above" ? -tickLen - 5 : tickLen + 5;
     var xVa = xTickPlacement === "above" ? "bottom" : "top";
-    var xs = axisTickValuesForMode(xMin, xMax, xStep, cfg.x_ticks, cfg.x_mode, false, cfg.hints, box.width, cfg.dist, cfg.min_dist, cfg.max_dist);
+    var xs = frozenX && Array.isArray(frozenX.values)
+      ? frozenX.values.slice()
+      : axisTickValuesForMode(xMin, xMax, xStep, cfg.x_ticks, cfg.x_mode, false, cfg.hints, box.width, cfg.dist, cfg.min_dist, cfg.max_dist);
     var xOffsetValue = axisLabelOffset(xs, xMin, xMax);
     var xLabelAxisPad = Math.max(0, Number(cfg.label_axis_pad) || 34);
     for (var xi = 0; xi < xs.length; xi += 1) {
@@ -5125,7 +8273,9 @@
     var yTickPlacement = String(cfg.y_tick_label_placement || "left").toLowerCase();
     var yOffset = yTickPlacement === "right" ? tickLen + 5 : -tickLen - 5;
     var yHa = yTickPlacement === "right" ? "left" : "right";
-    var ys = axisTickValuesForMode(yMin, yMax, yStep, cfg.y_ticks, cfg.y_mode, false, cfg.hints, box.height, cfg.dist, cfg.min_dist, cfg.max_dist);
+    var ys = frozenY && Array.isArray(frozenY.values)
+      ? frozenY.values.slice()
+      : axisTickValuesForMode(yMin, yMax, yStep, cfg.y_ticks, cfg.y_mode, false, cfg.hints, box.height, cfg.dist, cfg.min_dist, cfg.max_dist);
     var yOffsetValue = axisLabelOffset(ys, yMin, yMax);
     var yLabelAxisPad = Math.max(0, Number(cfg.label_axis_pad) || 34);
     var yTickLabelWidth = yLabels
@@ -5147,6 +8297,7 @@
     if (cfg.x_label) {
       out.push({
         pixel: true,
+        keep_upright: true,
         x: (box.left + box.right) * 0.5,
         y: box.bottom + xLabelAxisPad,
         text: String(cfg.x_label),
@@ -5173,6 +8324,7 @@
       var yLabelOutsidePad = tickLen + 8 + yTickLabelWidth + yLabelGap;
       out.push({
         pixel: true,
+        keep_upright: true,
         x: yTickPlacement === "right" ? box.left + yLabelOutsidePad : box.left - yLabelOutsidePad,
         y: (box.top + box.bottom) * 0.5,
         text: String(cfg.y_label),
@@ -5195,7 +8347,7 @@
         color: labelColor
       });
     }
-    return out;
+    return rotateAxis2DLabelSpecs(out, mesh, cfg, w, h);
   }
 
   function renderGeomTextOverlay(fid, frameEl, geomSpec) {
@@ -5219,7 +8371,6 @@
       var items = [];
       var texts = geomSpec && Array.isArray(geomSpec.texts) ? geomSpec.texts : [];
       for (var ti = 0; ti < texts.length; ti += 1) {
-        if (geomSpec && geomSpec.axis3d_controls === true && texts[ti] && texts[ti].edge_anchor === true) { continue; }
         items.push(texts[ti]);
       }
       var meshes = geomSpec && Array.isArray(geomSpec.meshes) ? geomSpec.meshes : [];
@@ -5239,7 +8390,10 @@
       var keepAllAxis3DLabels = !!(geomSpec && geomSpec.axis3d_controls === true);
       for (var i = 0; i < items.length; i += 1) {
         var item = items[i] || {};
-        var p = geomTextToPx(item, w, h, geomSpec && geomSpec.camera || null);
+        var edgeInfo = item && item.world === true && item.edge_anchor === true
+          ? edgeAnchorPixelInfoFromWorld(geomSpec && geomSpec.camera || null, w, h, item)
+          : null;
+        var p = edgeInfo ? edgeInfo.point : geomTextToPx(item, w, h, geomSpec && geomSpec.camera || null);
         if (!p) { continue; }
         if (!keepAllAxis3DLabels && !textPointIsNearViewport(p, w, h, 112)) { continue; }
         if (!firstPos) { firstPos = p.slice ? p.slice(0, 2) : p; }
@@ -5266,10 +8420,27 @@
         el.style.color = "rgba(" + Math.round(color[0] * 255) + "," + Math.round(color[1] * 255) + "," + Math.round(color[2] * 255) + "," + Math.max(0, Math.min(1, color[3])) + ")";
         el.style.fontSize = String(Math.max(1, Number(item.font_size) || 12)) + "px";
         var rotation = Number(item.rotate) || 0;
+        var ha = String(item.ha || "center").toLowerCase();
+        var va = String(item.va || "center").toLowerCase();
+        if (edgeInfo && geomSpec && geomSpec.axis3d_controls === true) {
+          if (edgeInfo.side === "left") {
+            ha = "left";
+            va = "center";
+          } else if (edgeInfo.side === "right") {
+            ha = "right";
+            va = "center";
+          } else if (edgeInfo.side === "top") {
+            ha = "center";
+            va = "top";
+          } else if (edgeInfo.side === "bottom") {
+            ha = "center";
+            va = "bottom";
+          }
+        }
         el.style.transform = "translate3d(" + String(p[0]) + "px," + String(p[1]) + "px,0) translate(" +
-          (String(item.ha || "center").toLowerCase() === "left" ? "0" : String(item.ha || "center").toLowerCase() === "right" ? "-100%" : "-50%") +
+          (ha === "left" ? "0" : ha === "right" ? "-100%" : "-50%") +
           "," +
-          (String(item.va || "center").toLowerCase() === "top" ? "0" : String(item.va || "center").toLowerCase() === "bottom" ? "-100%" : "-50%") +
+          (va === "top" ? "0" : va === "bottom" ? "-100%" : "-50%") +
           ")" + (rotation ? " rotate(" + String(rotation) + "deg)" : "");
         var textValue = item.text != null ? String(item.text) : "";
         if (el.dataset.vfGeomTextValue !== textValue) {
@@ -5323,10 +8494,11 @@
     ensureAxis3DControls(String(fid), frameEl, geomSpec);
     ensureAxis2DControls(String(fid), frameEl, geomSpec);
     updatePlotAnimation(String(fid), frameEl, geomSpec);
-    if (geomSpec && geomSpec.axis3d_runtime && !geomSpec.__axis3dRuntimePreparing) {
+    if (geomSpec && axis3DRuntimeConfig(geomSpec) && !geomSpec.__axis3dRuntimePreparing) {
       geomSpec.__axis3dRuntimePreparing = true;
       try {
         rebuildAxis3DLocalField(String(fid), true, geomSpec);
+        applyAxis3DBoundMeshes(geomSpec);
       } finally {
         geomSpec.__axis3dRuntimePreparing = false;
       }
@@ -5501,7 +8673,7 @@
       }
     }
     rec.entries.length = renderSpecs.length;
-    if (geomSpec && geomSpec.axis3d_runtime) {
+    if (geomSpec && axis3DRuntimeConfig(geomSpec)) {
       var fitForAxisLines = fittedFrameContentRect(frameEl, geomFrameHost(frameEl, fid));
       renderGeomLineOverlay(
         fid,
@@ -5753,6 +8925,66 @@
       entry.initError = (err && err.message ? err.message : String(err));
       vlog("error", "mountDynamicGeomFrame [" + fid + "]: renderer init threw: " + (err && err.message ? err.message : String(err)));
     });
+  }
+
+  function ensurePositiveAxisRangeForLog(cfg, axis) {
+    if (!cfg) { return; }
+    var lo = Number(cfg[axis + "_min"]);
+    var hi = Number(cfg[axis + "_max"]);
+    if (lo > 0 && hi > lo) { return; }
+    cfg[axis + "_min"] = 0.1;
+    cfg[axis + "_max"] = 10.0;
+  }
+
+  function setAxisTickMode(fid, axis, mode) {
+    fid = String(fid || "");
+    axis = String(axis || "").toLowerCase();
+    mode = String(mode || "linear").toLowerCase() === "log" ? "log" : "linear";
+    if (!fid || (axis !== "x" && axis !== "y" && axis !== "z")) { return false; }
+    var geom = _lastDisplayPayload && _lastDisplayPayload.geom ? _lastDisplayPayload.geom[fid] : null;
+    if (!geom) { return false; }
+    var changed = false;
+    var meshes = Array.isArray(geom.meshes) ? geom.meshes : [];
+    for (var mi = 0; mi < meshes.length; mi += 1) {
+      var cfg = meshes[mi] && meshes[mi].axis_ticks;
+      if (!cfg || (axis !== "x" && axis !== "y")) { continue; }
+      cfg[axis + "_mode"] = mode;
+      if (mode === "log") {
+        if (meshes[mi] && meshes[mi].axis_box === true) {
+          ensurePositiveAxisRangeForLog(cfg, axis);
+        } else {
+          ensureSymmetricCrosshairLogRange(cfg, axis);
+        }
+      }
+      changed = true;
+    }
+    var cfg3 = axis3DRuntimeConfig(geom);
+    if (cfg3) {
+      cfg3[axis + "_mode"] = mode;
+      cfg3[axis + "_tick_mode"] = mode;
+      if (mode === "log") {
+        if (String(cfg3.mode || "").toLowerCase() === "box") {
+          ensurePositiveAxisRangeForLog(cfg3, axis);
+        } else {
+          ensureSymmetricCrosshairLogRange(cfg3, axis);
+        }
+      }
+      var rec = frameRecs[fid] || null;
+      if (rec) {
+        rec.axis3DHelperTickCache = null;
+        rec.axis3DHelperStepCache = null;
+      }
+      changed = true;
+    }
+    if (!changed) { return false; }
+    var frameEl = findFrameEl(geomTargetFrameId(fid));
+    if (cfg3) {
+      repaintAxis3DHelperLines(fid);
+    } else if (frameEl) {
+      drawSimple2DMarkerLineMeshes(fid, frameEl, meshes);
+      renderGeomTextOverlay(fid, frameEl, geom);
+    }
+    return true;
   }
 
   function mountOffscreenGeomFrame(fid, provider, width, height) {
@@ -6232,6 +9464,7 @@ fn fsMain(in : VOut) -> @location(0) vec4<f32> {
       vlog("warn", "renderFromJson: data is null or not an object");
       return;
     }
+    carryForwardLiveGeomState(_lastDisplayPayload, data);
     _lastDisplayPayload = data;
 
     // Log a summary of what arrived (suppress repeat spam)
@@ -6364,6 +9597,69 @@ fn fsMain(in : VOut) -> @location(0) vec4<f32> {
     return true;
   }
 
+  function redrawVisibleGeomFrames() {
+    if (!_lastDisplayPayload || !_lastDisplayPayload.geom) { return false; }
+    var geom = _lastDisplayPayload.geom;
+    var frameIds = Object.keys(geom);
+    var any = false;
+    for (var i = 0; i < frameIds.length; i += 1) {
+      var fid = frameIds[i];
+      var frameEl = findFrameEl(geomTargetFrameId(fid));
+      if (!frameEl) { continue; }
+      var hidden = false;
+      try {
+        hidden = frameEl.style.display === "none" || (global.getComputedStyle && global.getComputedStyle(frameEl).display === "none");
+      } catch (_) {}
+      if (hidden) { continue; }
+      updateGeomFrame(fid, geom[fid]);
+      any = true;
+    }
+    return any;
+  }
+
+  function forEachLiveAxisConfig(visitor) {
+    if (!_lastDisplayPayload || !_lastDisplayPayload.geom) { return 0; }
+    var geom = _lastDisplayPayload.geom;
+    var frameIds = Object.keys(geom);
+    var count = 0;
+    for (var fi = 0; fi < frameIds.length; fi += 1) {
+      var frameGeom = geom[frameIds[fi]];
+      var meshes = frameGeom && Array.isArray(frameGeom.meshes) ? frameGeom.meshes : [];
+      for (var mi = 0; mi < meshes.length; mi += 1) {
+        var cfg = meshes[mi] && meshes[mi].axis_ticks;
+        if (!cfg) { continue; }
+        visitor(cfg, meshes[mi], frameIds[fi], frameGeom);
+        count += 1;
+      }
+      if (frameGeom && frameGeom.axis3d_runtime) {
+        visitor(frameGeom.axis3d_runtime, null, frameIds[fi], frameGeom);
+        count += 1;
+      }
+      var frameLayers = frameGeom && Array.isArray(frameGeom.frame_layers) ? frameGeom.frame_layers : [];
+      for (var li = 0; li < frameLayers.length; li += 1) {
+        var layer = frameLayers[li] || null;
+        if (!layer) { continue; }
+        if (String(layer.kind || "").toLowerCase() !== "axis") { continue; }
+        visitor(layer, null, frameIds[fi], frameGeom);
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  function toggleAllAxisGridlines() {
+    var anyEnabled = false;
+    forEachLiveAxisConfig(function (cfg) {
+      if (cfg.grid !== false) { anyEnabled = true; }
+    });
+    var nextEnabled = !anyEnabled;
+    forEachLiveAxisConfig(function (cfg) {
+      cfg.grid = nextEnabled;
+    });
+    redrawCurrentDisplay();
+    return nextEnabled;
+  }
+
   function resolveRuntimeShellScriptUrl() {
     if (_vfDisplayScript && _vfDisplayScript.src && typeof URL !== "undefined") {
       try {
@@ -6404,6 +9700,13 @@ fn fsMain(in : VOut) -> @location(0) vec4<f32> {
     if (global.__vfKeyboardAttached) { return; }
     global.__vfKeyboardAttached = true;
 
+    function targetIsEditable(target) {
+      if (!target) { return false; }
+      if (target.isContentEditable) { return true; }
+      var tag = String(target.tagName || "").toLowerCase();
+      return tag === "input" || tag === "textarea" || tag === "select";
+    }
+
     function activeFrameId() {
       // Try to find which frame has focus or is under the pointer
       var active = document.activeElement;
@@ -6429,6 +9732,14 @@ fn fsMain(in : VOut) -> @location(0) vec4<f32> {
 
     global.addEventListener("keydown", function(e) { keyEvt("key_down", e); }, { passive: true, capture: true });
     global.addEventListener("keyup",   function(e) { keyEvt("key_up",   e); }, { passive: true, capture: true });
+    global.addEventListener("keydown", function(e) {
+      var key = String(e && e.key || "").toLowerCase();
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && key === "g" && !targetIsEditable(e.target)) {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleAllAxisGridlines();
+      }
+    }, { passive: false, capture: true });
     vlog("info", "keyboard listeners attached");
   })();
 
@@ -6439,6 +9750,7 @@ fn fsMain(in : VOut) -> @location(0) vec4<f32> {
     loadAndRender: loadAndRender,
     applyRuntimePacket: applyRuntimePacket,
     redrawCurrentDisplay: redrawCurrentDisplay,
+    redrawVisibleGeomFrames: redrawVisibleGeomFrames,
     mountDynamicGeomFrame: mountDynamicGeomFrame,
     mountOffscreenGeomFrame: mountOffscreenGeomFrame,
     mountLinkedMirrorTextureFrame: mountLinkedMirrorTextureFrame,
@@ -6447,6 +9759,7 @@ fn fsMain(in : VOut) -> @location(0) vec4<f32> {
     dynamicGeomFrameCanAcceptUpdate: dynamicGeomFrameCanAcceptUpdate,
     geomFrameStatus: geomFrameStatus,
     geomFrameViewAspect: geomFrameViewAspect,
+    setAxisTickMode: setAxisTickMode,
     __test: {
       buildSingleMesh: buildSingleMesh,
       buildCombinedTriangleMesh: buildCombinedTriangleMesh,

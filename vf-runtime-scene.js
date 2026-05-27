@@ -146,12 +146,21 @@
       }
     }
 
-    function postExitToHost() {
-      var wv = global.chrome && global.chrome.webview;
-      if (wv && typeof wv.postMessage === "function") {
-        wv.postMessage({ type: "close" });
-      }
+  function postExitToHost() {
+    var wv = global.chrome && global.chrome.webview;
+    if (wv && typeof wv.postMessage === "function") {
+      wv.postMessage({ type: "close" });
     }
+  }
+
+  function runtimeAllowsHostExit() {
+    try {
+      if (typeof document === "undefined" || !document || !document.body) { return false; }
+      return document.body.getAttribute("data-vf-allow-host-exit") === "true";
+    } catch (_) {
+      return false;
+    }
+  }
 
     function ensureFrameOverlay(panel) {
       if (!panel || !panel.body) { return null; }
@@ -231,6 +240,7 @@
             alpha: alpha,
             bodyTransparent: spec.body_transparent === true,
             master: isMaster,
+            frameless: spec.frameless === true,
             dockLocation: dockLocation,
             zIndexBase: 1000 + i * 2,
             onBeforeDestroy: function(frameId) {
@@ -242,7 +252,7 @@
             }(id),
             onFrameRemoved: function() {
               if (layer._vfMasterTeardown) { return; }
-              if (countExitTrackedFrames(layer) === 0) {
+              if (runtimeAllowsHostExit() && countExitTrackedFrames(layer) === 0) {
                 postExitToHost();
               }
             }
@@ -271,6 +281,9 @@
         }
       }
       syncNativeLayout();
+      if (widgets && typeof widgets.refreshButtonGroups === "function") {
+        widgets.refreshButtonGroups();
+      }
       if (isLegacyFallbackActive()) {
         displayRefresh();
       }
@@ -278,11 +291,17 @@
         for (var m = 0; m < mounted.length; m++) {
           reapplySpecRect(mounted[m].panel, mounted[m].spec, "post-mount frame");
         }
+        if (widgets && typeof widgets.refreshButtonGroups === "function") {
+          widgets.refreshButtonGroups();
+        }
       });
       global.requestAnimationFrame(function() {
         global.requestAnimationFrame(function() {
           for (var m = 0; m < mounted.length; m++) {
             reapplySpecRect(mounted[m].panel, mounted[m].spec, "settled frame");
+          }
+          if (widgets && typeof widgets.refreshButtonGroups === "function") {
+            widgets.refreshButtonGroups();
           }
           syncNativeLayout();
           if (isLegacyFallbackActive()) {
