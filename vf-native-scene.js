@@ -71,6 +71,71 @@
     } catch (_) {}
   }
 
+  function showStatusOverlay(text) {
+    try {
+      var doc = global.document;
+      if (!doc) { return; }
+      var frameId = String(frameSpec.frame_id || "");
+      var host = frameId
+        ? doc.querySelector('.vf-frame[data-vf-frame-id="' + frameId + '"] .vf-frame__body')
+        : null;
+      if (!host) { return; }
+      var existing = doc.getElementById("vf-native-scene-status");
+      if (!existing) {
+        existing = doc.createElement("div");
+        existing.id = "vf-native-scene-status";
+        existing.style.position = "absolute";
+        existing.style.left = "8px";
+        existing.style.top = "8px";
+        existing.style.zIndex = "9998";
+        existing.style.maxWidth = "calc(100% - 16px)";
+        existing.style.padding = "6px 8px";
+        existing.style.background = "rgba(10,14,20,0.72)";
+        existing.style.color = "#d9e7ff";
+        existing.style.font = "12px/1.35 Consolas, Menlo, monospace";
+        existing.style.whiteSpace = "pre-wrap";
+        existing.style.pointerEvents = "none";
+        existing.style.borderRadius = "6px";
+        existing.style.boxShadow = "0 2px 10px rgba(0,0,0,0.35)";
+        var computedPosition = "";
+        try { computedPosition = global.getComputedStyle(host).position || ""; } catch (_) {}
+        if (!computedPosition || computedPosition === "static") {
+          host.style.position = "relative";
+        }
+        host.appendChild(existing);
+      }
+      existing.textContent = String(text);
+    } catch (_) {}
+  }
+
+  function clearStatusOverlay() {
+    try {
+      var doc = global.document;
+      if (!doc) { return; }
+      var existing = doc.getElementById("vf-native-scene-status");
+      if (existing && existing.parentNode) {
+        existing.parentNode.removeChild(existing);
+      }
+    } catch (_) {}
+  }
+
+  function visibleSpecSummary(spec) {
+    if (!spec || typeof spec !== "object") {
+      return "visibleSpec=null";
+    }
+    var meshes = Array.isArray(spec.meshes) ? spec.meshes.length : 0;
+    var parts = Array.isArray(spec.parts) ? spec.parts.length : 0;
+    var cam = spec.camera && typeof spec.camera === "object" ? spec.camera : null;
+    var vpw = cam ? Number(cam.viewport_width_px || 0) : 0;
+    var vph = cam ? Number(cam.viewport_height_px || 0) : 0;
+    return [
+      "visibleSpec.meshes=" + String(meshes),
+      "visibleSpec.parts=" + String(parts),
+      "camera.viewport=" + String(vpw) + "x" + String(vph),
+      "unified=" + String(spec.unified_renderer === true)
+    ].join("\n");
+  }
+
   function failFast(message) {
     var text = "native_scene: " + String(message);
     try { console.error(text); } catch (_) {}
@@ -293,6 +358,12 @@
     if (source && source._skip_render === true) {
       cloned._skip_render = true;
     }
+    if (source && source._mirrorDebug && typeof source._mirrorDebug === "object") {
+      cloned._mirrorDebug = cloneJsonValue(source._mirrorDebug);
+    }
+    if (Array.isArray(source._mirrorViewProjection) && source._mirrorViewProjection.length === 16) {
+      cloned._mirrorViewProjection = source._mirrorViewProjection.slice();
+    }
     return cloned;
   }
 
@@ -481,7 +552,8 @@
       camera_ref: String(system.camera_ref || ""),
       frame_ref: String(system.frame_ref || ""),
       flip_x: kind === "mirror" || system.flip_x === true,
-      reverse_facing: kind === "mirror" ? true : (system.reverse_facing === true),
+      flip_y: system.flip_y === true,
+      reverse_facing: system.reverse_facing === true,
       camera: camera,
       world: {
         kind: world.kind,
@@ -1249,54 +1321,8 @@
       aperture_mesh_id: String(entityProp(resolved, "aperture_mesh_id", "") || ""),
       reflect_of_light_id: String(entityProp(resolved, "reflect_of_light_id", "") || ""),
       reflect_mirror_mesh_id: String(entityProp(resolved, "reflect_mirror_mesh_id", "") || ""),
-      clip_epsilon: Math.max(0.0, resolveTrackedNumber(resolved, "clip_epsilon", framePos, Number(entityProp(resolved, "clip_epsilon", 1e-3) == null ? 1e-3 : entityProp(resolved, "clip_epsilon", 1e-3))))
+      clip_epsilon_ratio: Math.max(0.0, resolveTrackedNumber(resolved, "clip_epsilon_ratio", framePos, Number(entityProp(resolved, "clip_epsilon_ratio", 1e-5) == null ? 1e-5 : entityProp(resolved, "clip_epsilon_ratio", 1e-5))))
     };
-  }
-
-  function resolveLinkedMirrorLight(lightSpec, sourceLightsById, meshById) {
-    var reflectOfId = String(lightSpec && lightSpec.reflect_of_light_id || "").trim();
-    var mirrorMeshId = String(lightSpec && lightSpec.reflect_mirror_mesh_id || "").trim();
-    if (!reflectOfId && !mirrorMeshId) { return lightSpec; }
-    if (!reflectOfId || !mirrorMeshId) { return lightSpec; }
-    var sourceLight = sourceLightsById && sourceLightsById[reflectOfId];
-    var mirrorMesh = meshById && meshById[mirrorMeshId];
-    if (!sourceLight || !mirrorMesh) { return lightSpec; }
-    var aperture = quadApertureFrame(mirrorMesh);
-    if (!aperture) { return lightSpec; }
-    var clipEpsilon = Math.max(0.0, Number(lightSpec && lightSpec.clip_epsilon == null ? 1e-3 : lightSpec.clip_epsilon) || 0.0);
-    var sourceSide = dot3([
-      Number(sourceLight.pos[0] || 0.0) - Number(aperture.center[0] || 0.0),
-      Number(sourceLight.pos[1] || 0.0) - Number(aperture.center[1] || 0.0),
-      Number(sourceLight.pos[2] || 0.0) - Number(aperture.center[2] || 0.0)
-    ], aperture.normal);
-    var reflectivity = 1.0;
-    if (mirrorMesh.surface_system && typeof mirrorMesh.surface_system === "object") {
-      reflectivity = Math.max(0.0, Math.min(1.0, Number(mirrorMesh.surface_system.reflectivity == null ? 1.0 : mirrorMesh.surface_system.reflectivity) || 0.0));
-    }
-    var reflectedPos = reflectPointAcrossPlane(sourceLight.pos, aperture.center, aperture.normal);
-    var reflectedTarget = Array.isArray(sourceLight.target)
-      ? reflectPointAcrossPlane(sourceLight.target, aperture.center, aperture.normal)
-      : sourceLight.target;
-    var resolved = Object.assign({}, lightSpec, {
-      pos: reflectedPos,
-      target: reflectedTarget,
-      motion: "linked_reflection"
-    });
-    if (resolved.intensity != null) {
-      resolved.intensity = Math.max(0.0, Number(resolved.intensity || 0.0) * reflectivity);
-    }
-    if (resolved.power != null) {
-      resolved.power = Math.max(0.0, Number(resolved.power || 0.0) * reflectivity);
-    }
-    if (!(sourceSide > clipEpsilon) || !(reflectivity > 1e-4)) {
-      resolved.intensity = 0.0;
-      resolved.power = 0.0;
-      resolved.casts_shadow = false;
-    }
-    if (!resolved.aperture_mesh_id) {
-      resolved.aperture_mesh_id = mirrorMeshId;
-    }
-    return resolved;
   }
 
   function toVec2(value, fallback) {
@@ -1544,9 +1570,24 @@
   }
 
   function buildMirrorEyeLockedCamera(viewerCamera, hostMesh, baseCamera) {
-    var model = matrixForMesh(hostMesh);
-    var planePoint = transformPointMat4(model, 0.0, 0.0, 0.0);
-    var planeNormal = normalize3(transformDirMat4(model, [0.0, 0.0, 1.0]), [0.0, 0.0, 1.0]);
+    var geomUtil = global.VfGeomWgpuUtil;
+    if (!geomUtil || typeof geomUtil.derivePlanarSurfaceWorldFrame !== "function" || !global.VfGeomMath) {
+      failFast("mirror eye-locked camera requires canonical planar frame adapter");
+    }
+    var frame = geomUtil.derivePlanarSurfaceWorldFrame({ mesh: hostMesh }, 0, global.VfGeomMath);
+    if (!frame || !Array.isArray(frame.point) || !Array.isArray(frame.normal)) {
+      failFast("mirror eye-locked camera canonical planar frame is invalid");
+    }
+    var minU = Number(frame.minU || 0.0);
+    var maxU = Number(frame.maxU == null ? (minU + Number(frame.spanU || 0.0)) : frame.maxU);
+    var minV = Number(frame.minV || 0.0);
+    var maxV = Number(frame.maxV == null ? (minV + Number(frame.spanV || 0.0)) : frame.maxV);
+    var planePoint = [
+      Number(frame.point[0] || 0.0) + (Number(frame.uAxis[0] || 0.0) * ((minU + maxU) * 0.5)) + (Number(frame.vAxis[0] || 0.0) * ((minV + maxV) * 0.5)),
+      Number(frame.point[1] || 0.0) + (Number(frame.uAxis[1] || 0.0) * ((minU + maxU) * 0.5)) + (Number(frame.vAxis[1] || 0.0) * ((minV + maxV) * 0.5)),
+      Number(frame.point[2] || 0.0) + (Number(frame.uAxis[2] || 0.0) * ((minU + maxU) * 0.5)) + (Number(frame.vAxis[2] || 0.0) * ((minV + maxV) * 0.5))
+    ];
+    var planeNormal = normalize3(frame.normal, [0.0, 0.0, 1.0]);
     var reflectedPos = reflectPointAcrossPlane(
       toVec3(viewerCamera && viewerCamera.pos, [4.0, -5.0, 3.5]),
       planePoint,
@@ -1559,6 +1600,17 @@
       fov: Number(viewerCamera && viewerCamera.fov || 34.0) || 34.0,
       flip_x: (baseCamera && baseCamera.flip_x === true) || (viewerCamera && viewerCamera.flip_x === true)
     };
+  }
+
+  function renderedMirrorPartForCamera(mesh, camera, purpose) {
+    var rendered = buildMeshPayload(mesh, camera, []);
+    if (Array.isArray(rendered)) {
+      failFast(String(purpose || "mirror camera") + " requires one rendered planar mirror mesh");
+    }
+    if (!rendered || rendered.kind !== "quad") {
+      failFast(String(purpose || "mirror camera") + " requires rendered quad mirror mesh");
+    }
+    return { mesh: rendered };
   }
 
   function buildConvexHullGeometry(spec, points) {
@@ -1850,85 +1902,6 @@
     return [];
   }
 
-  function quadApertureFrame(mesh) {
-    if (!mesh || mesh.kind !== "quad") {
-      return null;
-    }
-    var vertices = meshVerticesForOccluder(mesh);
-    if (!Array.isArray(vertices) || vertices.length < 4) {
-      return null;
-    }
-    var p0 = toVec3(vertices[0], [0.0, 0.0, 0.0]);
-    var p1 = toVec3(vertices[1], [0.0, 0.0, 0.0]);
-    var p2 = toVec3(vertices[2], [0.0, 0.0, 0.0]);
-    var p3 = toVec3(vertices[3], [0.0, 0.0, 0.0]);
-    var uAxis = normalize3([p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]], [1.0, 0.0, 0.0]);
-    var vRaw = [p3[0] - p0[0], p3[1] - p0[1], p3[2] - p0[2]];
-    var normal = normalize3(cross3(uAxis, vRaw), [0.0, 0.0, 1.0]);
-    var vAxis = normalize3(cross3(normal, uAxis), [0.0, 1.0, 0.0]);
-    var center = [
-      0.25 * (p0[0] + p1[0] + p2[0] + p3[0]),
-      0.25 * (p0[1] + p1[1] + p2[1] + p3[1]),
-      0.25 * (p0[2] + p1[2] + p2[2] + p3[2])
-    ];
-    var localPts = [
-      [dot3([p0[0] - center[0], p0[1] - center[1], p0[2] - center[2]], uAxis), dot3([p0[0] - center[0], p0[1] - center[1], p0[2] - center[2]], vAxis)],
-      [dot3([p1[0] - center[0], p1[1] - center[1], p1[2] - center[2]], uAxis), dot3([p1[0] - center[0], p1[1] - center[1], p1[2] - center[2]], vAxis)],
-      [dot3([p2[0] - center[0], p2[1] - center[1], p2[2] - center[2]], uAxis), dot3([p2[0] - center[0], p2[1] - center[1], p2[2] - center[2]], vAxis)],
-      [dot3([p3[0] - center[0], p3[1] - center[1], p3[2] - center[2]], uAxis), dot3([p3[0] - center[0], p3[1] - center[1], p3[2] - center[2]], vAxis)]
-    ];
-    var signedArea = 0.0;
-    for (var pointIndex = 0; pointIndex < localPts.length; pointIndex += 1) {
-      var a = localPts[pointIndex];
-      var b = localPts[(pointIndex + 1) % localPts.length];
-      signedArea += (Number(a[0]) * Number(b[1])) - (Number(b[0]) * Number(a[1]));
-    }
-    if (signedArea < 0.0) {
-      localPts.reverse();
-    }
-    var reverseFacing = !!(mesh && mesh.surface_system && mesh.surface_system.reverse_facing === true);
-    if (reverseFacing) {
-      normal = [-normal[0], -normal[1], -normal[2]];
-      vAxis = [-vAxis[0], -vAxis[1], -vAxis[2]];
-      localPts.reverse();
-    }
-    return {
-      center: center,
-      normal: normal,
-      u_axis: uAxis,
-      v_axis: vAxis,
-      points: localPts
-    };
-  }
-
-  function resolveProjectedLightSpec(lightSpec, meshById) {
-    var apertureMeshId = String(lightSpec && lightSpec.aperture_mesh_id || "");
-    if (String(lightSpec && lightSpec.kind || "point") !== "projected") {
-      return lightSpec;
-    }
-    if (!apertureMeshId) {
-      failFast("projected light requires aperture_mesh_id");
-    }
-    var apertureMesh = meshById ? meshById[apertureMeshId] : null;
-    if (!apertureMesh) {
-      failFast("projected light aperture_mesh_id \"" + apertureMeshId + "\" was not found");
-    }
-    var aperture = quadApertureFrame(apertureMesh);
-    if (!aperture) {
-      failFast("projected light aperture mesh \"" + apertureMeshId + "\" must currently resolve to a planar quad");
-    }
-    lightSpec.projected_aperture = {
-      mesh_id: apertureMeshId,
-      plane_point: aperture.center.slice(),
-      plane_normal: aperture.normal.slice(),
-      u_axis: aperture.u_axis.slice(),
-      v_axis: aperture.v_axis.slice(),
-      points: aperture.points.map(function (pt) { return [Number(pt[0]) || 0.0, Number(pt[1]) || 0.0]; }),
-      clip_epsilon: Math.max(0.0, Number(lightSpec.clip_epsilon || 1e-3) || 1e-3)
-    };
-    return lightSpec;
-  }
-
   function cubeMesh(cube, color) {
     var vertices = makeCubeLocalVertices(cube.size);
     var faces = [
@@ -1968,6 +1941,9 @@
       color: color,
       texture: cube.texture || null,
       surface_system: cube.surface_system || null,
+      casts_shadow: cube.casts_shadow !== false,
+      receives_shadow: cube.receives_shadow !== false,
+      no_backface_specular: cube.no_backface_specular === true,
       tracks: cube.tracks || null,
       animation_timing: {
         fps: fps,
@@ -2296,6 +2272,10 @@
       color: planeColor,
       texture: plane.texture || null,
       surface_system: plane.surface_system || null,
+      casts_shadow: plane.casts_shadow !== false,
+      receives_shadow: plane.receives_shadow !== false,
+      no_backface_specular: plane.no_backface_specular === true,
+      reverse_facing: plane.reverse_facing === true,
       light_model: "blinn_phong",
       interpolation: true,
       transparent: isTransparent,
@@ -2363,7 +2343,10 @@
         transform: resolveTrackedMatrix4(spec, "transform", framePos, toMatrix4(transformFallback, null)),
         face_color: resolveTrackedRgba(spec, "face_color", framePos, toRgba(faceColor, [0.96, 0.22, 0.16, 1.0])),
         texture: resolveTrackedObject(spec, "texture", framePos, entityProp(spec, "texture", null)),
-        surface_system: resolveSurfaceSystem(resolveTrackedObject(spec, "surface_system", framePos, entityProp(spec, "surface_system", null)), viewerCamera, seconds)
+        surface_system: resolveSurfaceSystem(resolveTrackedObject(spec, "surface_system", framePos, entityProp(spec, "surface_system", null)), viewerCamera, seconds),
+        casts_shadow: entityProp(spec, "casts_shadow", true) !== false,
+        receives_shadow: entityProp(spec, "receives_shadow", true) !== false,
+        no_backface_specular: entityProp(spec, "no_backface_specular", false) === true
       };
     }
     if (kind === "convex_hull") {
@@ -2472,6 +2455,10 @@
           var center2 = toVec2(entityProp(spec, "center", [0.0, 0.0]), [0.0, 0.0]);
           return [center2[0], center2[1], Number(entityProp(spec, "z", 0.0) || 0.0)];
         }());
+    var quadSurfaceSystem = resolveSurfaceSystem(resolveTrackedObject(spec, "surface_system", framePos, entityProp(spec, "surface_system", null)), viewerCamera, seconds);
+    var quadCastsShadowDefault = quadSurfaceSystem ? false : true;
+    var quadReverseFacing = entityProp(spec, "reverse_facing", false) === true ||
+      (quadSurfaceSystem && quadSurfaceSystem.reverse_facing === true);
     return {
       id: String(spec.id || "plane"),
       kind: "quad",
@@ -2490,7 +2477,11 @@
         color: toRgba(entityProp(spec, "color", [0.20, 0.22, 0.26, 1.0]), [0.20, 0.22, 0.26, 1.0]),
         texture: resolveTrackedObject(spec, "texture", framePos, entityProp(spec, "texture", null)),
         visible: entityProp(spec, "visible", true) !== false,
-        surface_system: resolveSurfaceSystem(resolveTrackedObject(spec, "surface_system", framePos, entityProp(spec, "surface_system", null)), viewerCamera, seconds)
+        surface_system: quadSurfaceSystem,
+        casts_shadow: entityProp(spec, "casts_shadow", quadCastsShadowDefault) !== false,
+        receives_shadow: entityProp(spec, "receives_shadow", true) !== false,
+        no_backface_specular: entityProp(spec, "no_backface_specular", false) === true,
+        reverse_facing: quadReverseFacing
       };
   }
 
@@ -2579,6 +2570,9 @@
             render_mode: renderMode,
             marker_space: String(mesh.marker_space || (String(renderMode).toLowerCase() === "marker_impostor" ? "pixel" : "world")),
             casts_shadow: mesh.casts_shadow !== false,
+            receives_shadow: mesh.receives_shadow !== false,
+            no_backface_specular: mesh.no_backface_specular === true,
+            reverse_facing: mesh.reverse_facing === true,
             no_lighting: mesh.no_lighting === true,
             interpolation: mesh.interpolation === true,
             depth_write: mesh.depth_write === true,
@@ -2614,6 +2608,9 @@
         render_mode: renderMode,
         marker_space: String(mesh.marker_space || (String(renderMode).toLowerCase() === "marker_impostor" ? "pixel" : "world")),
         casts_shadow: mesh.casts_shadow !== false,
+        receives_shadow: mesh.receives_shadow !== false,
+        no_backface_specular: mesh.no_backface_specular === true,
+        reverse_facing: mesh.reverse_facing === true,
         no_lighting: mesh.no_lighting === true,
         interpolation: mesh.interpolation === true,
         depth_write: mesh.depth_write === true,
@@ -3133,13 +3130,6 @@
       meshById[meshSpecs[meshIndex].id] = meshSpecs[meshIndex];
     }
     var lights = lightSpecs.map(function (entry) { return normalizeLight(entry, seconds); });
-    var sourceLightsById = Object.create(null);
-    for (var lightIndex = 0; lightIndex < lights.length; lightIndex += 1) {
-      var sourceLight = lights[lightIndex];
-      if (sourceLight && sourceLight.id) {
-        sourceLightsById[String(sourceLight.id)] = sourceLight;
-      }
-    }
     for (var mirrorIndex = 0; mirrorIndex < meshSpecs.length; mirrorIndex += 1) {
       var mirrorMesh = meshSpecs[mirrorIndex];
       var surfaceSystem = mirrorMesh && mirrorMesh.surface_system && typeof mirrorMesh.surface_system === "object"
@@ -3189,6 +3179,12 @@
         meshes.push(meshPayload);
       }
     }
+    if (renderOptions.show_light_markers === true) {
+      var markerMeshes = buildLightMarkerMeshes(lights, camera, renderOptions.light_marker_size);
+      for (var markerIndex = 0; markerIndex < markerMeshes.length; markerIndex += 1) {
+        meshes.push(markerMeshes[markerIndex]);
+      }
+    }
     return {
       camera: camera,
       lights: lights,
@@ -3210,7 +3206,7 @@
       lights: state.lights,
       background: sceneBackground,
       light_flares: {
-        enabled: renderOptions.show_light_markers === true,
+        enabled: renderOptions.light_flares === true,
         size: Number(renderOptions.light_marker_size || 0.18),
         lights: state.lights,
         occluders: state.flare_occluders
@@ -3242,6 +3238,36 @@
     return adapter;
   }
 
+  function fmtMirrorDebugVec3(value) {
+    var v = Array.isArray(value) ? value : [];
+    return "[" +
+      (Number(v[0] || 0.0)).toFixed(4) + "," +
+      (Number(v[1] || 0.0)).toFixed(4) + "," +
+      (Number(v[2] || 0.0)).toFixed(4) + "]";
+  }
+
+  function debugMirrorCamera(label, camera, extra) {
+    try {
+      var debug = camera && camera._mirrorDebug && typeof camera._mirrorDebug === "object"
+        ? camera._mirrorDebug
+        : {};
+      global.console.warn(
+        "[DEBUG-MIRROR-CAMERA] label=" + String(label || "") +
+        " frame=" + String(frameSpec && frameSpec.frame_id || config.frame_id || "") +
+        " pos=" + fmtMirrorDebugVec3(camera && camera.pos) +
+        " target=" + fmtMirrorDebugVec3(camera && camera.target) +
+        " hasView=" + String(Array.isArray(camera && camera.view_matrix) && camera.view_matrix.length === 16) +
+        " hasProj=" + String(Array.isArray(camera && camera.projection_matrix) && camera.projection_matrix.length === 16) +
+        " planePoint=" + fmtMirrorDebugVec3(debug.planePoint) +
+        " planeNormal=" + fmtMirrorDebugVec3(debug.planeNormal) +
+        " clipApplied=" + String(debug.clipApplied === true) +
+        (extra ? " " + String(extra) : "")
+      );
+    } catch (err) {
+      void err;
+    }
+  }
+
   function resolveLinkedMirrorCamera(baseCamera, seconds) {
     var cameraCfg = config.camera || {};
     var props = cameraCfg && cameraCfg.properties && typeof cameraCfg.properties === "object"
@@ -3257,7 +3283,7 @@
     }
     var sourceCamera = global.__vfNativeSceneLiveCameras[sourceFrameId];
     if (!sourceCamera || !Array.isArray(sourceCamera.pos) || !Array.isArray(sourceCamera.target)) {
-      return baseCamera;
+      failFast('linked reflected camera source frame "' + sourceFrameId + '" is not registered');
     }
     var meshSpecs = Array.isArray(config.meshes)
       ? config.meshes.map(function (mesh) { return normalizeMeshSpec(mesh, seconds, sourceCamera); })
@@ -3265,12 +3291,13 @@
     var mirrorMesh = resolveMeshSpecById(meshSpecs, mirrorMeshId, "linked reflected camera");
     try {
       var adapter = requirePlanarMirrorAdapterMethod("buildRenderCamera", "linked reflected camera");
+      var mirrorPart = renderedMirrorPartForCamera(mirrorMesh, sourceCamera, "linked reflected camera");
       var frameRect = frameSpec && Array.isArray(frameSpec.rect) ? frameSpec.rect : [0, 0, 1, 1];
       var targetAspect = Math.max(1e-4, Number(frameRect[2] || 1.0) / Math.max(1e-4, Number(frameRect[3] || 1.0)));
       if (props.reflect_eye_only === true || props.lock_aperture_camera === true) {
-        var planeSeed = buildMirrorEyeLockedCamera(sourceCamera, mirrorMesh, baseCamera);
-        return adapter.buildRenderCamera({
-          part: { mesh: mirrorMesh },
+        var planeSeed = buildMirrorEyeLockedCamera(sourceCamera, mirrorPart.mesh, baseCamera);
+        var eyeLockedCamera = adapter.buildRenderCamera({
+          part: mirrorPart,
           surfaceCamera: {
             pos: toVec3(sourceCamera.pos, [0.0, 0.0, 0.0]),
             target: toVec3(planeSeed.target, [0.0, 0.0, 0.0]),
@@ -3282,14 +3309,17 @@
           targetAspect: targetAspect,
           math: global.VfGeomMath
         });
+        debugMirrorCamera("linked-reflected-eye-locked", eyeLockedCamera, "source=" + sourceFrameId + " mirror=" + mirrorMeshId);
+        return eyeLockedCamera;
       }
       var reflectedCamera = adapter.buildRenderCamera({
-        part: { mesh: mirrorMesh },
+        part: mirrorPart,
         surfaceCamera: sourceCamera,
         timeMs: seconds * 1000.0,
         targetAspect: targetAspect,
         math: global.VfGeomMath
       });
+      debugMirrorCamera("linked-reflected", reflectedCamera, "source=" + sourceFrameId + " mirror=" + mirrorMeshId);
       if (props.reflect_keep_world_up === true) {
         return {
           pos: toVec3(reflectedCamera.pos, toVec3(sourceCamera.pos, [0.0, 0.0, 0.0])),
@@ -3303,20 +3333,11 @@
       return reflectedCamera;
     } catch (err) {
       var message = err && err.message ? String(err.message) : String(err);
-      if (message.indexOf("mirror surface_system camera lies on or behind the mirror plane") >= 0) {
-        var skipped = cloneCameraState(baseCamera, baseCamera);
-        skipped._skip_render = true;
-        return skipped;
-      }
       failFast("linked reflected camera setup failed: " + message);
     }
   }
 
   function resolveMirrorApertureCamera(baseCamera, seconds, targetAspect) {
-    if (Array.isArray(baseCamera && baseCamera.view_matrix) && baseCamera.view_matrix.length === 16 &&
-        Array.isArray(baseCamera && baseCamera.projection_matrix) && baseCamera.projection_matrix.length === 16) {
-      return baseCamera;
-    }
     var cameraCfg = config.camera || {};
     var props = cameraCfg && cameraCfg.properties && typeof cameraCfg.properties === "object"
       ? cameraCfg.properties
@@ -3325,26 +3346,32 @@
     if (!mirrorMeshId) {
       return baseCamera;
     }
+    var forceAperture = props.lock_aperture_camera === true;
+    if (Array.isArray(baseCamera && baseCamera.view_matrix) && baseCamera.view_matrix.length === 16 &&
+        Array.isArray(baseCamera && baseCamera.projection_matrix) && baseCamera.projection_matrix.length === 16) {
+      if (!forceAperture) {
+        debugMirrorCamera("aperture-skip-existing-matrices", baseCamera, "mirror=" + mirrorMeshId);
+        return baseCamera;
+      }
+      debugMirrorCamera("aperture-force-existing-matrices", baseCamera, "mirror=" + mirrorMeshId);
+    }
     var meshSpecs = Array.isArray(config.meshes)
       ? config.meshes.map(function (mesh) { return normalizeMeshSpec(mesh, seconds, baseCamera); })
       : [];
     var mirrorMesh = resolveMeshSpecById(meshSpecs, mirrorMeshId, "aperture camera");
     try {
       var adapter = requirePlanarMirrorAdapterMethod("buildApertureCamera", "aperture camera");
-      return adapter.buildApertureCamera({
-        part: { mesh: mirrorMesh },
+      var mirrorPart = renderedMirrorPartForCamera(mirrorMesh, baseCamera, "aperture camera");
+      var apertureCamera = adapter.buildApertureCamera({
+        part: mirrorPart,
         surfaceCamera: baseCamera,
         timeMs: seconds * 1000.0,
         targetAspect: targetAspect,
         math: global.VfGeomMath
       });
+      debugMirrorCamera("aperture-built", apertureCamera, "mirror=" + mirrorMeshId);
+      return apertureCamera;
     } catch (err) {
-      var message = err && err.message ? String(err.message) : String(err);
-      if (message.indexOf("mirror aperture camera lies on or behind the mirror plane") >= 0) {
-        var skipped = cloneCameraState(baseCamera, baseCamera);
-        skipped._skip_render = true;
-        return skipped;
-      }
       failFast("aperture camera setup failed: " + (err && err.message ? err.message : String(err)));
     }
   }
@@ -3453,6 +3480,45 @@
     return { width: width, height: height };
   }
 
+  function visibleFramePixels(frameEl, bodyEl) {
+    var rect = bodyEl && typeof bodyEl.getBoundingClientRect === "function"
+      ? bodyEl.getBoundingClientRect()
+      : { width: 1, height: 1 };
+    var width = Math.max(1, Number(rect.width || 1) || 1);
+    var height = Math.max(1, Number(rect.height || 1) || 1);
+    if (String(frameSpec && frameSpec.aspect || "").toLowerCase() === "equal") {
+      var fit = Math.max(1, Math.min(width, height));
+      width = fit;
+      height = fit;
+    }
+    return { width: width, height: height };
+  }
+
+  function frameCameraConfigSignature() {
+    try {
+      return JSON.stringify({
+        frame_id: frameSpec && frameSpec.frame_id || config.frame_id || "",
+        visible: frameSpec && frameSpec.visible,
+        camera: config.camera || null,
+        meshes: (Array.isArray(config.meshes) ? config.meshes : []).map(function (mesh) {
+          return {
+            id: mesh && mesh.id,
+            kind: mesh && mesh.kind,
+            properties: mesh && mesh.properties,
+            center: mesh && mesh.center,
+            size: mesh && mesh.size,
+            rotation: mesh && mesh.rotation,
+            transform: mesh && mesh.transform,
+            surface_system: mesh && mesh.surface_system,
+            reverse_facing: mesh && mesh.reverse_facing
+          };
+        })
+      });
+    } catch (err) {
+      failFast("frame camera config signature failed: " + (err && err.message ? err.message : String(err)));
+    }
+  }
+
   function boot() {
     requireRuntime();
     var frame = document.querySelector('.vf-frame[data-vf-frame-id="' + String(frameSpec.frame_id || config.frame_id) + '"]');
@@ -3486,14 +3552,32 @@
           keyLeft: false,
           keyRight: false,
           keyUp: false,
-          keyDown: false
+          keyDown: false,
+          dependencyWaitStartMs: 0.0
         };
       }
     var controlState = controlRegistry.states[watchedFrameId];
+    var configSignature = frameCameraConfigSignature();
+    controlState.zoomFactor = 1.0;
+    controlState.orbitPhi = 0.0;
+    controlState.orbitTheta = 0.0;
+    controlState.keyLeft = false;
+    controlState.keyRight = false;
+    controlState.keyUp = false;
+    controlState.keyDown = false;
+    controlState.apertureInitDone = false;
+    controlState.userInteracted = false;
+    controlState.linkedEyeKey = "";
+    controlState.baseCamera = null;
+    controlState.exactInitCamera = null;
+    controlState.dependencyWaitStartMs = 0.0;
+    controlState.configSignature = configSignature;
     var useVisibleFrame = sceneFrameVisible();
     var dependencySourceFrameId = String(cameraBehaviorProps().reflect_of_frame_id || "").trim();
     var offscreenSpec = null;
     var offscreenMounted = false;
+    var visibleSpec = null;
+    var visibleMounted = false;
     var offscreenPixels = null;
     if (!useVisibleFrame) {
       if (!global.VfDisplay || typeof global.VfDisplay.mountOffscreenGeomFrame !== "function") {
@@ -3506,6 +3590,43 @@
           renderFrame();
         });
       }
+    }
+    function ensureVisibleGeomMount() {
+      if (!useVisibleFrame || visibleMounted) { return; }
+      if (!global.VfDisplay || typeof global.VfDisplay.mountDynamicGeomFrame !== "function") {
+        failFast("visible scene frame support is unavailable");
+      }
+      global.VfDisplay.mountDynamicGeomFrame(watchedFrameId, function () {
+        return visibleSpec;
+      });
+      visibleMounted = true;
+    }
+    function pushVisibleRender(rendered) {
+      var payload = rendered && rendered.payload && typeof rendered.payload === "object"
+        ? rendered.payload
+        : { screen: [], frames: {}, geom: {} };
+      var geomPayload = payload.geom && typeof payload.geom === "object"
+        ? payload.geom[watchedFrameId] || null
+        : null;
+      var has2dPayload = !!(
+        (Array.isArray(payload.screen) && payload.screen.length > 0) ||
+        (payload.frames && typeof payload.frames === "object" && Object.keys(payload.frames).length > 0)
+      );
+      if (geomPayload && !has2dPayload) {
+        var nextVisibleSpec = cloneJsonValue(geomPayload);
+        if (nextVisibleSpec && nextVisibleSpec.camera && frame && body) {
+          var fitRect = visibleFramePixels(frame, body);
+          nextVisibleSpec.camera = Object.assign({}, nextVisibleSpec.camera, {
+            viewport_width_px: Math.max(1, Math.round(fitRect.width || 1)),
+            viewport_height_px: Math.max(1, Math.round(fitRect.height || 1))
+          });
+        }
+        visibleSpec = nextVisibleSpec;
+        ensureVisibleGeomMount();
+        global.VfDisplay.requestDynamicGeomFrameUpdate(watchedFrameId);
+        return;
+      }
+      global.VfDisplay.renderFromJson(payload);
     }
     function markActiveFrame() {
       controlRegistry.activeFrameId = watchedFrameId;
@@ -3535,6 +3656,33 @@
       target.addEventListener("pointermove", markActiveFrame, { passive: true });
       target.addEventListener("pointerdown", markActiveFrame, { passive: true });
     }
+    function eventFrameId(ev) {
+      var target = ev && ev.target;
+      var frameEl = target && typeof target.closest === "function" ? target.closest(".vf-frame") : null;
+      if (!frameEl && ev && typeof ev.composedPath === "function") {
+        var path = ev.composedPath();
+        for (var i = 0; i < path.length; i++) {
+          var node = path[i];
+          if (node && typeof node.getAttribute === "function" && node.classList && node.classList.contains("vf-frame")) {
+            frameEl = node;
+            break;
+          }
+        }
+      }
+      return frameEl ? String(frameEl.getAttribute("data-vf-frame-id") || "").trim() : "";
+    }
+    function keyEventTargetsTextInput(ev) {
+      var target = ev && ev.target;
+      if (!target) { return false; }
+      var tagName = String(target.tagName || "").toLowerCase();
+      if (tagName === "input" || tagName === "textarea" || tagName === "select") { return true; }
+      return target.isContentEditable === true;
+    }
+    function keyEventAllowedForActiveFrame(ev, activeFrameId) {
+      if (keyEventTargetsTextInput(ev)) { return false; }
+      var fid = eventFrameId(ev);
+      return !fid || fid === activeFrameId;
+    }
     if (useVisibleFrame) {
       attachFrameZoomTarget(frame);
       attachFrameZoomTarget(body);
@@ -3548,22 +3696,8 @@
         if (!activeFrameId) { return; }
         var activeState = registry && registry.states ? registry.states[activeFrameId] : null;
         if (!activeState) { return; }
-        var target = ev && ev.target;
-        var frameEl = target && typeof target.closest === "function" ? target.closest(".vf-frame") : null;
-        if (!frameEl && ev && typeof ev.composedPath === "function") {
-          var path = ev.composedPath();
-          for (var i = 0; i < path.length; i++) {
-            var node = path[i];
-            if (node && typeof node.getAttribute === "function" && node.classList && node.classList.contains("vf-frame")) {
-              frameEl = node;
-              break;
-            }
-          }
-        }
-        if (frameEl) {
-          var fid = String(frameEl.getAttribute("data-vf-frame-id") || "").trim();
-          if (fid && fid !== activeFrameId) { return; }
-        }
+        var fid = eventFrameId(ev);
+        if (!fid || fid !== activeFrameId) { return; }
         applyWheelZoom(activeState, ev);
       }, { passive: false, capture: true });
     }
@@ -3578,6 +3712,7 @@
           : null;
         if (!activeState) { return; }
         if (activeState.controlsEnabled === false) { return; }
+        if (!keyEventAllowedForActiveFrame(ev, activeFrameId)) { return; }
         ev.preventDefault();
         if (key === "ArrowLeft") { activeState.keyLeft = true; }
         else if (key === "ArrowRight") { activeState.keyRight = true; }
@@ -3593,6 +3728,7 @@
           ? global.__vfNativeSceneCameraControls.states[activeFrameId]
           : null;
         if (!activeState) { return; }
+        if (!keyEventAllowedForActiveFrame(ev, activeFrameId)) { return; }
         if (key === "ArrowLeft") { activeState.keyLeft = false; }
         else if (key === "ArrowRight") { activeState.keyRight = false; }
         else if (key === "ArrowUp") { activeState.keyUp = false; }
@@ -3618,6 +3754,7 @@
         ? global.VfDisplay.geomFrameStatus(watchedFrameId)
         : null;
       if (status && status.runningRenderers > 0) {
+        clearStatusOverlay();
         return;
       }
       if (status) {
@@ -3641,6 +3778,21 @@
             ? (global.performance.now() * 0.001)
             : (Date.now() * 0.001);
           var nowMs = seconds * 1000.0;
+          if (!useVisibleFrame && dependencySourceFrameId) {
+            var dependencyCamera = global.__vfNativeSceneLiveCameras && global.__vfNativeSceneLiveCameras[dependencySourceFrameId];
+            if (!dependencyCamera || !Array.isArray(dependencyCamera.pos) || !Array.isArray(dependencyCamera.target)) {
+              if (!(controlState.dependencyWaitStartMs > 0.0)) {
+                controlState.dependencyWaitStartMs = nowMs;
+              }
+              if ((nowMs - controlState.dependencyWaitStartMs) > 4000.0) {
+                failFast('dependent reflected frame "' + watchedFrameId + '" timed out waiting for source frame "' + dependencySourceFrameId + '"');
+              }
+              controlState.rendering = false;
+              global.setTimeout(renderFrame, 16);
+              return;
+            }
+            controlState.dependencyWaitStartMs = 0.0;
+          }
           var dtSec = controlState.lastRenderTsMs > 0
             ? Math.max(0.0, Math.min(0.1, (nowMs - controlState.lastRenderTsMs) * 0.001))
             : (1.0 / 60.0);
@@ -3771,21 +3923,18 @@
         }
         var rendered = renderPayload(renderCamera, seconds);
         if (useVisibleFrame) {
-          global.VfDisplay.renderFromJson(rendered.payload);
+          pushVisibleRender(rendered);
         } else {
           offscreenSpec = rendered.payload && rendered.payload.geom
             ? rendered.payload.geom[watchedFrameId] || null
             : null;
           if (!offscreenMounted) {
-            if (offscreenSpec) {
-              global.VfDisplay.mountOffscreenGeomFrame(watchedFrameId, function () {
-                return offscreenSpec;
-              }, offscreenPixels.width, offscreenPixels.height);
-              offscreenMounted = true;
-            }
-          } else {
-            global.VfDisplay.requestDynamicGeomFrameUpdate(watchedFrameId);
+            global.VfDisplay.mountOffscreenGeomFrame(watchedFrameId, function () {
+              return offscreenSpec;
+            }, offscreenPixels.width, offscreenPixels.height);
+            offscreenMounted = true;
           }
+          global.VfDisplay.requestDynamicGeomFrameUpdate(watchedFrameId);
         }
         controlState.rendering = false;
         if (useVisibleFrame || !dependencySourceFrameId) {

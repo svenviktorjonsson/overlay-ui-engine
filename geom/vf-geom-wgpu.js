@@ -161,6 +161,30 @@
     wlog("info", "[lights " + String(renderer._frameId || "frame") + " " + (renderer._offscreenFrame === true ? "offscreen" : "visible") + " " + String(label || "") + "] " + out.join(" "));
   }
 
+  function maybeLogMirrorCamera(renderer, mesh) {
+    if (!renderer || !mesh || !mesh.camera || !mesh.camera._mirrorDebug) { return; }
+    var now = Date.now();
+    if ((now - Number(renderer._debugLastMirrorCameraLogAt || 0)) < 800) {
+      return;
+    }
+    renderer._debugLastMirrorCameraLogAt = now;
+    var cam = mesh.camera || {};
+    var dbg = cam._mirrorDebug || {};
+    wlog(
+      "warn",
+      "[DEBUG-MIRROR-CAMERA-WGPU] frame=" + String(renderer._frameId || "frame") +
+      " mode=" + (renderer._offscreenFrame === true ? "offscreen" : "visible") +
+      " pos=" + fmtVec3(cam.pos) +
+      " target=" + fmtVec3(cam.target) +
+      " planePoint=" + fmtVec3(dbg.planePoint) +
+      " planeNormal=" + fmtVec3(dbg.planeNormal) +
+      " hasView=" + String(Array.isArray(cam.view_matrix) && cam.view_matrix.length === 16) +
+      " hasProj=" + String(Array.isArray(cam.projection_matrix) && cam.projection_matrix.length === 16) +
+      " clipApplied=" + String(dbg.clipApplied === true) +
+      " clipReason=" + String(dbg.clipFallbackReason || "")
+    );
+  }
+
   var FRAME_BLIT_SHADER = `
 struct VOut {
   @builtin(position) pos : vec4<f32>,
@@ -259,8 +283,8 @@ fn fs_blit(in : VOut) -> @location(0) vec4<f32> {
           failFast("mirror aperture camera computed a collapsed off-axis frustum");
         }
         void targetAspect;
-        var returnedUp = [0.0, 0.0, 1.0];
-        var target = plane.point.slice();
+        var returnedUp = normalizeVec3(surfaceCamera.up || [0, 0, 1], [0, 0, 1]);
+        var target = surfaceCamera.target ? vec3Or(surfaceCamera.target, plane.point) : plane.point.slice();
         var view = mat4FromCameraBasis(eye, basis.right, basis.up, basis.backward);
         var projection = mat4FrustumOffCenterZ01(left, right, bottom, top, near, far);
         var clipResult = { clipped: false, reason: "" };
@@ -269,7 +293,7 @@ fn fs_blit(in : VOut) -> @location(0) vec4<f32> {
           if (viewerPos && dotVec3(frontNormalWorld, subVec3(viewerPos, plane.point)) < 0.0) {
             frontNormalWorld = scaleVec3(frontNormalWorld, -1.0);
           }
-          var clipPlanePointWorld = addVec3(plane.point, scaleVec3(frontNormalWorld, 1e-3));
+        var clipPlanePointWorld = addVec3(plane.point, scaleVec3(frontNormalWorld, relativePlaneEpsilon(plane, null, 1e-5)));
           var clipNormalWorld = frontNormalWorld.slice();
           if (dotVec3(clipNormalWorld, subVec3(eye, clipPlanePointWorld)) > 0.0) {
             clipNormalWorld = scaleVec3(clipNormalWorld, -1.0);
@@ -321,7 +345,7 @@ fn fs_blit(in : VOut) -> @location(0) vec4<f32> {
         );
         var near = 0.05;
         var far = 500.0;
-        var clipEpsilon = 1e-3;
+        var clipEpsilon = relativePlaneEpsilon(plane, null, 1e-5);
         var reflectedPos = reflectPointAcrossPlane(surfaceCamera.pos, plane.point, plane.normal);
         var reflectedTarget = reflectPointAcrossPlane(surfaceCamera.target, plane.point, plane.normal);
         var reflectedUp = normalizeVec3(reflectDirAcrossPlane(surfaceCamera.up || [0, 0, 1], plane.normal), [0, 0, 1]);
@@ -346,8 +370,8 @@ fn fs_blit(in : VOut) -> @location(0) vec4<f32> {
           failFast("mirror surface_system computed a collapsed off-axis frustum");
         }
         void targetAspect;
-        var returnedUp = [0.0, 0.0, 1.0];
-        var returnedTarget = plane.point.slice();
+        var returnedUp = basis.up.slice();
+        var returnedTarget = addVec3(reflectedPos, scaleVec3(basis.backward, -1.0));
         var view = mat4FromCameraBasis(reflectedPos, basis.right, basis.up, basis.backward);
         var projection = mat4FrustumOffCenterZ01(left, right, bottom, top, near, far);
         var frontNormalWorld = plane.normal.slice();
@@ -418,7 +442,7 @@ struct Scene {
   light_count: u32,           // 4 bytes   offset 272
   light_model: u32,           // 4 bytes   offset 276
   alpha_mul  : f32,           // 4 bytes   offset 280
-  shadow0_count: u32,         // 4 bytes   offset 284
+  receive_shadow: u32,        // 4 bytes   offset 284
   shadow1_count: u32,         // 4 bytes   offset 288
   shadow0_softness: f32,      // 4 bytes   offset 292
   shadow1_softness: f32,      // 4 bytes   offset 296
@@ -851,7 +875,7 @@ fn shadowMapVisibility0(worldPos: vec3<f32>, normal: vec3<f32>) -> f32 {
   }
   let dims = vec2<f32>(textureDimensions(shadowTex0));
   let texel = vec2<f32>(1.0 / max(dims.x, 1.0), 1.0 / max(dims.y, 1.0));
-  let refDepth = ndc.z - (sc.shadow_meta.y + 0.00045);
+  let refDepth = ndc.z - (sc.shadow_meta.y + 0.00125);
   var vis = 0.0;
   for (var oy: i32 = -2; oy <= 2; oy = oy + 1) {
     for (var ox: i32 = -2; ox <= 2; ox = ox + 1) {
@@ -881,7 +905,7 @@ fn shadowMapVisibility1(worldPos: vec3<f32>, normal: vec3<f32>) -> f32 {
   }
   let dims = vec2<f32>(textureDimensions(shadowTex1));
   let texel = vec2<f32>(1.0 / max(dims.x, 1.0), 1.0 / max(dims.y, 1.0));
-  let refDepth = ndc.z - (sc.shadow_meta.w + 0.00045);
+  let refDepth = ndc.z - (sc.shadow_meta.w + 0.00125);
   var vis = 0.0;
   for (var oy: i32 = -2; oy <= 2; oy = oy + 1) {
     for (var ox: i32 = -2; ox <= 2; ox = ox + 1) {
@@ -898,7 +922,7 @@ fn checkerValue(p: vec2<f32>) -> f32 {
   let base = abs(cell - (2.0 * floor(cell * 0.5)));
   let fp = fract(p);
   let distToGrid = min(fp, vec2<f32>(1.0, 1.0) - fp);
-  let fw = max(fwidth(p), vec2<f32>(1e-4, 1e-4));
+  let fw = vec2<f32>(0.006, 0.006);
   let edgeBlendX = 1.0 - smoothstep(0.0, fw.x, distToGrid.x);
   let edgeBlendY = 1.0 - smoothstep(0.0, fw.y, distToGrid.y);
   let edgeBlend = clamp(max(edgeBlendX, edgeBlendY), 0.0, 1.0);
@@ -922,9 +946,7 @@ fn segmentDistance(uv: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
 }
 
 fn uvUnitsPerPixel(uv: vec2<f32>) -> f32 {
-  let dx = dpdx(uv);
-  let dy = dpdy(uv);
-  return max(max(length(dx), length(dy)), 1e-5);
+  return 0.01;
 }
 
 fn graphLineMask(uv: vec2<f32>, a: vec2<f32>, b: vec2<f32>, widthPx: f32, uvPerPx: f32) -> f32 {
@@ -1360,13 +1382,7 @@ fn surfaceWorldSceneColor(base: vec3<f32>, localPos: vec3<f32>, worldPos: vec3<f
   if (maxUv > 0.995) {
     return mix(base, sc.texture_color_b.rgb, frameAlpha);
   }
-  let viewerDirWorld = normalize(sc.cam_pos - worldPos);
   let screenFlags = i32(sc.texture_params.w + 0.5);
-  let reverseFacing = (screenFlags & 1) != 0;
-  let facing = dot(normalize(hostNormal), viewerDirWorld) * select(1.0, -1.0, reverseFacing);
-  if (facing <= 1e-4) {
-    return base;
-  }
   var uv = vec2<f32>(
     clamp(surfaceUv.x, 0.0, 1.0),
     clamp(surfaceUv.y, 0.0, 1.0)
@@ -1374,13 +1390,17 @@ fn surfaceWorldSceneColor(base: vec3<f32>, localPos: vec3<f32>, worldPos: vec3<f
   if ((screenFlags & 2) != 0) {
     uv.x = 1.0 - uv.x;
   }
+  if ((screenFlags & 4) != 0) {
+    uv.y = 1.0 - uv.y;
+  }
   let sampleColor = textureSampleLevel(surfaceTex, surfaceSampler, uv, 0.0);
+  let sampleAlpha = clamp(sampleColor.a, 0.0, 1.0);
   if (sc.texture_params.x > 3.5) {
     let reflectivity = clamp(sc.surface_cam_forward_count.w, 0.0, 1.0);
-    let reflectedLayer = mix(contentBg, sampleColor.rgb, clamp(sampleColor.a, 0.0, 1.0));
+    let reflectedLayer = mix(contentBg, sampleColor.rgb, sampleAlpha);
     return mix(contentBg, reflectedLayer, reflectivity);
   }
-  return mix(contentBg, sampleColor.rgb, clamp(sampleColor.a, 0.0, 1.0));
+  return mix(contentBg, sampleColor.rgb, sampleAlpha);
 }
 
 fn texturePatternValue(kindCode: f32, p: vec2<f32>) -> f32 {
@@ -1423,15 +1443,15 @@ fn shadeLitBase(base: vec3<f32>, alpha: f32, worldPos: vec3<f32>, inputNormal: v
   let V = normalize(sc.cam_pos - worldPos);
   var N = normalize(inputNormal);
   let facing = dot(N, V);
-  let suppressSpecular = backfaceSpecularOff && facing < 0.0;
-  if (!suppressSpecular && facing < 0.0) {
+  let suppressBackfaceLighting = backfaceSpecularOff && facing < 0.0;
+  if (!suppressBackfaceLighting && facing < 0.0) {
     N = -N;
   }
   var diffuse = vec3f(0.0, 0.0, 0.0);
   var specular = vec3f(0.0, 0.0, 0.0);
-  if (sc.light_count > 0u) {
-    let stableVis0 = shadowMapVisibility0(worldPos, N);
-    let contactVis0 = planarContactVisibility0(worldPos, sc.light0_pos);
+  if (!suppressBackfaceLighting && sc.light_count > 0u) {
+    let stableVis0 = select(1.0, shadowMapVisibility0(worldPos, N), sc.receive_shadow != 0u);
+    let contactVis0 = select(1.0, planarContactVisibility0(worldPos, sc.light0_pos), sc.receive_shadow != 0u);
     let vis0 = select(min(stableVis0, contactVis0), 1.0, sc.light0_spot_params.w >= 1.5);
     let toLight0 = sc.light0_pos - worldPos;
     let dist0 = max(length(toLight0), 1e-6);
@@ -1447,15 +1467,15 @@ fn shadeLitBase(base: vec3<f32>, alpha: f32, worldPos: vec3<f32>, inputNormal: v
     let litScale0 = vis0 * atten0 * spot0 * proj0;
     let diff0 = max(dot(N, L0), 0.0);
     diffuse += (litScale0 * diff0) * lc0 * base;
-    if (!suppressSpecular && sc.light0_spot_params.w < 1.5) {
+    if (sc.light0_spot_params.w < 1.5) {
       let H0 = normalize(L0 + V);
       let spec0 = pow(max(dot(N, H0), 0.0), 40.0);
       specular += (litScale0 * spec0) * lc0 * (1.8 * a);
     }
   }
-  if (sc.light_count > 1u) {
-    let stableVis1 = shadowMapVisibility1(worldPos, N);
-    let contactVis1 = planarContactVisibility1(worldPos, sc.light1_pos);
+  if (!suppressBackfaceLighting && sc.light_count > 1u) {
+    let stableVis1 = select(1.0, shadowMapVisibility1(worldPos, N), sc.receive_shadow != 0u);
+    let contactVis1 = select(1.0, planarContactVisibility1(worldPos, sc.light1_pos), sc.receive_shadow != 0u);
     let vis1 = select(min(stableVis1, contactVis1), 1.0, sc.light1_spot_params.w >= 1.5);
     let toLight1 = sc.light1_pos - worldPos;
     let dist1 = max(length(toLight1), 1e-6);
@@ -1471,7 +1491,7 @@ fn shadeLitBase(base: vec3<f32>, alpha: f32, worldPos: vec3<f32>, inputNormal: v
     let litScale1 = vis1 * atten1 * spot1 * proj1;
     let diff1 = max(dot(N, L1), 0.0);
     diffuse += (litScale1 * diff1) * lc1 * base;
-    if (!suppressSpecular && sc.light1_spot_params.w < 1.5) {
+    if (sc.light1_spot_params.w < 1.5) {
       let H1 = normalize(L1 + V);
       let spec1 = pow(max(dot(N, H1), 0.0), 40.0);
       specular += (litScale1 * spec1) * lc1 * (1.8 * a);
@@ -1483,6 +1503,44 @@ fn shadeLitBase(base: vec3<f32>, alpha: f32, worldPos: vec3<f32>, inputNormal: v
   let ambient = 0.10 * base;
   let lit = (ambient + diffuse) * a + specular;
   return vec4f(lit, a);
+}
+
+fn receivedShadowVisibility(worldPos: vec3<f32>, inputNormal: vec3<f32>) -> f32 {
+  if (sc.receive_shadow == 0u) {
+    return 1.0;
+  }
+  var visibility = 1.0;
+  let N = normalize(inputNormal);
+  if (sc.light_count > 0u) {
+    let stableVis0 = shadowMapVisibility0(worldPos, N);
+    let contactVis0 = planarContactVisibility0(worldPos, sc.light0_pos);
+    visibility = min(visibility, min(stableVis0, contactVis0));
+  }
+  if (sc.light_count > 1u) {
+    let stableVis1 = shadowMapVisibility1(worldPos, N);
+    let contactVis1 = planarContactVisibility1(worldPos, sc.light1_pos);
+    visibility = min(visibility, min(stableVis1, contactVis1));
+  }
+  return visibility;
+}
+
+fn shadeAmbientBase(base: vec3<f32>, alpha: f32) -> vec4f {
+  let a = alpha * sc.alpha_mul;
+  if (sc.light_count == 0u) {
+    return vec4f(base, a);
+  }
+  return vec4f((0.10 * base) * a, a);
+}
+
+fn screenSurfaceFrontMask(inputNormal: vec3<f32>) -> f32 {
+  let surfaceCenter = (sc.model * vec4f(0.0, 0.0, 0.0, 1.0)).xyz;
+  var rawNormal = (sc.model * vec4f(0.0, 0.0, 1.0, 0.0)).xyz;
+  if (length(rawNormal) <= 1e-6) {
+    rawNormal = inputNormal;
+  }
+  let surfaceNormal = normalize(rawNormal);
+  let cameraSide = dot(surfaceNormal, sc.cam_pos - surfaceCenter);
+  return select(0.0, 1.0, cameraSide > 1e-4);
 }
 
 fn screenSurfaceLayer(base: vec3<f32>, baseAlpha: f32, localPos: vec3<f32>, worldPos: vec3<f32>, hostNormal: vec3<f32>, surfaceProjPos: vec4<f32>) -> vec4<f32> {
@@ -1505,19 +1563,16 @@ fn screenSurfaceLayer(base: vec3<f32>, baseAlpha: f32, localPos: vec3<f32>, worl
   if (maxUv > 0.995) {
     return vec4<f32>(mix(base, sc.texture_color_b.rgb, frameAlpha), surfaceAlpha);
   }
-  let viewerDirWorld = normalize(sc.cam_pos - worldPos);
   let screenFlags = i32(sc.texture_params.w + 0.5);
-  let reverseFacing = (screenFlags & 1) != 0;
-  let facing = dot(normalize(hostNormal), viewerDirWorld) * select(1.0, -1.0, reverseFacing);
-  if (facing <= 1e-4) {
-    return vec4<f32>(baseLayer, surfaceAlpha);
-  }
   var uv = vec2<f32>(
     clamp(surfaceUv.x, 0.0, 1.0),
     clamp(surfaceUv.y, 0.0, 1.0)
   );
   if ((screenFlags & 2) != 0) {
     uv.x = 1.0 - uv.x;
+  }
+  if ((screenFlags & 4) != 0) {
+    uv.y = 1.0 - uv.y;
   }
   let reflectionSample = textureSampleLevel(surfaceTex, surfaceSampler, uv, 0.0);
   let reflectivity = clamp(sc.surface_cam_forward_count.w, 0.0, 1.0);
@@ -1645,9 +1700,15 @@ fn vs_line_impostor(v: CylinderInstVin) -> LineImpostorVOut {
 @fragment
 fn fs(i: Vout) -> @location(0) vec4f {
   if (sc.texture_params.x > 3.5) {
-    let surfaceLit = shadeLitBase(i.color.rgb, i.color.a, i.world_pos, i.normal, sc.surface_cam_up_pad.w > 0.5);
-    let composed = surfaceWorldSceneColor(surfaceLit.rgb, i.local_pos, i.world_pos, i.normal, i.surface_proj_pos, true);
-    return vec4f(composed, surfaceLit.a);
+    let frontMask = screenSurfaceFrontMask(i.normal);
+    if (frontMask < 0.5 && sc.surface_cam_up_pad.w > 0.5) {
+      return shadeAmbientBase(i.color.rgb, i.color.a);
+    }
+    let surfaceLit = shadeLitBase(i.color.rgb, i.color.a, i.world_pos, i.normal, false);
+    let composed = surfaceWorldSceneColor(i.color.rgb, i.local_pos, i.world_pos, i.normal, i.surface_proj_pos, true);
+    let shadowVisibility = receivedShadowVisibility(i.world_pos, i.normal);
+    let shadowedComposed = composed * mix(0.38, 1.0, shadowVisibility);
+    return vec4f(mix(surfaceLit.rgb, shadowedComposed, frontMask), surfaceLit.a);
   }
   let base = proceduralTexture(i.color.rgb, i.local_pos, i.world_pos, i.normal, i.surface_proj_pos);
   return shadeLitBase(base, i.color.a, i.world_pos, i.normal, sc.surface_cam_up_pad.w > 0.5);
@@ -2329,7 +2390,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     u32[69] = lightModel;
     f32[70] = Number(alphaMul);
     if (!Number.isFinite(f32[70])) { f32[70] = 1.0; }
-    u32[71] = 0;
+    u32[71] = meshLike && meshLike.receives_shadow === false ? 0 : 1;
     u32[72] = 0;
     f32[73] = 0.0;
     f32[74] = 0.0;
@@ -2338,11 +2399,12 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
         f32[base + clear] = 0.0;
       }
       if (!occluder || typeof occluder !== "object") { return; }
-      var planePoint = Array.isArray(occluder.plane_point) ? occluder.plane_point : [0.0, 0.0, 0.0];
-      var planeNormal = Array.isArray(occluder.plane_normal) ? occluder.plane_normal : [0.0, 0.0, 1.0];
-      var uAxis = Array.isArray(occluder.u_axis) ? occluder.u_axis : [1.0, 0.0, 0.0];
-      var vAxis = Array.isArray(occluder.v_axis) ? occluder.v_axis : [0.0, 1.0, 0.0];
-      var points = Array.isArray(occluder.points) ? occluder.points : [];
+      var packet = requirePlanarPacket(occluder, "planar contact occluder");
+      var planePoint = packet.planePoint;
+      var planeNormal = packet.planeNormal;
+      var uAxis = packet.uAxis;
+      var vAxis = packet.vAxis;
+      var points = packet.points;
       var count = Math.min(MAX_LIGHT_APERTURE_POINTS, points.length);
       f32[base + 0] = Number(planePoint[0]) || 0.0;
       f32[base + 1] = Number(planePoint[1]) || 0.0;
@@ -2361,7 +2423,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       f32[base + 18] = Math.max(0.0, Number(occluder.clip_epsilon || 0.0) || 0.0);
       f32[base + 19] = Math.max(f32[base + 18], Number(occluder.contact_band || 0.08) || 0.08);
       for (var pointIndex = 0; pointIndex < count; pointIndex += 1) {
-        var point = Array.isArray(points[pointIndex]) ? points[pointIndex] : [0.0, 0.0];
+        var point = points[pointIndex];
         var pointBase = base + 20 + (pointIndex * 4);
         f32[pointBase + 0] = Number(point[0]) || 0.0;
         f32[pointBase + 1] = Number(point[1]) || 0.0;
@@ -2446,6 +2508,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
         var screenFlags = 0.0;
         if (surfaceSystem.reverse_facing === true) { screenFlags += 1.0; }
         if (surfaceSystem.flip_x === true) { screenFlags += 2.0; }
+        if (surfaceSystem.flip_y === true) { screenFlags += 4.0; }
         f32[343] = screenFlags;
       }
     if (hasSurfaceTriangles) {
@@ -2548,6 +2611,10 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     var lightApertureHeaderStride = 20;
     var lightAperturePointsStride = MAX_LIGHT_APERTURE_POINTS * 4;
     var lightAperturePointsBase = lightApertureBase + (2 * lightApertureHeaderStride);
+    function finiteComponent(values, index, fallback) {
+      var n = Number(values && values[index]);
+      return Number.isFinite(n) ? n : fallback;
+    }
     function writeLightAperture(lightIndex, lightValue) {
       var base = lightApertureBase + (lightIndex * lightApertureHeaderStride);
       var ptsBase = lightAperturePointsBase + (lightIndex * lightAperturePointsStride);
@@ -2563,31 +2630,32 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
         return;
       }
       var aperture = lightValue.projected_aperture;
-      var planePoint = Array.isArray(aperture.plane_point) ? aperture.plane_point : [0.0, 0.0, 0.0];
-      var planeNormal = Array.isArray(aperture.plane_normal) ? aperture.plane_normal : [0.0, 0.0, 1.0];
-      var uAxis = Array.isArray(aperture.u_axis) ? aperture.u_axis : [1.0, 0.0, 0.0];
-      var vAxis = Array.isArray(aperture.v_axis) ? aperture.v_axis : [0.0, 1.0, 0.0];
-      var points = Array.isArray(aperture.points) ? aperture.points : [];
+      var packet = requirePlanarPacket(aperture, "projected light aperture");
+      var planePoint = packet.planePoint;
+      var planeNormal = packet.planeNormal;
+      var uAxis = packet.uAxis;
+      var vAxis = packet.vAxis;
+      var points = packet.points;
       var count = Math.min(MAX_LIGHT_APERTURE_POINTS, points.length);
-      f32[base + 0] = Number(planePoint[0]) || 0.0;
-      f32[base + 1] = Number(planePoint[1]) || 0.0;
-      f32[base + 2] = Number(planePoint[2]) || 0.0;
-      f32[base + 4] = Number(planeNormal[0]) || 0.0;
-      f32[base + 5] = Number(planeNormal[1]) || 0.0;
-      f32[base + 6] = Number(planeNormal[2]) || 1.0;
-      f32[base + 8] = Number(uAxis[0]) || 0.0;
-      f32[base + 9] = Number(uAxis[1]) || 0.0;
-      f32[base + 10] = Number(uAxis[2]) || 0.0;
-      f32[base + 12] = Number(vAxis[0]) || 0.0;
-      f32[base + 13] = Number(vAxis[1]) || 0.0;
-      f32[base + 14] = Number(vAxis[2]) || 0.0;
+      f32[base + 0] = finiteComponent(planePoint, 0, 0.0);
+      f32[base + 1] = finiteComponent(planePoint, 1, 0.0);
+      f32[base + 2] = finiteComponent(planePoint, 2, 0.0);
+      f32[base + 4] = finiteComponent(planeNormal, 0, 0.0);
+      f32[base + 5] = finiteComponent(planeNormal, 1, 0.0);
+      f32[base + 6] = finiteComponent(planeNormal, 2, 1.0);
+      f32[base + 8] = finiteComponent(uAxis, 0, 0.0);
+      f32[base + 9] = finiteComponent(uAxis, 1, 0.0);
+      f32[base + 10] = finiteComponent(uAxis, 2, 0.0);
+      f32[base + 12] = finiteComponent(vAxis, 0, 0.0);
+      f32[base + 13] = finiteComponent(vAxis, 1, 0.0);
+      f32[base + 14] = finiteComponent(vAxis, 2, 0.0);
       f32[base + 18] = count;
       f32[base + 19] = Math.max(0.0, Number(aperture.clip_epsilon || 0.0) || 0.0);
       for (var pointIndex = 0; pointIndex < count; pointIndex += 1) {
-        var point = Array.isArray(points[pointIndex]) ? points[pointIndex] : [0.0, 0.0];
+        var point = points[pointIndex];
         var pointBase = ptsBase + (pointIndex * 4);
-        f32[pointBase + 0] = Number(point[0]) || 0.0;
-        f32[pointBase + 1] = Number(point[1]) || 0.0;
+        f32[pointBase + 0] = finiteComponent(point, 0, 0.0);
+        f32[pointBase + 1] = finiteComponent(point, 1, 0.0);
       }
     }
     writeLightAperture(0, lights && lights.length ? lights[0] : null);
@@ -2719,6 +2787,54 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       ];
     }
     return fallback.slice();
+  }
+
+  function requireFiniteVec2(value, label) {
+    if (!value || typeof value !== "object" || value.length < 2) {
+      failFast(label + " requires a finite vec2");
+    }
+    var x = Number(value[0]);
+    var y = Number(value[1]);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      failFast(label + " requires a finite vec2");
+    }
+    return [x, y];
+  }
+
+  function requireFiniteVec3(value, label) {
+    if (!value || typeof value !== "object" || value.length < 3) {
+      failFast(label + " requires a finite vec3");
+    }
+    var x = Number(value[0]);
+    var y = Number(value[1]);
+    var z = Number(value[2]);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+      failFast(label + " requires a finite vec3");
+    }
+    return [x, y, z];
+  }
+
+  function requirePlanarPacket(packet, label) {
+    if (!packet || typeof packet !== "object") {
+      failFast(label + " requires a planar packet");
+    }
+    var planePoint = requireFiniteVec3(packet.plane_point, label + ".plane_point");
+    var planeNormal = requireFiniteVec3(packet.plane_normal, label + ".plane_normal");
+    var uAxis = requireFiniteVec3(packet.u_axis, label + ".u_axis");
+    var vAxis = requireFiniteVec3(packet.v_axis, label + ".v_axis");
+    var points = Array.isArray(packet.points) ? packet.points : null;
+    if (!points || points.length < 3) {
+      failFast(label + ".points requires at least 3 finite vec2 points");
+    }
+    return {
+      planePoint: planePoint,
+      planeNormal: planeNormal,
+      uAxis: uAxis,
+      vAxis: vAxis,
+      points: points.map(function (point, index) {
+        return requireFiniteVec2(point, label + ".points[" + index + "]");
+      })
+    };
   }
 
   function normalizeVec3(v, fallback) {
@@ -3117,6 +3233,108 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     };
   }
 
+  function planarFrameExtent(frame) {
+    return Math.max(
+      1e-6,
+      Math.abs(Number(frame && frame.spanU || 0.0) || 0.0),
+      Math.abs(Number(frame && frame.spanV || 0.0) || 0.0)
+    );
+  }
+
+  function relativePlaneEpsilon(frame, ratioValue, fallbackRatio) {
+    var extent = planarFrameExtent(frame);
+    var ratio = Number(ratioValue);
+    if (!Number.isFinite(ratio) || !(ratio > 0.0)) {
+      ratio = Number(fallbackRatio);
+    }
+    if (!Number.isFinite(ratio) || !(ratio > 0.0)) {
+      ratio = 1e-5;
+    }
+    ratio = Math.max(1e-8, Math.min(1e-3, ratio));
+    return extent * ratio;
+  }
+
+  function resolvePlanarMirrorGeometry(meshLike, t, context) {
+    var label = String(context || "planar mirror");
+    if (!meshLike || typeof meshLike !== "object") {
+      failFast(label + " requires a rendered mirror mesh");
+    }
+    var frame = mirrorFrameForLightMesh(meshLike, t);
+    if (!frame) {
+      failFast(label + ' mirror mesh "' + String(meshLike.id || "") + '" did not produce a canonical planar frame');
+    }
+    var center = planarFrameCenter(frame);
+    var corners = mirrorWorldCorners(frame);
+    var extent = planarFrameExtent(frame);
+    return {
+      mesh: meshLike,
+      frame: frame,
+      center: center,
+      corners: corners,
+      extent: extent,
+      epsilon: function (ratioValue, fallbackRatio) {
+        return relativePlaneEpsilon(frame, ratioValue, fallbackRatio);
+      }
+    };
+  }
+
+  function createPlanarMirrorRuntime(meshLike, t, context) {
+    var geometry = resolvePlanarMirrorGeometry(meshLike, t, context);
+    var frame = geometry.frame;
+    var center = geometry.center;
+    var corners = geometry.corners;
+    function localPointFromCenter(worldPoint) {
+      var rel = subVec3(worldPoint, center);
+      return [
+        dotVec3(rel, frame.uAxis),
+        dotVec3(rel, frame.vAxis)
+      ];
+    }
+    function aperturePacket(meshId, planeNormal, ratioValue, fallbackRatio) {
+      return {
+        mesh_id: String(meshId || (meshLike && meshLike.id) || ""),
+        plane_point: center.slice(),
+        plane_normal: normalizeVec3(planeNormal || frame.normal, frame.normal).slice(),
+        u_axis: frame.uAxis.slice(),
+        v_axis: frame.vAxis.slice(),
+        points: [
+          localPointFromCenter(corners.bottomLeft),
+          localPointFromCenter(corners.bottomRight),
+          localPointFromCenter(corners.topRight),
+          localPointFromCenter(corners.topLeft)
+        ],
+        clip_epsilon: geometry.epsilon(ratioValue, fallbackRatio)
+      };
+    }
+    function debugSnapshot() {
+      return {
+        mesh_id: String(meshLike && meshLike.id || ""),
+        center: center.slice(),
+        normal: frame.normal.slice(),
+        u_axis: frame.uAxis.slice(),
+        v_axis: frame.vAxis.slice(),
+        corners: {
+          bottomLeft: corners.bottomLeft.slice(),
+          bottomRight: corners.bottomRight.slice(),
+          topRight: corners.topRight.slice(),
+          topLeft: corners.topLeft.slice()
+        },
+        extent: geometry.extent
+      };
+    }
+    return {
+      mesh: meshLike,
+      geometry: geometry,
+      frame: frame,
+      center: center,
+      corners: corners,
+      extent: geometry.extent,
+      epsilon: geometry.epsilon,
+      aperturePacket: aperturePacket,
+      debugSnapshot: debugSnapshot
+    };
+  }
+
   function orientMirrorBasisForEye(corners, eye, preferredUp) {
     void preferredUp;
     var bottomLeft = corners.bottomLeft;
@@ -3146,11 +3364,14 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
   }
 
   function derivePlanarSurfaceLocalFrame(meshLike) {
+    if (meshLike && meshLike.vertices && meshLike.vertices.length >= 30) {
+      return derivePlanarFrameFromPoints(planarPointsFromMeshVertices(meshLike, null));
+    }
     var quadPoints = planarPointsFromQuadSpec(meshLike, null);
     if (Array.isArray(quadPoints) && quadPoints.length >= 3) {
       return derivePlanarFrameFromPoints(quadPoints);
     }
-    return derivePlanarFrameFromPoints(planarPointsFromMeshVertices(meshLike, null));
+    failFast("mirror surface_system host mesh requires planar vertices or a quad spec");
   }
 
   function derivePlanarSurfaceWorldFrame(part, timeMs, MmLocal) {
@@ -3163,9 +3384,10 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       meshLike && meshLike.scale ? meshLike.scale : [1, 1, 1],
       MmLocal || getMath()
     ) || ((meshLike && meshLike._modelMatrix) ? meshLike._modelMatrix : (MmLocal || getMath()).mat4Identity());
-    var frame = mirrorFrameForLightMesh(meshLike, timeMs);
+    var runtime = createPlanarMirrorRuntime(meshLike, timeMs, "mirror surface_system host");
+    var frame = runtime.frame;
     var points = planarShadowPointsForMesh(meshLike, timeMs);
-    if (!frame || !Array.isArray(points) || points.length < 3) {
+    if (!Array.isArray(points) || points.length < 3) {
       failFast("mirror surface_system host mesh requires planar vertices or a quad spec");
     }
     frame.modelMatrix = Array.prototype.slice.call(modelMatrix);
@@ -3267,14 +3489,20 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
   function resolveLightPosition(light, t) {
     light = light || {};
     var target = vec3Or(light.target, [0, 0, 0]);
+    if (Array.isArray(light.pos) && light.pos.length >= 3) {
+      return vec3Or(light.pos, [0, 10, 10]);
+    }
     var hasOrbit = light.orbit === true ||
+      String(light.motion || "").toLowerCase().trim() === "orbit" ||
+      String(light.motion || "").toLowerCase().trim() === "oscillate" ||
       light.orbit_radius !== undefined ||
+      light.radius !== undefined ||
       light.angular_velocity !== undefined ||
       light.theta !== undefined;
     if (!hasOrbit) {
       return vec3Or(light.pos, [0, 10, 10]);
     }
-    var radius = Number(light.orbit_radius);
+    var radius = Number(light.orbit_radius != null ? light.orbit_radius : light.radius);
     if (!(radius > 0)) { radius = 4; }
     var height = Number(light.height);
     if (!isFinite(height)) { height = 3; }
@@ -3298,6 +3526,83 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     return addVec3(frame.point, addVec3(scaleVec3(frame.uAxis, midU), scaleVec3(frame.vAxis, midV)));
   }
 
+  function fmtVec3(v) {
+    return "[" +
+      Number(v && v[0] || 0.0).toFixed(4) + "," +
+      Number(v && v[1] || 0.0).toFixed(4) + "," +
+      Number(v && v[2] || 0.0).toFixed(4) + "]";
+  }
+
+  function debugMirrorPlane(label, meshLike, frame, extra) {
+    var meshId = String(meshLike && meshLike.id || "");
+    if (meshId !== "back_mirror" && String(meshLike && meshLike.surface_system && meshLike.surface_system.kind || "").toLowerCase().trim() !== "screen") {
+      return;
+    }
+    var now = Date.now();
+    var key = String(label || "") + "::" + meshId;
+    if (!global.__vfMirrorPlaneDebugLast) {
+      global.__vfMirrorPlaneDebugLast = Object.create(null);
+    }
+    if ((now - Number(global.__vfMirrorPlaneDebugLast[key] || 0)) < 650) {
+      return;
+    }
+    global.__vfMirrorPlaneDebugLast[key] = now;
+    var center = frame ? planarFrameCenter(frame) : null;
+    var parts = [
+      "[DEBUG-MIRROR-PLANE]",
+      "label=" + String(label || ""),
+      "mesh=" + meshId,
+      "center=" + fmtVec3(center),
+      "normal=" + fmtVec3(frame && frame.normal),
+      "point=" + fmtVec3(frame && frame.point),
+      "meshCenter=" + fmtVec3(meshLike && meshLike.center),
+      "rev=" + String(meshReverseFacing(meshLike)),
+      "surface=" + String(meshLike && meshLike.surface_system && meshLike.surface_system.kind || ""),
+      "verts=" + String(meshLike && meshLike.vertices && meshLike.vertices.length || 0)
+    ];
+    if (extra) {
+      parts.push(String(extra));
+    }
+    wlog("warn", parts.join(" "));
+  }
+
+  function debugSurfaceBind(label, meshLike, extra) {
+    var meshId = String(meshLike && meshLike.id || "");
+    if (meshId !== "back_mirror" && String(meshLike && meshLike.surface_system && meshLike.surface_system.kind || "").toLowerCase().trim() !== "screen") {
+      return;
+    }
+    var now = Date.now();
+    var key = String(label || "") + "::" + meshId;
+    if (!global.__vfSurfaceBindDebugLast) {
+      global.__vfSurfaceBindDebugLast = Object.create(null);
+    }
+    if ((now - Number(global.__vfSurfaceBindDebugLast[key] || 0)) < 650) {
+      return;
+    }
+    global.__vfSurfaceBindDebugLast[key] = now;
+    var MmLocal = getMath();
+    var modelMatrix = resolveAnimatedModelMatrix(
+      meshLike,
+      0,
+      meshLike && meshLike.center || [0, 0, 0],
+      meshLike && meshLike.rotation || [0, 0, 0],
+      meshLike && meshLike.scale || [1, 1, 1],
+      MmLocal
+    ) || (MmLocal && MmLocal.mat4Identity ? MmLocal.mat4Identity() : null);
+    var rawNormal = modelMatrix ? normalizeVec3(transformDirMat4(modelMatrix, [0, 0, 1]), [0, 0, 1]) : [0, 0, 1];
+    var reverseNormal = meshReverseFacing(meshLike) ? scaleVec3(rawNormal, -1.0) : rawNormal;
+    wlog(
+      "warn",
+      "[DEBUG-MIRROR-SURFACE] label=" + String(label || "") +
+      " mesh=" + meshId +
+      " rawNormal=" + fmtVec3(rawNormal) +
+      " flaggedNormal=" + fmtVec3(reverseNormal) +
+      " center=" + fmtVec3(meshLike && meshLike.center) +
+      " flags=" + String(meshLike && meshLike.surface_system && meshLike.surface_system.reverse_facing === true ? 1 : 0) +
+      (extra ? " " + String(extra) : "")
+    );
+  }
+
   function tryDerivePlanarFrameFromPoints(points) {
     try {
       return derivePlanarFrameFromPoints(points);
@@ -3306,35 +3611,20 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     }
   }
 
-  function quadLikeRenderPartPoints(meshLike, t) {
-    if (!meshLike || !(meshLike.vertices && meshLike.vertices.length === 40)) {
-      return null;
+  function visiblePlanarPointsForMesh(meshLike, t, modelMatrix) {
+    void t;
+    if (!meshLike || typeof meshLike !== "object") { return null; }
+    if (meshLike.vertices && meshLike.vertices.length >= 30) {
+      var visiblePoints = planarPointsFromMeshVertices(meshLike, modelMatrix);
+      if (Array.isArray(visiblePoints) && visiblePoints.length >= 3) {
+        return visiblePoints;
+      }
     }
-    var rawPoints = planarPointsFromMeshVertices(meshLike, null);
-    if (!Array.isArray(rawPoints) || rawPoints.length !== 4) {
-      return null;
+    var authoredPoints = planarPointsFromQuadSpec(meshLike, modelMatrix);
+    if (Array.isArray(authoredPoints) && authoredPoints.length >= 3) {
+      return authoredPoints;
     }
-    var MmLocal = getMath();
-    var modelMatrix = resolveAnimatedModelMatrix(
-      meshLike,
-      t,
-      meshLike.center || [0, 0, 0],
-      meshLike.rotation || [0, 0, 0],
-      meshLike.scale || [1, 1, 1],
-      MmLocal
-    ) || (MmLocal && typeof MmLocal.mat4ModelTRS === "function"
-      ? MmLocal.mat4ModelTRS(
-          meshLike.center || [0, 0, 0],
-          meshLike.rotation || [0, 0, 0],
-          meshLike.scale || [1, 1, 1]
-        )
-      : null);
-    if (!modelMatrix) {
-      return rawPoints;
-    }
-    return rawPoints.map(function (point) {
-      return transformPointMat4(modelMatrix, point);
-    });
+    return null;
   }
 
   function frameFromQuadLikePoints(points) {
@@ -3371,6 +3661,13 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     };
   }
 
+  function meshReverseFacing(meshLike) {
+    return !!(
+      (meshLike && meshLike.reverse_facing === true) ||
+      (meshLike && meshLike.surface_system && meshLike.surface_system.reverse_facing === true)
+    );
+  }
+
   function mirrorFrameForLightMesh(meshLike, t) {
     if (!meshLike) { return null; }
     var modelMatrix = resolveAnimatedModelMatrix(
@@ -3381,53 +3678,12 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       meshLike.scale || [1, 1, 1],
       getMath()
     ) || (meshLike._modelMatrix || getMath().mat4Identity());
-    var points = planarPointsFromQuadSpec(meshLike, modelMatrix);
-    if (!Array.isArray(points) || points.length < 3) {
-      points = null;
-    }
-    var renderQuadPoints = null;
-    if (!points) {
-      renderQuadPoints = quadLikeRenderPartPoints(meshLike, t);
-      points = renderQuadPoints;
-    }
-    if (!points && meshLike.vertices && meshLike.vertices.length >= 30) {
-      var expectedCenter = Array.isArray(meshLike.center) ? vec3Or(meshLike.center, [0.0, 0.0, 0.0]) : null;
-      var rawPoints = planarPointsFromMeshVertices(meshLike, null);
-      var transformedPoints = planarPointsFromMeshVertices(meshLike, modelMatrix);
-      if (expectedCenter) {
-        var rawFrame = tryDerivePlanarFrameFromPoints(rawPoints);
-        var transformedFrame = tryDerivePlanarFrameFromPoints(transformedPoints);
-        if (!rawFrame && transformedFrame) {
-          points = transformedPoints;
-        } else if (rawFrame && !transformedFrame) {
-          points = rawPoints;
-        } else if (rawFrame && transformedFrame) {
-        var rawCenter = planarFrameCenter(rawFrame);
-        var transformedCenter = planarFrameCenter(transformedFrame);
-        var rawErr = dotVec3(subVec3(rawCenter, expectedCenter), subVec3(rawCenter, expectedCenter));
-        var transformedErr = dotVec3(subVec3(transformedCenter, expectedCenter), subVec3(transformedCenter, expectedCenter));
-        points = rawErr <= transformedErr ? rawPoints : transformedPoints;
-        } else {
-          points = transformedPoints;
-        }
-      } else {
-        points = transformedPoints;
-      }
-    }
+    var points = visiblePlanarPointsForMesh(meshLike, t, modelMatrix);
     if (!Array.isArray(points) || points.length < 3) { return null; }
-    var frame = Array.isArray(renderQuadPoints) && renderQuadPoints.length >= 4
-      ? frameFromQuadLikePoints(renderQuadPoints)
+    var frame = meshLike.vertices && meshLike.vertices.length === 40 && points.length >= 4
+      ? frameFromQuadLikePoints(points)
       : tryDerivePlanarFrameFromPoints(points);
     if (!frame) { return null; }
-    if (meshLike.surface_system && meshLike.surface_system.reverse_facing === true) {
-      frame.normal = scaleVec3(frame.normal, -1.0);
-      frame.vAxis = scaleVec3(frame.vAxis, -1.0);
-      var flippedMinV = -Number(frame.maxV || 0.0);
-      var flippedMaxV = -Number(frame.minV || 0.0);
-      frame.minV = flippedMinV;
-      frame.maxV = flippedMaxV;
-      frame.spanV = frame.maxV - frame.minV;
-    }
     return frame;
   }
 
@@ -3435,16 +3691,33 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     var reflectOfId = String(lightSpec && lightSpec.reflect_of_light_id || "").trim();
     var mirrorMeshId = String(lightSpec && lightSpec.reflect_mirror_mesh_id || "").trim();
     if (!reflectOfId && !mirrorMeshId) { return lightSpec; }
-    if (!reflectOfId || !mirrorMeshId) { return lightSpec; }
+    if (!reflectOfId || !mirrorMeshId) {
+      failFast("reflected light requires both reflect_of_light_id and reflect_mirror_mesh_id");
+    }
     var sourceLight = sourceLightsById && sourceLightsById[reflectOfId];
     var mirrorMesh = meshById && meshById[mirrorMeshId];
-    if (!sourceLight || !mirrorMesh) { return lightSpec; }
-    var frame = mirrorFrameForLightMesh(mirrorMesh, t);
-    if (!frame) { return lightSpec; }
-    var planePoint = planarFrameCenter(frame);
+    if (!sourceLight) {
+      failFast('reflected light source "' + reflectOfId + '" was not found');
+    }
+    if (!mirrorMesh) {
+      failFast('reflected light mirror mesh "' + mirrorMeshId + '" was not found in rendered scene parts');
+    }
+    var runtime = createPlanarMirrorRuntime(mirrorMesh, t, "reflected light");
+    var frame = runtime.frame;
+    var planePoint = runtime.center;
     var planeNormal = normalizeVec3(frame.normal, [0.0, 1.0, 0.0]);
-    var clipEpsilon = clampPositiveNumber(lightSpec.clip_epsilon, 1e-3);
+    var clipEpsilon = runtime.epsilon(lightSpec.clip_epsilon_ratio, 1e-5);
     var sourceSide = dotVec3(subVec3(sourceLight.pos, planePoint), planeNormal);
+    debugMirrorPlane(
+      "light-reflect",
+      mirrorMesh,
+      frame,
+      "source=" + fmtVec3(sourceLight.pos) +
+      " reflectNormal=" + fmtVec3(planeNormal) +
+      " sourceSide=" + Number(sourceSide || 0.0).toFixed(4) +
+      " epsilon=extent*" + Number(lightSpec.clip_epsilon_ratio || 1e-5).toFixed(8) + "=" + clipEpsilon.toFixed(8) +
+      " aperturePlanePoint=" + fmtVec3(planePoint)
+    );
     var reflectivity = 1.0;
     if (mirrorMesh.surface_system && typeof mirrorMesh.surface_system === "object") {
       reflectivity = Math.max(0.0, Math.min(1.0, Number(mirrorMesh.surface_system.reflectivity == null ? 1.0 : mirrorMesh.surface_system.reflectivity) || 0.0));
@@ -3474,29 +3747,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       resolved.aperture_mesh_id = mirrorMeshId;
     }
     if (normalizeLightKind(resolved.kind) === "projected") {
-      var corners = mirrorWorldCorners(frame);
-      var center = planePoint.slice();
-      function localPointFromCenter(worldPoint) {
-        var rel = subVec3(worldPoint, center);
-        return [
-          dotVec3(rel, frame.uAxis),
-          dotVec3(rel, frame.vAxis)
-        ];
-      }
-      resolved.projected_aperture = {
-        mesh_id: mirrorMeshId,
-        plane_point: center.slice(),
-        plane_normal: planeNormal.slice(),
-        u_axis: frame.uAxis.slice(),
-        v_axis: frame.vAxis.slice(),
-        points: [
-          localPointFromCenter(corners.bottomLeft),
-          localPointFromCenter(corners.bottomRight),
-          localPointFromCenter(corners.topRight),
-          localPointFromCenter(corners.topLeft)
-        ],
-          clip_epsilon: clipEpsilon
-      };
+      resolved.projected_aperture = runtime.aperturePacket(mirrorMeshId, planeNormal, lightSpec.clip_epsilon_ratio, 1e-5);
     }
     return resolved;
   }
@@ -3505,38 +3756,17 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     if (!lightSpec || normalizeLightKind(lightSpec.kind) !== "projected") { return lightSpec; }
     if (lightSpec.projected_aperture && typeof lightSpec.projected_aperture === "object") { return lightSpec; }
     var apertureMeshId = String(lightSpec.aperture_mesh_id || "").trim();
-    if (!apertureMeshId) { return lightSpec; }
-    var apertureMesh = meshById && meshById[apertureMeshId];
-    if (!apertureMesh) { return lightSpec; }
-    var frame = mirrorFrameForLightMesh(apertureMesh, t);
-    if (!frame) { return lightSpec; }
-    var corners = mirrorWorldCorners(frame);
-    var center = addVec3(
-      corners.bottomLeft,
-      scaleVec3(addVec3(subVec3(corners.topRight, corners.bottomLeft), [0.0, 0.0, 0.0]), 0.5)
-    );
-    function localPointFromCenter(worldPoint) {
-      var rel = subVec3(worldPoint, center);
-      return [
-        dotVec3(rel, frame.uAxis),
-        dotVec3(rel, frame.vAxis)
-      ];
+    if (!apertureMeshId) {
+      failFast("projected light requires aperture_mesh_id or projected_aperture");
     }
+    var apertureMesh = meshById && meshById[apertureMeshId];
+    if (!apertureMesh) {
+      failFast('projected light aperture mesh "' + apertureMeshId + '" was not found in rendered scene parts');
+    }
+    var runtime = createPlanarMirrorRuntime(apertureMesh, t, "projected light aperture");
+    debugMirrorPlane("light-aperture", apertureMesh, runtime.frame, "apertureCenter=" + fmtVec3(runtime.center));
     return Object.assign({}, lightSpec, {
-      projected_aperture: {
-        mesh_id: apertureMeshId,
-        plane_point: center.slice(),
-        plane_normal: frame.normal.slice(),
-        u_axis: frame.uAxis.slice(),
-        v_axis: frame.vAxis.slice(),
-        points: [
-          localPointFromCenter(corners.bottomLeft),
-          localPointFromCenter(corners.bottomRight),
-          localPointFromCenter(corners.topRight),
-          localPointFromCenter(corners.topLeft)
-        ],
-        clip_epsilon: clampPositiveNumber(lightSpec.clip_epsilon, 1e-3)
-      }
+      projected_aperture: runtime.aperturePacket(apertureMeshId, runtime.frame.normal, lightSpec.clip_epsilon_ratio, 1e-5)
     });
   }
 
@@ -3556,18 +3786,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       meshLike.scale || [1, 1, 1],
       getMath()
     ) || (meshLike._modelMatrix || getMath().mat4Identity());
-    var quadPoints = planarPointsFromQuadSpec(meshLike, modelMatrix);
-    if (Array.isArray(quadPoints) && quadPoints.length >= 3) {
-      return quadPoints;
-    }
-    var renderPartPoints = quadLikeRenderPartPoints(meshLike, t);
-    if (Array.isArray(renderPartPoints) && renderPartPoints.length >= 3) {
-      return renderPartPoints;
-    }
-    if (isQuadLike && meshLike.vertices && meshLike.vertices.length >= 30) {
-      return planarPointsFromMeshVertices(meshLike, modelMatrix);
-    }
-    return null;
+    return visiblePlanarPointsForMesh(meshLike, t, modelMatrix);
   }
 
   function planarFrameForShadowMesh(meshLike, t) {
@@ -3575,8 +3794,9 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     if (meshLike.visible === false || meshLike.casts_shadow === false) { return null; }
     var points = planarShadowPointsForMesh(meshLike, t);
     if (!Array.isArray(points) || points.length < 3) { return null; }
-    var frame = mirrorFrameForLightMesh(meshLike, t);
-    if (!frame) { return null; }
+    var runtime = createPlanarMirrorRuntime(meshLike, t, "planar shadow frame");
+    var frame = runtime.frame;
+    debugMirrorPlane("shadow-frame", meshLike, frame, "");
     var extent = 0.0;
     for (var i = 0; i < points.length; i += 1) {
       var rel = subVec3(points[i], frame.point);
@@ -3585,44 +3805,18 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
         return null;
       }
     }
-    if (meshLike.surface_system && meshLike.surface_system.reverse_facing === true) {
-      frame.normal = scaleVec3(frame.normal, -1.0);
-      frame.vAxis = scaleVec3(frame.vAxis, -1.0);
-      var flippedMinV = -Number(frame.maxV || 0.0);
-      var flippedMaxV = -Number(frame.minV || 0.0);
-      frame.minV = flippedMinV;
-      frame.maxV = flippedMaxV;
-      frame.spanV = frame.maxV - frame.minV;
-    }
     return frame;
   }
 
   function buildPlanarContactOccluder(meshLike, t) {
     var frame = planarFrameForShadowMesh(meshLike, t);
     if (!frame) { return null; }
-    var corners = mirrorWorldCorners(frame);
-    var center = planarFrameCenter(frame);
-    function localPointFromCenter(worldPoint) {
-      var rel = subVec3(worldPoint, center);
-      return [
-        dotVec3(rel, frame.uAxis),
-        dotVec3(rel, frame.vAxis)
-      ];
-    }
-    return {
-      plane_point: center.slice(),
-      plane_normal: frame.normal.slice(),
-      u_axis: frame.uAxis.slice(),
-      v_axis: frame.vAxis.slice(),
-      points: [
-        localPointFromCenter(corners.bottomLeft),
-        localPointFromCenter(corners.bottomRight),
-        localPointFromCenter(corners.topRight),
-        localPointFromCenter(corners.topLeft)
-      ],
-      clip_epsilon: 1e-3,
-      contact_band: 0.08
-    };
+    if (isPlanarScreenShadowSurface(meshLike)) { return null; }
+    debugMirrorPlane("analytic-shadow", meshLike, frame, "");
+    var runtime = createPlanarMirrorRuntime(meshLike, t, "planar contact occluder");
+    var packet = runtime.aperturePacket(meshLike && meshLike.id, frame.normal, null, 1e-5);
+    packet.contact_band = 0.08;
+    return packet;
   }
 
   function resolvePlanarContactOccluderForLight(parts, light, t) {
@@ -3666,17 +3860,10 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       }
     }
     var meshById = Object.create(null);
-    var sourceSpecs = Array.isArray(meshLike && meshLike.source_specs) ? meshLike.source_specs : [];
-    for (var si = 0; si < sourceSpecs.length; si += 1) {
-      var sourceSpec = sourceSpecs[si];
-      if (sourceSpec && sourceSpec.id) {
-        meshById[String(sourceSpec.id)] = sourceSpec;
-      }
-    }
     var partSpecs = Array.isArray(meshLike && meshLike.parts) ? meshLike.parts : [];
     for (var pi = 0; pi < partSpecs.length; pi += 1) {
       var partMesh = partSpecs[pi];
-      if (partMesh && partMesh.id && !meshById[String(partMesh.id)]) {
+      if (partMesh && partMesh.id) {
         meshById[String(partMesh.id)] = partMesh;
       }
     }
@@ -3712,8 +3899,29 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     return filtered;
   }
 
+  function lightsForMesh(rawLights, offscreenFrame, meshLike) {
+    var rendererLights = lightsForRenderer(rawLights, offscreenFrame);
+    var meshId = String(meshLike && meshLike.id || "").trim();
+    if (!meshId) { return rendererLights; }
+    var out = [];
+    for (var i = 0; i < rendererLights.length; i += 1) {
+      var light = rendererLights[i];
+      var kind = normalizeLightKind(light && light.kind);
+      var apertureMeshId = String(light && (light.aperture_mesh_id || light.aperture_face_id) || "").trim();
+      var mirrorMeshId = String(light && light.reflect_mirror_mesh_id || "").trim();
+      if (kind === "projected" && (apertureMeshId === meshId || mirrorMeshId === meshId)) {
+        continue;
+      }
+      out.push(light);
+    }
+    return out;
+  }
+
   function normalizeLight(light, t) {
     light = light || {};
+    if (light.clip_epsilon != null && light.clip_epsilon_ratio == null) {
+      failFast("native_scene light clip_epsilon is absolute; use clip_epsilon_ratio");
+    }
     var pos = resolveLightPosition(light, t);
     var kind = normalizeLightKind(light.kind);
     var defaultShowMarker = kind === "projected" ? false : true;
@@ -3738,10 +3946,10 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       show_marker: light.show_marker !== undefined ? light.show_marker !== false : defaultShowMarker,
       source_radius: clampPositiveNumber(light.source_radius, 0.0),
       spread: clampPositiveNumber(light.spread, 1.0),
-      aperture_mesh_id: String(light.aperture_mesh_id || ""),
+      aperture_mesh_id: String(light.aperture_mesh_id || light.aperture_face_id || ""),
       reflect_of_light_id: String(light.reflect_of_light_id || ""),
       reflect_mirror_mesh_id: String(light.reflect_mirror_mesh_id || ""),
-      clip_epsilon: clampPositiveNumber(light.clip_epsilon, 1e-3),
+      clip_epsilon_ratio: clampPositiveNumber(light.clip_epsilon_ratio, 1e-5),
       projected_aperture: light && light.projected_aperture && typeof light.projected_aperture === "object"
         ? light.projected_aperture
         : null,
@@ -3768,13 +3976,6 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       if (mesh.casts_shadow === false) { continue; }
       if (mesh.pickable === false && mesh.no_lighting === true) { continue; }
       if (String(mesh.blend_mode || "") === "additive") { continue; }
-      if (
-        includeScreens !== true &&
-        mesh.surface_system &&
-        String(mesh.surface_system.kind || "").toLowerCase().trim() === "screen"
-      ) {
-        continue;
-      }
       out.push(part);
     }
     return out;
@@ -3791,6 +3992,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       if (mesh.casts_shadow === false) { continue; }
       if (mesh.pickable === false && mesh.no_lighting === true) { continue; }
       if (String(mesh.blend_mode || "") === "additive") { continue; }
+      if (isPlanarScreenShadowSurface(mesh)) { continue; }
       out.push(part);
     }
     return out;
@@ -3869,6 +4071,69 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     return points;
   }
 
+  function shadowCasterPartsForLight(casterParts, light, t) {
+    var out = [];
+    if (!Array.isArray(casterParts) || !light) { return out; }
+    var apertureCasterId = light && light.projected_aperture && light.projected_aperture.mesh_id
+      ? String(light.projected_aperture.mesh_id)
+      : "";
+    for (var cpi = 0; cpi < casterParts.length; cpi += 1) {
+      var casterPart = casterParts[cpi];
+      var casterMesh = casterPart && casterPart.mesh;
+      if (!casterMesh) { continue; }
+      if (apertureCasterId && String(casterMesh.id || "") === apertureCasterId) {
+        continue;
+      }
+      if (canPlanarSurfaceCastShadowForLight(casterMesh, light, t)) {
+        out.push(casterPart);
+      }
+    }
+    return out;
+  }
+
+  function isPlanarScreenShadowSurface(meshLike) {
+    if (!meshLike || typeof meshLike !== "object") {
+      return false;
+    }
+    var surfaceKind = String(meshLike.surface_system && meshLike.surface_system.kind || "").toLowerCase().trim();
+    if (surfaceKind === "screen") {
+      return true;
+    }
+    var meshKind = String(meshLike.kind || "").toLowerCase().trim();
+    var isPlanar = meshKind === "quad" || meshLike.size != null || (meshLike.vertices && meshLike.vertices.length === 40);
+    return isPlanar && meshLike.no_backface_specular === true && meshLike.receives_shadow === false;
+  }
+
+  function canPlanarSurfaceCastShadowForLight(meshLike, light, t) {
+    if (!isPlanarScreenShadowSurface(meshLike) || !light || normalizeLightKind(light.kind) === "projected") {
+      return true;
+    }
+    var lightKind = normalizeLightKind(light.kind);
+    var runtime = createPlanarMirrorRuntime(meshLike, t, "planar shadow light gate");
+    var frame = runtime.frame;
+    var planePoint = runtime.center;
+    var planeNormal = normalizeVec3(frame.normal, [0.0, 1.0, 0.0]);
+    var lightSide = dotVec3(subVec3(vec3Or(light.pos, [0.0, 0.0, 0.0]), planePoint), planeNormal);
+    if (lightKind === "point") {
+      return Math.abs(lightSide) > 1e-4;
+    }
+    var targetSide = dotVec3(subVec3(vec3Or(light.target, planePoint), planePoint), planeNormal);
+    if (Math.abs(lightSide) <= 1e-4 || Math.abs(targetSide) <= 1e-4) {
+      return true;
+    }
+    debugMirrorPlane(
+      "shadow-gate",
+      meshLike,
+      frame,
+      "light=" + fmtVec3(light.pos) +
+      " target=" + fmtVec3(light.target) +
+      " lightSide=" + Number(lightSide || 0.0).toFixed(4) +
+      " targetSide=" + Number(targetSide || 0.0).toFixed(4) +
+      " casts=" + String(lightSide * targetSide < 0.0)
+    );
+    return lightSide * targetSide < 0.0;
+  }
+
   function fitShadowViewProjection(light, worldPoints, MmLocal) {
     if (!light || !Array.isArray(worldPoints) || !worldPoints.length) { return null; }
     var eye = vec3Or(light.pos, [0.0, 0.0, 0.0]);
@@ -3876,11 +4141,12 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       ? light.projected_aperture
       : null;
     if (aperture) {
-      var planePoint = vec3Or(aperture.plane_point, [0.0, 0.0, 0.0]);
-      var planeNormal = normalizeVec3(vec3Or(aperture.plane_normal, [0.0, 0.0, 1.0]), [0.0, 0.0, 1.0]);
-      var uAxis = normalizeVec3(vec3Or(aperture.u_axis, [1.0, 0.0, 0.0]), [1.0, 0.0, 0.0]);
-      var vAxis = normalizeVec3(vec3Or(aperture.v_axis, [0.0, 1.0, 0.0]), [0.0, 1.0, 0.0]);
-      var aperturePts = Array.isArray(aperture.points) ? aperture.points : [];
+      var aperturePacket = requirePlanarPacket(aperture, "projected shadow aperture");
+      var planePoint = aperturePacket.planePoint;
+      var planeNormal = normalizeVec3(aperturePacket.planeNormal, [0.0, 0.0, 1.0]);
+      var uAxis = normalizeVec3(aperturePacket.uAxis, [1.0, 0.0, 0.0]);
+      var vAxis = normalizeVec3(aperturePacket.vAxis, [0.0, 1.0, 0.0]);
+      var aperturePts = aperturePacket.points;
       var clipEpsilon = Math.max(0.0, Number(aperture.clip_epsilon || 0.0) || 0.0);
       var lightSide = dotVec3(subVec3(eye, planePoint), planeNormal);
       var targetProj = subVec3(planePoint, scaleVec3(planeNormal, lightSide));
@@ -3959,7 +4225,16 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
         bias: Math.max(0.0008, Math.min(0.0035, 0.0010 + ((farA - nearA) * 0.00002)))
       };
     }
-    var target = Array.isArray(light.target) ? vec3Or(light.target, [0.0, 0.0, 0.0]) : addVec3(eye, vec3Or(light.direction_f32, [0.0, 0.0, -1.0]));
+    var target;
+    if (normalizeLightKind(light.kind) === "point") {
+      target = [0.0, 0.0, 0.0];
+      for (var centerIndex = 0; centerIndex < worldPoints.length; centerIndex += 1) {
+        target = addVec3(target, worldPoints[centerIndex]);
+      }
+      target = scaleVec3(target, 1.0 / Math.max(1, worldPoints.length));
+    } else {
+      target = Array.isArray(light.target) ? vec3Or(light.target, [0.0, 0.0, 0.0]) : addVec3(eye, vec3Or(light.direction_f32, [0.0, 0.0, -1.0]));
+    }
     var forward = normalizeVec3(subVec3(target, eye), [0.0, 0.0, -1.0]);
     var up = chooseShadowUp(forward);
     var view = mat4LookAt(eye, target, up);
@@ -4095,26 +4370,28 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       var localKind = String(meshLike.kind || "").toLowerCase().trim();
       var localHasSurfaceSystem = !!meshLike.surface_system;
       if (localKind === "quad" || (localHasSurfaceSystem && meshLike.size != null)) {
-      var rawSize = meshLike.size;
-      var sx = 0.0;
-      var sy = 0.0;
-      if (Array.isArray(rawSize)) {
-        sx = Number(rawSize[0] || 0.0);
-        sy = Number(rawSize[1] || 0.0);
-      } else {
-        sx = Number(rawSize || 0.0);
-        sy = Number(rawSize || 0.0);
-      }
-      var halfX = Math.max(1e-4, sx * 0.5);
-      var halfY = Math.max(1e-4, sy * 0.5);
-      return {
-        minX: -halfX,
-        minY: -halfY,
-        spanX: halfX * 2.0,
-        spanY: halfY * 2.0,
-        uAxis: [1.0, 0.0, 0.0],
-        vAxis: [0.0, 1.0, 0.0]
-      };
+        var quadFrame = derivePlanarSurfaceLocalFrame(meshLike);
+        var quadPoints = planarPointsFromQuadSpec(meshLike, null);
+        if (Array.isArray(quadPoints) && quadPoints.length >= 3) {
+          var qMinX = Infinity, qMinY = Infinity, qMaxX = -Infinity, qMaxY = -Infinity;
+          for (var qi = 0; qi < quadPoints.length; qi += 1) {
+            var qPoint = quadPoints[qi];
+            var qU = dotVec3(qPoint, quadFrame.uAxis);
+            var qV = dotVec3(qPoint, quadFrame.vAxis);
+            if (qU < qMinX) { qMinX = qU; }
+            if (qU > qMaxX) { qMaxX = qU; }
+            if (qV < qMinY) { qMinY = qV; }
+            if (qV > qMaxY) { qMaxY = qV; }
+          }
+          return {
+            minX: qMinX,
+            minY: qMinY,
+            spanX: Math.max(1e-4, qMaxX - qMinX),
+            spanY: Math.max(1e-4, qMaxY - qMinY),
+            uAxis: quadFrame.uAxis,
+            vAxis: quadFrame.vAxis
+          };
+        }
       }
     }
     var frame = derivePlanarSurfaceLocalFrame(meshLike);
@@ -4146,6 +4423,9 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       var trackedMatrix = sampleMeshMatrixTrack(tracks.transform, t, timing);
       if (trackedMatrix) { return trackedMatrix; }
     }
+    if (shouldUseUploadedModelMatrix(meshLike)) {
+      return meshLike._modelMatrix;
+    }
     var center = fallbackCenter;
     var rotation = fallbackRotation;
     var scale = fallbackScale;
@@ -4162,6 +4442,38 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       return MmLocal.mat4ModelTRS(center, rotation, scale);
     }
     return meshLike && meshLike._modelMatrix ? meshLike._modelMatrix : (MmLocal && typeof MmLocal.mat4Identity === "function" ? MmLocal.mat4Identity() : null);
+  }
+
+  function isIdentityMat4(m) {
+    if (!Array.isArray(m) || m.length !== 16) { return false; }
+    for (var i = 0; i < 16; i += 1) {
+      var expected = (i % 5 === 0) ? 1.0 : 0.0;
+      if (Math.abs((Number(m[i]) || 0.0) - expected) > 1e-7) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function vecHasNonDefault(value, fallback) {
+    if (!Array.isArray(value)) { return false; }
+    for (var i = 0; i < Math.min(value.length, fallback.length); i += 1) {
+      if (Math.abs((Number(value[i]) || 0.0) - Number(fallback[i])) > 1e-7) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function shouldUseUploadedModelMatrix(meshLike) {
+    var matrix = meshLike && meshLike._modelMatrix;
+    if (!Array.isArray(matrix) || matrix.length !== 16) { return false; }
+    if (!isIdentityMat4(matrix)) { return true; }
+    return !(
+      vecHasNonDefault(meshLike.center, [0.0, 0.0, 0.0]) ||
+      vecHasNonDefault(meshLike.rotation, [0.0, 0.0, 0.0]) ||
+      vecHasNonDefault(meshLike.scale, [1.0, 1.0, 1.0])
+    );
   }
 
   function resolveSceneMeshById(sceneMesh, meshId) {
@@ -4647,10 +4959,10 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     },
 
     _buildPlanarSurfaceRenderCamera: function (part, sceneMesh, surfaceCamera, t, targetAspect) {
-      var authoredMesh = resolveSceneMeshById(sceneMesh, part && part.mesh && part.mesh.id);
-      var planarPart = authoredMesh ? { mesh: authoredMesh } : part;
+      var renderGeometry = resolvePlanarMirrorGeometry(part && part.mesh, t, "surface render camera");
+      debugMirrorPlane("surface-render-camera", part && part.mesh, renderGeometry.frame, "");
       return createPlanarMirrorAdapter().buildRenderCamera({
-        part: planarPart,
+        part: part,
         surfaceCamera: surfaceCamera,
         timeMs: t,
         targetAspect: targetAspect,
@@ -4751,7 +5063,6 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
         return [null, null];
       }
       var shadowSize = Math.max(512, Math.min(2048, Math.max(frameWidth | 0, frameHeight | 0, 1024)));
-      var casterSig = buildShadowCasterSignature(casterParts, t, MmLocal);
       var lightSig = activeLights.map(function (light) {
         return [
           String(light && light.id || ""),
@@ -4765,14 +5076,18 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
         ].join(",");
       }).join("|");
       var lightCaches = this._shadowLightCaches || (this._shadowLightCaches = { slot0: null, slot1: null });
-      var worldPoints = null;
       var cacheHits = 0;
       var prepareLightShadow = function (renderer, slot, light) {
         if (!light) {
-          return { shadow: null, contact: null, view: null, cacheHit: false, cacheKey: "", cacheSlot: slot === 1 ? "slot1" : "slot0" };
+          return { shadow: null, contact: null, view: null, casterParts: [], cacheHit: false, cacheKey: "", cacheSlot: slot === 1 ? "slot1" : "slot0" };
+        }
+        var lightCasterParts = shadowCasterPartsForLight(casterParts, light, t);
+        if (!lightCasterParts.length) {
+          return { shadow: null, contact: null, view: null, casterParts: [], cacheHit: false, cacheKey: "", cacheSlot: slot === 1 ? "slot1" : "slot0" };
         }
         var slotName = slot === 1 ? "slot1" : "slot0";
-        var cacheKey = casterSig + "||" + lightSig + "||slot=" + String(slot) + "||" + String(shadowSize);
+        var lightCasterSig = buildShadowCasterSignature(lightCasterParts, t, MmLocal);
+        var cacheKey = lightCasterSig + "||" + lightSig + "||slot=" + String(slot) + "||" + String(shadowSize);
         var cacheEntry = lightCaches[slotName] || null;
         if (cacheEntry && cacheEntry.key === cacheKey) {
           cacheHits += 1;
@@ -4780,14 +5095,13 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
             shadow: cacheEntry.shadow || null,
             contact: cacheEntry.contact || null,
             view: cacheEntry.view || null,
+            casterParts: lightCasterParts,
             cacheHit: true,
             cacheKey: cacheKey,
             cacheSlot: slotName
           };
         }
-        if (!worldPoints) {
-          worldPoints = collectShadowWorldPoints(casterParts, t, MmLocal);
-        }
+        var worldPoints = collectShadowWorldPoints(lightCasterParts, t, MmLocal);
         var shadow = fitShadowViewProjection(light, worldPoints, MmLocal);
         var contact = resolvePlanarContactOccluderForLight(contactParts, light, t);
         if (shadow) {
@@ -4797,6 +5111,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
           shadow: shadow,
           contact: contact,
           view: slot === 1 ? renderer._shadowDepthView1 : renderer._shadowDepthView0,
+          casterParts: lightCasterParts,
           cacheHit: false,
           cacheKey: cacheKey,
           cacheSlot: slotName
@@ -4860,7 +5175,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
         pass.end();
       };
       if (shadowState0.shadow && !shadowState0.cacheHit) {
-        drawShadowPass(this, 0, shadowState0.shadow, casterParts);
+        drawShadowPass(this, 0, shadowState0.shadow, shadowState0.casterParts || []);
         lightCaches[shadowState0.cacheSlot] = {
           key: shadowState0.cacheKey,
           shadow: shadowState0.shadow,
@@ -4869,7 +5184,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
         };
       }
       if (shadowState1.shadow && !shadowState1.cacheHit) {
-        drawShadowPass(this, 1, shadowState1.shadow, casterParts);
+        drawShadowPass(this, 1, shadowState1.shadow, shadowState1.casterParts || []);
         lightCaches[shadowState1.cacheSlot] = {
           key: shadowState1.cacheKey,
           shadow: shadowState1.shadow,
@@ -4881,10 +5196,10 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     },
 
     _buildPlanarSurfaceApertureCamera: function (part, sceneMesh, surfaceCamera, t, targetAspect) {
-      var authoredMesh = resolveSceneMeshById(sceneMesh, part && part.mesh && part.mesh.id);
-      var planarPart = authoredMesh ? { mesh: authoredMesh } : part;
+      var apertureGeometry = resolvePlanarMirrorGeometry(part && part.mesh, t, "surface aperture camera");
+      debugMirrorPlane("surface-aperture-camera", part && part.mesh, apertureGeometry.frame, "");
       return createPlanarMirrorAdapter().buildApertureCamera({
-        part: planarPart,
+        part: part,
         surfaceCamera: surfaceCamera,
         timeMs: t,
         targetAspect: targetAspect,
@@ -4893,19 +5208,10 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     },
 
     _buildMirrorEyeLockedCamera: function (viewerCamera, hostMesh, baseCamera, t) {
-      var MmLocal = getMath();
-      var model = resolveAnimatedModelMatrix(
-        hostMesh,
-        Number(t || 0.0) || 0.0,
-        hostMesh && hostMesh.center ? hostMesh.center : [0.0, 0.0, 0.0],
-        hostMesh && hostMesh.rotation ? hostMesh.rotation : [0.0, 0.0, 0.0],
-        hostMesh && hostMesh.scale ? hostMesh.scale : [1.0, 1.0, 1.0],
-        MmLocal
-      ) || (MmLocal && typeof MmLocal.mat4Identity === "function" ? MmLocal.mat4Identity() : null);
-      var planePoint = model ? transformPointMat4(model, [0.0, 0.0, 0.0]) : [0.0, 0.0, 0.0];
+      var geometry = resolvePlanarMirrorGeometry(hostMesh, Number(t || 0.0) || 0.0, "mirror eye-locked camera");
       return {
         pos: vec3Or(viewerCamera && viewerCamera.pos, [4.0, -5.0, 3.5]),
-        target: planePoint,
+        target: geometry.center,
         up: [0.0, 0.0, 1.0],
         fov: Number(viewerCamera && viewerCamera.fov || 34.0) || 34.0,
         flip_x: (baseCamera && baseCamera.flip_x === true) || (viewerCamera && viewerCamera.flip_x === true)
@@ -4992,7 +5298,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       }
       var rawLightsPart = partMesh.no_lighting === true
         ? []
-        : lightsForRenderer((partMesh.lights || sceneMesh.lights || []), this._offscreenFrame === true);
+        : lightsForMesh((partMesh.lights || sceneMesh.lights || []), this._offscreenFrame === true, partMesh);
       var lightsNormPart = resolveSceneLights(rawLightsPart, sceneMeshForLightResolution(sceneMesh, this._parts), t);
       var lmNamePart = partMesh.light_model || sceneMesh.light_model || (lightsNormPart[0] && lightsNormPart[0].model) || "blinn_phong";
       var lmIntPart = LIGHT_MODELS[lmNamePart] !== undefined ? LIGHT_MODELS[lmNamePart] : 2;
@@ -5301,6 +5607,14 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
           part.surfaceW = Number(frameTextureRef.width || 0) || width;
           part.surfaceH = Number(frameTextureRef.height || 0) || height;
           partMesh._surfaceTextureReady = true;
+          debugSurfaceBind(
+            "frame-ref-bind",
+            partMesh,
+            "source=" + sourceFrameId +
+            " dims=" + String(part.surfaceW) + "x" + String(part.surfaceH) +
+            " flipU=" + String(!!frameTextureRef.flipU) +
+            " flipV=" + String(!!frameTextureRef.flipV)
+          );
           this._ensurePartBindGroup(part);
           continue;
         }
@@ -5648,6 +5962,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       var mesh = this._getMesh(t * 0.001);
       perfSample.get_mesh = perfNowMs() - perfStageStart;
       if (!mesh) { return; }
+      maybeLogMirrorCamera(this, mesh);
       var meshRevision = Number(mesh && mesh.__revision);
       if (mesh !== this._lastMesh || meshRevision !== this._lastMeshRevision) {
         perfStageStart = perfNowMs();
@@ -5899,7 +6214,7 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
       }
 
       // --- Lights ---
-      var rawLights = mesh.no_lighting === true ? [] : lightsForRenderer((mesh.lights || []), this._offscreenFrame === true);
+      var rawLights = mesh.no_lighting === true ? [] : lightsForMesh((mesh.lights || []), this._offscreenFrame === true, mesh);
       var lightsNorm = resolveSceneLights(rawLights, sceneMeshForLightResolution(mesh, this._parts), t);
       maybeLogResolvedLights(this, "main", lightsNorm);
       var lmName = mesh.light_model || (lightsNorm[0] && lightsNorm[0].model) || "blinn_phong";
@@ -6231,7 +6546,10 @@ fn fs_flare(i: FlareVOut) -> @location(0) vec4<f32> {
     getSharedWgpu: getSharedWgpu,
     createPlanarMirrorAdapter: createPlanarMirrorAdapter,
     derivePlanarSurfaceLocalFrame: derivePlanarSurfaceLocalFrame,
+    createPlanarMirrorRuntime: createPlanarMirrorRuntime,
+    resolvePlanarMirrorGeometry: resolvePlanarMirrorGeometry,
     surfaceLocalBounds: surfaceLocalBounds,
     derivePlanarSurfaceWorldFrame: derivePlanarSurfaceWorldFrame
   };
 })(typeof window !== "undefined" ? window : this);
+
