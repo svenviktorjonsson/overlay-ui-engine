@@ -712,6 +712,15 @@
       const head = document.createElement("div");
       head.className = "vf-frame__header vf-frame__header--title-" + titleAlign;
 
+      const dragHandle = document.createElement("div");
+      dragHandle.className = "vf-frame__drag-handle";
+      dragHandle.setAttribute("role", "button");
+      dragHandle.setAttribute("tabindex", "0");
+      dragHandle.setAttribute("aria-label", "Drag window");
+      dragHandle.setAttribute("title", "Drag window");
+      dragHandle.dataset.vfDragHandle = "1";
+      dragHandle.textContent = "::::";
+
       const titleEl = document.createElement("span");
       titleEl.className = "vf-frame__title";
 
@@ -743,6 +752,7 @@
       if (btnMin) headEnd.appendChild(btnMin);
       if (btnClose) headEnd.appendChild(btnClose);
 
+      head.appendChild(dragHandle);
       head.appendChild(titleEl);
       if (btnMin || btnClose) {
         head.appendChild(headEnd);
@@ -973,7 +983,7 @@
       }
 
       if (useHostWindowDrag) {
-        VfFrame.attachHostWindowDrag([head, minibar], { onDragStart: bringToFront });
+        VfFrame.attachHostWindowDrag([head, minibar, dragHandle], { onDragStart: bringToFront });
       } else if (draggable && !frameless) {
         /* vf-overlay: keep region lock-step with pointer movement to avoid visible crop lag. */
         VfFrame.attachHeaderDrag({

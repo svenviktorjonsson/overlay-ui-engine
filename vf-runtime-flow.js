@@ -20,6 +20,11 @@
     var getRuntimeSource = options.getRuntimeSource || function() { return null; };
     var applySceneCommands = options.applySceneCommands || function() {};
     var state = options.state || {};
+    var BOOTSTRAP_COALESCE_KINDS = {
+      "scene.replace": true,
+      "ui_state.replace": true,
+      "display.replace": true
+    };
 
     function getPacketRuntimeState() {
       var value = String(state.packetRuntimeState || "");
@@ -204,6 +209,42 @@
       }
     }
 
+    function coalesceBootstrapPackets(packets) {
+      if (!Array.isArray(packets) || packets.length <= 1) { return packets; }
+      if (getPacketRuntimeState() !== PACKET_RUNTIME_STATES.BOOTSTRAP_ONLY) { return packets; }
+      var latestByKind = Object.create(null);
+      var preserved = [];
+      for (var i = 0; i < packets.length; i++) {
+        var packet = packets[i];
+        var kind = String(packet && packet.kind || "");
+        if (!BOOTSTRAP_COALESCE_KINDS[kind]) {
+          preserved.push(packet);
+          continue;
+        }
+        latestByKind[kind] = packet;
+      }
+      if (!latestByKind["scene.replace"] &&
+          !latestByKind["ui_state.replace"] &&
+          !latestByKind["display.replace"]) {
+        return packets;
+      }
+      var ordered = preserved.slice();
+      if (latestByKind["scene.replace"]) {
+        ordered.push(latestByKind["scene.replace"]);
+      }
+      if (latestByKind["ui_state.replace"]) {
+        ordered.push(latestByKind["ui_state.replace"]);
+      }
+      if (latestByKind["display.replace"]) {
+        ordered.push(latestByKind["display.replace"]);
+      }
+      runtimeLog(
+        "info",
+        "coalesceBootstrapPackets: in=" + packets.length + " out=" + ordered.length
+      );
+      return ordered;
+    }
+
     function loadRuntimePackets() {
       var runtimeSource = getRuntimeSource();
       if (state.runtimePacketsInFlight || typeof fetch === "undefined" || !runtimeSource) { return; }
@@ -218,8 +259,9 @@
               packetRuntimeState: getPacketRuntimeState()
             };
           }
-          for (var i = 0; i < packets.length; i++) {
-            var packet = packets[i];
+          var routedPackets = coalesceBootstrapPackets(packets);
+          for (var i = 0; i < routedPackets.length; i++) {
+            var packet = routedPackets[i];
             var seq = Number(packet && packet.seq);
             if (!Number.isFinite(seq) || seq <= state.lastRuntimePacketSeq) { continue; }
             state.packetModeActive = true;

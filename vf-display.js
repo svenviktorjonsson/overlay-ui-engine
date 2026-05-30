@@ -19,6 +19,12 @@
   "use strict";
 
   var _vfDisplayScript = typeof document !== "undefined" ? document.currentScript : null;
+  var _vfAxis3DKernel = global.VfAxis3DKernelAdapter &&
+    typeof global.VfAxis3DKernelAdapter.createJsAxis3DKernelAdapter === "function"
+      ? global.VfAxis3DKernelAdapter.createJsAxis3DKernelAdapter()
+      : (global.VfAxis3DKernel || null);
+  var _vfAxis3DProjectionKernelFactory = global.VfAxis3DProjectionKernelAdapter || global.VfAxis3DProjectionKernel || null;
+  var _vfAxis3DProjectionKernel = null;
 
   // ── Logging ───────────────────────────────────────────────────────────────
   function vlog(level, text) {
@@ -53,6 +59,18 @@
   var _geomTextFollow = Object.create(null);
   var _geomTextFollowRaf = 0;
   var _mathTextHtmlCache = Object.create(null);
+  var _vfPointerStreamInflight = false;
+  var _vfPointerStreamPending = null;
+  var _vfHostInputReady = false;
+  var _vfHostInputReadyPosted = false;
+  var _vfHostInputReadyTimer = 0;
+  var _vfHostInputReadyToken = 0;
+
+  function axis3DKernelMethod(name) {
+    return _vfAxis3DKernel && typeof _vfAxis3DKernel[name] === "function"
+      ? _vfAxis3DKernel[name]
+      : null;
+  }
 
   // ── Event forwarding ──────────────────────────────────────────────────────
   // frame_id -> { fid, canvases: [...] } for hit-testing
@@ -94,6 +112,16 @@
     } catch (_) {}
     var port = getApiPort();
     if (!port) { return; }  // no port yet — events queued until next hover/click
+    var eventName = String(evt && evt.event || "").toLowerCase();
+    if (eventName === "hover" || eventName === "move") {
+      _vfPointerStreamPending = evt;
+      flushPointerStreamEventQueue(port);
+      return;
+    }
+    sendEventToOverlayQueue(port, evt);
+  }
+
+  function sendEventToOverlayQueue(port, evt) {
     var body = JSON.stringify({ line: JSON.stringify(evt) });
     try {
       fetch("http://127.0.0.1:" + port + "/api/enqueue", {
@@ -102,6 +130,66 @@
         body:    body,
       }).catch(function(){});
     } catch(_) {}
+  }
+
+  function flushPointerStreamEventQueue(port) {
+    if (_vfPointerStreamInflight) { return; }
+    if (!_vfPointerStreamPending) { return; }
+    _vfPointerStreamInflight = true;
+    var evt = _vfPointerStreamPending;
+    _vfPointerStreamPending = null;
+    var body = JSON.stringify({ line: JSON.stringify(evt) });
+    try {
+      fetch("http://127.0.0.1:" + port + "/api/enqueue", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    body,
+      }).catch(function(){})
+        .finally(function () {
+          _vfPointerStreamInflight = false;
+          if (_vfPointerStreamPending) {
+            flushPointerStreamEventQueue(getApiPort() || port);
+          }
+        });
+    } catch(_) {
+      _vfPointerStreamInflight = false;
+    }
+  }
+
+  function notifyHostInputReady() {
+    if (_vfHostInputReadyPosted) { return; }
+    var port = getApiPort();
+    if (!port) { return; }
+    _vfHostInputReadyPosted = true;
+    try {
+      fetch("http://127.0.0.1:" + port + "/api/ui-ready", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{\"source\":\"vf-display\"}"
+      }).catch(function(){});
+    } catch (_) {}
+    _vfHostInputReady = true;
+  }
+
+  function scheduleHostInputReady() {
+    if (_vfHostInputReadyPosted) { return; }
+    _vfHostInputReady = false;
+    _vfHostInputReadyToken += 1;
+    var token = _vfHostInputReadyToken;
+    if (_vfHostInputReadyTimer && typeof global.clearTimeout === "function") {
+      global.clearTimeout(_vfHostInputReadyTimer);
+    }
+    _vfHostInputReadyTimer = global.setTimeout(function () {
+      _vfHostInputReadyTimer = 0;
+      if (token !== _vfHostInputReadyToken) { return; }
+      requestAnimationFrame(function () {
+        if (token !== _vfHostInputReadyToken) { return; }
+        requestAnimationFrame(function () {
+          if (token !== _vfHostInputReadyToken) { return; }
+          notifyHostInputReady();
+        });
+      });
+    }, 120);
   }
 
   function _emptyGeomHit(frameX, frameY, fid) {
@@ -898,6 +986,9 @@
   }
 
   function drawFrameOrWidgetOps(fid, ops) {
+    if (!_vfHostInputReadyPosted) {
+      scheduleHostInputReady();
+    }
     var key = String(fid || "");
     var sep = key.indexOf(":");
     if (sep > 0) {
@@ -2855,35 +2946,54 @@
     var forward = normalizeVec3Local([tgt[0] - pos[0], tgt[1] - pos[1], tgt[2] - pos[2]], [0, 0, -1]);
     var basisList = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
     var best = { axisIndex: 2, sign: 1, absDot: 0, angleDeg: 90 };
+    var candidates = [];
     for (var axisIndex = 0; axisIndex < basisList.length; axisIndex += 1) {
       var dot = dot3(basisList[axisIndex], forward);
       var absDot = Math.max(0, Math.min(1, Math.abs(dot)));
+      candidates[axisIndex] = {
+        axisIndex: axisIndex,
+        sign: dot >= 0 ? 1 : -1,
+        absDot: absDot,
+        angleDeg: Math.acos(absDot) * (180 / Math.PI)
+      };
       if (absDot > best.absDot) {
-        best = {
-          axisIndex: axisIndex,
-          sign: dot >= 0 ? 1 : -1,
-          absDot: absDot,
-          angleDeg: Math.acos(absDot) * (180 / Math.PI)
-        };
+        best = candidates[axisIndex];
       }
     }
+    best.candidates = candidates;
     return best;
   }
 
   function axis3DCrosshairSnapState(rawOrientation, previousSnap, cfg) {
     var hideAngleDeg = Math.max(0, Number(cfg && cfg.axis_direction_hide_angle_deg) || 15);
     var snapAngleDeg = hideAngleDeg;
+    var hysteresisDeg = Math.max(0, Number(cfg && cfg.axis_direction_snap_hysteresis_deg) || 2);
     if (!rawOrientation) {
       return {
         raw: null,
         snapped: null,
         hiddenAxisIndex: null,
         hideAngleDeg: hideAngleDeg,
-        snapAngleDeg: snapAngleDeg
+        snapAngleDeg: snapAngleDeg,
+        hysteresisDeg: hysteresisDeg
       };
     }
     var snapped = null;
-    if (Number(rawOrientation.angleDeg) <= snapAngleDeg) {
+    var previousCandidate = null;
+    var previousStillCompetitive = false;
+    if (previousSnap && rawOrientation.candidates && rawOrientation.candidates[previousSnap.axisIndex]) {
+      previousCandidate = rawOrientation.candidates[previousSnap.axisIndex];
+      previousStillCompetitive =
+        Number(previousCandidate.angleDeg) <= (snapAngleDeg + hysteresisDeg) &&
+        Number(previousCandidate.absDot) >= (Number(rawOrientation.absDot || 0) - 0.02);
+    }
+    if (previousStillCompetitive) {
+      snapped = {
+        axisIndex: previousCandidate.axisIndex,
+        sign: previousCandidate.sign,
+        angleDeg: previousCandidate.angleDeg
+      };
+    } else if (Number(rawOrientation.angleDeg) <= snapAngleDeg) {
       snapped = {
         axisIndex: rawOrientation.axisIndex,
         sign: rawOrientation.sign,
@@ -2905,16 +3015,35 @@
       snapped: snapped,
       hiddenAxisIndex: Number(rawOrientation.angleDeg) < hideAngleDeg ? rawOrientation.axisIndex : null,
       hideAngleDeg: hideAngleDeg,
-      snapAngleDeg: snapAngleDeg
+      snapAngleDeg: snapAngleDeg,
+      hysteresisDeg: hysteresisDeg
     };
   }
 
-  function axis3DProjectedAxisSnapState(axisInfos, previousRawAngles, cfg) {
+  function axis3DProjectedAxisSnapState(axisInfos, previousState, cfg) {
     var snapAngleDeg = Math.max(0, Number(cfg && cfg.axis_projected_snap_angle_deg) || 5);
+    var unsnapAngleDeg = Math.max(snapAngleDeg, Number(cfg && cfg.axis_projected_unsnap_angle_deg) || (snapAngleDeg + 3));
+    var pairSnapAngleDeg = Math.max(
+      snapAngleDeg,
+      Number(cfg && cfg.axis_projected_pair_snap_angle_deg) || Math.max(snapAngleDeg + 4, 12)
+    );
+    var pairUnsnapAngleDeg = Math.max(
+      pairSnapAngleDeg,
+      Number(cfg && cfg.axis_projected_pair_unsnap_angle_deg) || Math.max(unsnapAngleDeg + 3, pairSnapAngleDeg + 2)
+    );
+    var previousRawAngles = Array.isArray(previousState)
+      ? previousState
+      : (previousState && Array.isArray(previousState.rawAngles) ? previousState.rawAngles : null);
+    var previousPairs = previousState && previousState.pairedAxes ? previousState.pairedAxes : null;
+    var previousSideSigns = previousState && previousState.sideSigns ? previousState.sideSigns : null;
     var rawAngles = [];
     var deltas = [];
     var hiddenAxes = {};
     var cardinalSnaps = {};
+    var pairedAxes = {};
+    var sideSigns = {};
+    var pairTargets = {};
+    var pairLeaders = {};
     for (var i = 0; i < axisInfos.length; i += 1) {
       var info = axisInfos[i];
       if (!info) { rawAngles[i] = null; deltas[i] = 0; continue; }
@@ -2924,7 +3053,9 @@
         ? undirectedAngleDiffDeg(angleDeg, previousRawAngles[i])
         : 0;
       var nearest = nearestAxisSnapAngleDeg(angleDeg, [0, 90]);
-      if (nearest.diffDeg <= snapAngleDeg) {
+      var prevCardinal = previousState && previousState.cardinalSnaps ? previousState.cardinalSnaps[i] : null;
+      var samePrevCardinal = prevCardinal != null && Number(prevCardinal) === Number(nearest.angleDeg);
+      if (nearest.diffDeg <= snapAngleDeg || (samePrevCardinal && nearest.diffDeg <= unsnapAngleDeg)) {
         cardinalSnaps[i] = nearest.angleDeg;
       }
     }
@@ -2932,27 +3063,56 @@
       if (!Number.isFinite(rawAngles[a])) { continue; }
       for (var b = a + 1; b < rawAngles.length; b += 1) {
         if (!Number.isFinite(rawAngles[b])) { continue; }
-        if (undirectedAngleDiffDeg(rawAngles[a], rawAngles[b]) > snapAngleDeg) { continue; }
-        var keep = a;
-        var hide = b;
-        var da = Number(deltas[a]) || 0;
-        var db = Number(deltas[b]) || 0;
-        if (Math.min(da, db) <= Math.max(da, db) * 0.5) {
-          keep = da <= db ? a : b;
-          hide = keep === a ? b : a;
-        } else {
-          keep = da >= db ? a : b;
-          hide = keep === a ? b : a;
+        var pairDiff = undirectedAngleDiffDeg(rawAngles[a], rawAngles[b]);
+        var previouslyPaired = !!(previousPairs && (previousPairs[a] === b || previousPairs[b] === a));
+        if (pairDiff > (previouslyPaired ? pairUnsnapAngleDeg : pairSnapAngleDeg)) { continue; }
+        pairedAxes[a] = b;
+        pairedAxes[b] = a;
+        var leader = a;
+        var follower = b;
+        var deltaA = Math.abs(Number(deltas[a] || 0));
+        var deltaB = Math.abs(Number(deltas[b] || 0));
+        if (deltaA > deltaB + 1e-6) {
+          leader = b;
+          follower = a;
+        } else if (Math.abs(deltaA - deltaB) <= 1e-6 && b < a) {
+          leader = b;
+          follower = a;
         }
-        hiddenAxes[hide] = keep;
+        var sideA = previousSideSigns && Number(previousSideSigns[a]);
+        var sideB = previousSideSigns && Number(previousSideSigns[b]);
+        if (!((sideA === -1 && sideB === 1) || (sideA === 1 && sideB === -1))) {
+          sideA = -1;
+          sideB = 1;
+        }
+        sideSigns[a] = sideA;
+        sideSigns[b] = sideB;
+        pairTargets[follower] = rawAngles[leader];
+        pairLeaders[follower] = leader;
       }
     }
     return {
       rawAngles: rawAngles,
       deltas: deltas,
       hiddenAxes: hiddenAxes,
-      cardinalSnaps: cardinalSnaps
+      cardinalSnaps: cardinalSnaps,
+      pairedAxes: pairedAxes,
+      sideSigns: sideSigns,
+      pairTargets: pairTargets,
+      pairLeaders: pairLeaders,
+      snapAngleDeg: snapAngleDeg,
+      unsnapAngleDeg: unsnapAngleDeg,
+      pairSnapAngleDeg: pairSnapAngleDeg,
+      pairUnsnapAngleDeg: pairUnsnapAngleDeg
     };
+  }
+
+  function axis3DProjectedAxisSideSign(projectedSnapState, axisIndex, defaultSide) {
+    var base = Number(defaultSide) || 0;
+    if (!projectedSnapState || !projectedSnapState.sideSigns) { return base; }
+    var forced = Number(projectedSnapState.sideSigns[axisIndex]);
+    if (forced === 1 || forced === -1) { return forced; }
+    return base;
   }
 
   function drawAxisCollapsedMarker(ctx, cfg, px, py, snappedOrientation, color3) {
@@ -3131,6 +3291,11 @@
   }
 
   function axis3DBoxDragDataDelta(camera, body, cfg, dx, dy) {
+    var boxDragDataDelta = axis3DKernelMethod("boxDragDataDelta");
+    if (boxDragDataDelta) {
+      var rect0 = body && body.getBoundingClientRect ? body.getBoundingClientRect() : { width: 1, height: 1 };
+      return boxDragDataDelta(camera, Number(rect0.width) || 1, Number(rect0.height) || 1, cfg, dx, dy);
+    }
     var pos = vec3Array(camera && camera.pos, [4, 4, 5.657]);
     var target = vec3Array(camera && camera.target, [0, 0, 0]);
     var upHint = normalizeVec3Local(camera && camera.up || [0, 0, 1], [0, 0, 1]);
@@ -3149,6 +3314,10 @@
   }
 
   function axis3DRotationCenter(cfg) {
+    var rotationCenter = axis3DKernelMethod("rotationCenter");
+    if (rotationCenter) {
+      return rotationCenter(cfg);
+    }
     if (cfg && String(cfg.mode || "crosshair").toLowerCase() === "box") {
       return [
         ((Number(cfg.x_min) || 0) + (Number(cfg.x_max) || 0)) * 0.5,
@@ -3174,6 +3343,10 @@
   }
 
   function axis3DScreenBasis(camera, center) {
+    var screenBasis = axis3DKernelMethod("screenBasis");
+    if (screenBasis) {
+      return screenBasis(camera, center);
+    }
     var pos = vec3Array(camera && camera.pos, [4, 4, 5.657]);
     var target = Array.isArray(center) ? center.slice() : vec3Array(camera && camera.target, [0, 0, 0]);
     var upHint = normalizeVec3Local(camera && camera.up || [0, 0, 1], [0, 0, 1]);
@@ -3184,6 +3357,10 @@
   }
 
   function axis3DApplyWorldRotation(camera, center, worldAxis, angleRad) {
+    var applyWorldRotation = axis3DKernelMethod("applyWorldRotation");
+    if (applyWorldRotation) {
+      return applyWorldRotation(camera, center, worldAxis, angleRad);
+    }
     var axis = normalizeVec3Local(worldAxis, [0, 0, 1]);
     var pos = vec3Array(camera && camera.pos, [4, 4, 5.657]);
     var target = Array.isArray(center) ? center.slice() : [0, 0, 0];
@@ -3196,6 +3373,10 @@
   }
 
   function axis3DCloneCamera(camera) {
+    var cloneCamera = axis3DKernelMethod("cloneCamera");
+    if (cloneCamera) {
+      return cloneCamera(camera);
+    }
     var out = Object.assign({}, camera || {});
     out.pos = vec3Array(camera && camera.pos, [4, 4, 5.657]);
     out.target = vec3Array(camera && camera.target, [0, 0, 0]);
@@ -3203,7 +3384,45 @@
     return out;
   }
 
+  function axis3DProjectionKernelDeps() {
+    return {
+      rotationCenter: axis3DRotationCenter,
+      projectWorldToPixel: projectWorldToPixel,
+      clipPixelLineToRect: clipPixelLineToRect,
+      cloneCamera: axis3DCloneCamera,
+      screenBasis: axis3DScreenBasis,
+      applyWorldRotation: axis3DApplyWorldRotation
+    };
+  }
+
+  function ensureAxis3DProjectionKernel() {
+    if (!_vfAxis3DProjectionKernel && _vfAxis3DProjectionKernelFactory &&
+        typeof _vfAxis3DProjectionKernelFactory.createJsAxis3DProjectionKernelAdapter === "function") {
+      _vfAxis3DProjectionKernel = _vfAxis3DProjectionKernelFactory.createJsAxis3DProjectionKernelAdapter(
+        axis3DProjectionKernelDeps()
+      );
+    } else if (!_vfAxis3DProjectionKernel && _vfAxis3DProjectionKernelFactory &&
+        typeof _vfAxis3DProjectionKernelFactory.createProjectionKernel === "function") {
+      _vfAxis3DProjectionKernel = _vfAxis3DProjectionKernelFactory.createProjectionKernel(
+        axis3DProjectionKernelDeps()
+      );
+    }
+    return _vfAxis3DProjectionKernel;
+  }
+
+  function axis3DProjectionKernelMethod(name) {
+    var kernel = ensureAxis3DProjectionKernel();
+    return kernel && typeof kernel[name] === "function"
+      ? kernel[name]
+      : null;
+  }
+
   function axis3DProjectedAxisInfos(camera, body, cfg) {
+    var projectedAxisInfos = axis3DProjectionKernelMethod("projectedAxisInfos");
+    if (projectedAxisInfos) {
+      var rect0 = body && body.getBoundingClientRect ? body.getBoundingClientRect() : { width: 1, height: 1 };
+      return projectedAxisInfos(camera, rect0, cfg);
+    }
     var rect = body && body.getBoundingClientRect ? body.getBoundingClientRect() : { width: 1, height: 1 };
     var w = Math.max(1, Number(rect.width) || 1);
     var h = Math.max(1, Number(rect.height) || 1);
@@ -3257,11 +3476,20 @@
   }
 
   function axis3DProjectedAxisAngleDeg(info) {
+    var projectedAxisAngleDeg = axis3DProjectionKernelMethod("projectedAxisAngleDeg");
+    if (projectedAxisAngleDeg) {
+      return projectedAxisAngleDeg(info);
+    }
     if (!info) { return null; }
     return normalizeUndirectedAngleDeg(Math.atan2(info.uy, info.ux) * 180 / Math.PI);
   }
 
   function axis3DProjectedAxisDiffDeg(camera, body, cfg, axisIndex, targetAngleDeg) {
+    var projectedAxisDiffDeg = axis3DProjectionKernelMethod("projectedAxisDiffDeg");
+    if (projectedAxisDiffDeg) {
+      var rect1 = body && body.getBoundingClientRect ? body.getBoundingClientRect() : { width: 1, height: 1 };
+      return projectedAxisDiffDeg(camera, rect1, cfg, axisIndex, targetAngleDeg);
+    }
     var projected = axis3DProjectedAxisInfos(camera, body, cfg);
     if (!projected || !projected.axisInfos[axisIndex]) { return Infinity; }
     var angleDeg = axis3DProjectedAxisAngleDeg(projected.axisInfos[axisIndex]);
@@ -3269,6 +3497,11 @@
   }
 
   function axis3DAlignProjectedAxisToScreenSnap(camera, body, cfg, axisIndex, targetAngleDeg) {
+    var alignProjectedAxisToScreenSnap = axis3DProjectionKernelMethod("alignProjectedAxisToScreenSnap");
+    if (alignProjectedAxisToScreenSnap) {
+      var rect2 = body && body.getBoundingClientRect ? body.getBoundingClientRect() : { width: 1, height: 1 };
+      return alignProjectedAxisToScreenSnap(camera, rect2, cfg, axisIndex, targetAngleDeg);
+    }
     var projected = axis3DProjectedAxisInfos(camera, body, cfg);
     if (!projected || !projected.axisInfos[axisIndex]) { return false; }
     var rawAngle = axis3DProjectedAxisAngleDeg(projected.axisInfos[axisIndex]);
@@ -3293,6 +3526,10 @@
   }
 
   function axis3DAlignAxisToViewSnap(camera, cfg, axisIndex, sign) {
+    var alignAxisToViewSnap = axis3DKernelMethod("alignAxisToViewSnap");
+    if (alignAxisToViewSnap) {
+      return alignAxisToViewSnap(camera, cfg, axisIndex, sign);
+    }
     var center = axis3DRotationCenter(cfg || {});
     var pos = vec3Array(camera && camera.pos, [4, 4, 5.657]);
     var tgt = vec3Array(camera && camera.target, center);
@@ -3316,6 +3553,35 @@
     return true;
   }
 
+  function axis3DCameraFinite(camera) {
+    if (!camera) { return false; }
+    var pos = vec3Array(camera.pos, []);
+    var target = vec3Array(camera.target, []);
+    var up = vec3Array(camera.up, []);
+    var values = pos.concat(target, up);
+    for (var i = 0; i < values.length; i += 1) {
+      if (!Number.isFinite(values[i])) { return false; }
+    }
+    return values.length >= 9;
+  }
+
+  function axis3DFormatCameraSummary(camera) {
+    if (!camera) { return "camera=null"; }
+    function fmt3(v) {
+      var a = vec3Array(v, [0, 0, 0]);
+      return "[" + a.map(function (n) {
+        return Number.isFinite(n) ? Number(n).toFixed(4) : String(n);
+      }).join(",") + "]";
+    }
+    return "pos=" + fmt3(camera.pos) + " target=" + fmt3(camera.target) + " up=" + fmt3(camera.up);
+  }
+
+  function axis3DLogRotateDiag(stage, camera, extra) {
+    try {
+      vlog("warn", "[axis3d-rotate] " + String(stage) + " " + axis3DFormatCameraSummary(camera) + (extra ? " " + String(extra) : ""));
+    } catch (_) {}
+  }
+
   function axis3DApplySnapPostConstraint(camera, cfg, body, dx, dy, dragState) {
     var projected = axis3DProjectedAxisInfos(camera, body, cfg);
     var snappedViewState = axis3DCrosshairSnapState(
@@ -3326,8 +3592,18 @@
     if (dragState) {
       dragState.axis3DLockedViewSnap = snappedViewState.snapped;
     }
+    if (dragState && (Number(dragState.sampleCount || 0) % 12) === 0) {
+      axis3DLogRotateDiag(
+        "pre-snap",
+        camera,
+        "viewSnap=" + JSON.stringify(snappedViewState && snappedViewState.snapped || null)
+      );
+    }
     if (snappedViewState && snappedViewState.snapped) {
       axis3DAlignAxisToViewSnap(camera, cfg, snappedViewState.snapped.axisIndex, snappedViewState.snapped.sign);
+    }
+    if (!axis3DCameraFinite(camera)) {
+      axis3DLogRotateDiag("nonfinite-after-view-snap", camera, "dx=" + Number(dx || 0) + " dy=" + Number(dy || 0));
     }
     projected = axis3DProjectedAxisInfos(camera, body, cfg);
     if (!projected) { return false; }
@@ -3338,13 +3614,12 @@
       cfg
     );
     if (dragState) {
-      dragState.axis3DProjectedSnapRawAngles = projectedSnapState.rawAngles.slice();
+      dragState.axis3DProjectedSnapState = projectedSnapState;
     }
     var bestCardinal = null;
     for (var axisIndex = 0; axisIndex < axisInfos.length; axisIndex += 1) {
       var info = axisInfos[axisIndex];
       if (!info) { continue; }
-      if (projectedSnapState.hiddenAxes[axisIndex] != null) { continue; }
       if (projectedSnapState.cardinalSnaps[axisIndex] == null) { continue; }
       var nx = -info.uy;
       var ny = info.ux;
@@ -3358,7 +3633,52 @@
       }
     }
     if (!bestCardinal || Math.abs(bestCardinal.component) <= 1e-6) { return false; }
-    return axis3DAlignProjectedAxisToScreenSnap(camera, body, cfg, bestCardinal.axisIndex, bestCardinal.targetAngleDeg);
+    var aligned = axis3DAlignProjectedAxisToScreenSnap(camera, body, cfg, bestCardinal.axisIndex, bestCardinal.targetAngleDeg);
+    projected = axis3DProjectedAxisInfos(camera, body, cfg);
+    if (projected && projected.axisInfos) {
+      projectedSnapState = axis3DProjectedAxisSnapState(
+        projected.axisInfos,
+        dragState && dragState.axis3DProjectedSnapState ? dragState.axis3DProjectedSnapState : projectedSnapState,
+        cfg
+      );
+      if (dragState) {
+        dragState.axis3DProjectedSnapState = projectedSnapState;
+      }
+      var bestPairFollower = null;
+      if (projectedSnapState && projectedSnapState.pairTargets) {
+        for (var pairFollowerKey in projectedSnapState.pairTargets) {
+          if (!Object.prototype.hasOwnProperty.call(projectedSnapState.pairTargets, pairFollowerKey)) { continue; }
+          var followerIndex = Number(pairFollowerKey);
+          var targetAngle = Number(projectedSnapState.pairTargets[pairFollowerKey]);
+          if (!Number.isFinite(followerIndex) || !Number.isFinite(targetAngle)) { continue; }
+          var followerDelta = Math.abs(Number(projectedSnapState.deltas && projectedSnapState.deltas[followerIndex] || 0));
+          if (!bestPairFollower || followerDelta > bestPairFollower.delta) {
+            bestPairFollower = {
+              axisIndex: followerIndex,
+              targetAngleDeg: targetAngle,
+              delta: followerDelta
+            };
+          }
+        }
+      }
+      if (bestPairFollower) {
+        aligned = axis3DAlignProjectedAxisToScreenSnap(
+          camera,
+          body,
+          cfg,
+          bestPairFollower.axisIndex,
+          bestPairFollower.targetAngleDeg
+        ) || aligned;
+      }
+    }
+    if (!axis3DCameraFinite(camera)) {
+      axis3DLogRotateDiag(
+        "nonfinite-after-projected-snap",
+        camera,
+        "cardinal=" + JSON.stringify(bestCardinal)
+      );
+    }
+    return aligned;
   }
 
   function axis3DIncrementalRotateComponents(camera, cfg, dx, dy, body, dragState) {
@@ -3517,6 +3837,9 @@
       ? axis3DCloneCamera(dragState.axis3DRawCamera)
       : axis3DCloneCamera(camera);
     axis3DApplyRawDragRotation(rawCamera, cfg || {}, dx, dy, body, dragState);
+    if (!axis3DCameraFinite(rawCamera)) {
+      axis3DLogRotateDiag("nonfinite-after-raw-rotate", rawCamera, "dx=" + Number(dx || 0) + " dy=" + Number(dy || 0));
+    }
     if (dragState) {
       dragState.axis3DRawCamera = axis3DCloneCamera(rawCamera);
     }
@@ -3524,6 +3847,9 @@
     camera.target = rawCamera.target.slice();
     camera.up = rawCamera.up.slice();
     axis3DApplySnapPostConstraint(camera, cfg || {}, body, dx, dy, dragState);
+    if (!axis3DCameraFinite(camera)) {
+      axis3DLogRotateDiag("nonfinite-after-rotate", camera, "dx=" + Number(dx || 0) + " dy=" + Number(dy || 0));
+    }
   }
 
   function applyAxis3DSelectionZoom(fid, body, drag) {
@@ -4259,6 +4585,11 @@
   }
 
   function axis3DDragWorldDelta(camera, body, dx, dy) {
+    var dragWorldDelta = axis3DKernelMethod("dragWorldDelta");
+    if (dragWorldDelta) {
+      var rect1 = body && body.getBoundingClientRect ? body.getBoundingClientRect() : { width: 1, height: 1 };
+      return dragWorldDelta(camera, Number(rect1.width) || 1, Number(rect1.height) || 1, dx, dy);
+    }
     var pos = vec3Array(camera && camera.pos, [4, 4, 5.657]);
     var target = vec3Array(camera && camera.target, [0, 0, 0]);
     var upHint = normalizeVec3Local(camera && camera.up || [0, 0, 1], [0, 0, 1]);
@@ -5291,6 +5622,7 @@
     if (!body || body.__vfAxis3DControlsAttached) { return; }
     body.__vfAxis3DControlsAttached = true;
     body.__vfAxis3DDragState = null;
+    body.__vfAxis3DWheelState = null;
     body.addEventListener("contextmenu", function (e) {
       if (body.__vfAxis3DDragState) {
         e.preventDefault();
@@ -5457,11 +5789,22 @@
       }
     }
 
-    body.addEventListener("wheel", function (e) {
+    function cancelAxis3DWheelRaf(state) {
+      if (state && state.raf) {
+        try { global.cancelAnimationFrame(state.raf); } catch (_) {}
+        state.raf = 0;
+      }
+    }
+
+    function flushAxis3DWheel() {
+      var wheel = body.__vfAxis3DWheelState;
+      if (!wheel) { return; }
+      wheel.raf = 0;
+      body.__vfAxis3DWheelState = null;
       if (!_lastDisplayPayload || !_lastDisplayPayload.geom || !_lastDisplayPayload.geom[fid]) { return; }
-      claimAxis3DEvent(e);
-      try { e.__vfHandledWheel = true; } catch (_) {}
-      var factor = Math.exp(Math.max(-600, Math.min(600, Number(e.deltaY) || 0)) * 0.0028);
+      var totalDeltaY = Math.max(-600, Math.min(600, Number(wheel.deltaY || 0)));
+      if (!totalDeltaY) { return; }
+      var factor = Math.exp(totalDeltaY * 0.0028);
       var geom = _lastDisplayPayload && _lastDisplayPayload.geom ? _lastDisplayPayload.geom[fid] : null;
       var boxCfg = axis3DBoxRuntime(geom);
       if (boxCfg) {
@@ -5476,7 +5819,7 @@
         return;
       }
       mutateAxis3DCamera(fid, function (camera) {
-        var anchorBefore = axis3DCursorPlanePoint(camera, body, e.clientX, e.clientY);
+        var anchorBefore = axis3DCursorPlanePoint(camera, body, wheel.clientX, wheel.clientY);
         var isOrtho = String(camera.projection || "").toLowerCase() === "orthographic";
         var pos = vec3Array(camera.pos, [4, 4, 5.657]);
         var target = vec3Array(camera.target, [0, 0, 0]);
@@ -5489,7 +5832,7 @@
           camera.ortho_scale = Math.max(1e-6, Number(camera.ortho_scale || 2.5) * factor);
         }
         camera.pos = nextPos;
-        var anchorAfter = axis3DCursorPlanePoint(camera, body, e.clientX, e.clientY);
+        var anchorAfter = axis3DCursorPlanePoint(camera, body, wheel.clientX, wheel.clientY);
         if (anchorBefore && anchorAfter) {
           var tx = anchorBefore[0] - anchorAfter[0];
           var ty = anchorBefore[1] - anchorAfter[1];
@@ -5499,6 +5842,9 @@
             camera.pos = [nextPos[0] + tx, nextPos[1] + ty, nextPos[2] + tz];
           }
         }
+        if (!axis3DCameraFinite(camera)) {
+          axis3DLogRotateDiag("nonfinite-after-wheel", camera, "deltaY=" + Number(totalDeltaY || 0) + " samples=" + Number(wheel.sampleCount || 0));
+        }
       }, { skipTextOverlay: true });
       var rec = frameRecs[String(fid)] || null;
       if (rec) {
@@ -5506,6 +5852,35 @@
         rec.axis3DHelperStepCache = null;
       }
       repaintAxis3DHelperLines(fid);
+    }
+
+    body.addEventListener("wheel", function (e) {
+      if (!_lastDisplayPayload || !_lastDisplayPayload.geom || !_lastDisplayPayload.geom[fid]) { return; }
+      claimAxis3DEvent(e);
+      try { e.__vfHandledWheel = true; } catch (_) {}
+      if (body.__vfAxis3DDragState) {
+        return;
+      }
+      var wheel = body.__vfAxis3DWheelState;
+      if (!wheel) {
+        wheel = {
+          deltaY: 0,
+          clientX: Number(e.clientX) || 0,
+          clientY: Number(e.clientY) || 0,
+          sampleCount: 0,
+          raf: 0
+        };
+        body.__vfAxis3DWheelState = wheel;
+      }
+      wheel.deltaY = Number(wheel.deltaY || 0) + (Number(e.deltaY) || 0);
+      wheel.clientX = Number(e.clientX) || 0;
+      wheel.clientY = Number(e.clientY) || 0;
+      wheel.sampleCount = Number(wheel.sampleCount || 0) + 1;
+      if (!wheel.raf) {
+        wheel.raf = global.requestAnimationFrame(function () {
+          flushAxis3DWheel();
+        });
+      }
     }, { passive: false, capture: true });
 
     body.addEventListener("pointerdown", function (e) {
@@ -5522,6 +5897,8 @@
       if (action === "pan" || action === "scale" || action === "rotate") {
         startAxisLock = axis3DStartAxisLock(geom && geom.camera || {}, body, axis3DRuntimeConfig(geom) || {}, x, y);
       }
+      cancelAxis3DWheelRaf(body.__vfAxis3DWheelState);
+      body.__vfAxis3DWheelState = null;
       body.__vfAxis3DDragState = {
         x: x,
         y: y,
@@ -5560,6 +5937,8 @@
     }, true);
     body.addEventListener("pointercancel", function (e) {
       cancelAxis3DDragRaf(body.__vfAxis3DDragState);
+      cancelAxis3DWheelRaf(body.__vfAxis3DWheelState);
+      body.__vfAxis3DWheelState = null;
       var geom = _lastDisplayPayload && _lastDisplayPayload.geom ? _lastDisplayPayload.geom[fid] : null;
       unfreezeAxis3DBoxTickPlacement(axis3DBoxRuntime(geom));
       resetAxis3DVisualLayers(fid);
@@ -5763,6 +6142,12 @@
   function _setDisplayHitRegions(regions) {
     try {
       global.__vfDisplayHitRegions = Array.isArray(regions) ? regions : [];
+    } catch (_) {}
+  }
+
+  function _setStandaloneDisplayContentPresent(present) {
+    try {
+      global.__vfHasStandaloneDisplayContent = !!present;
     } catch (_) {}
   }
 
@@ -7649,14 +8034,12 @@
         for (var axisLineIndex = 0; axisLineIndex < 3; axisLineIndex += 1) {
           axisInfos[axisLineIndex] = axisLineInfo(axisLineIndex);
         }
-        var projectedSnapState = axis3DProjectedAxisSnapState(axisInfos, rec3.axis3DProjectedRawAngles || null, cfg);
-        rec3.axis3DProjectedRawAngles = projectedSnapState.rawAngles;
+        var projectedSnapState = axis3DProjectedAxisSnapState(axisInfos, rec3.axis3DProjectedSnapState || null, cfg);
         rec3.axis3DProjectedSnapState = projectedSnapState;
         for (var axisDrawIndex = 0; axisDrawIndex < 3; axisDrawIndex += 1) {
           var drawInfo = axisInfos[axisDrawIndex];
           if (!drawInfo) { continue; }
           if (snapState.snapped && snapState.snapped.axisIndex === axisDrawIndex) { continue; }
-          if (projectedSnapState.hiddenAxes[axisDrawIndex] != null) { continue; }
           var clipped = drawInfo.clipped;
           ctx.moveTo(clipped[0][0], clipped[0][1]);
           ctx.lineTo(clipped[1][0], clipped[1][1]);
@@ -7708,24 +8091,40 @@
               if (tick && typeof tick === "object") { return Number(tick.coord); }
               return Number(tick);
             }
+            function cachedVisibleAxisExtent(axisIndex) {
+              var axis = cachedAxes[axisIndex] || null;
+              if (!axis) { return null; }
+              var values = Array.isArray(axis.values) ? axis.values.map(cachedTickCoord).filter(Number.isFinite) : [];
+              if (values.length >= 2) {
+                return [Math.min.apply(Math, values), Math.max.apply(Math, values)];
+              }
+              var lo = Number(axis.lo);
+              var hi = Number(axis.hi);
+              if (Number.isFinite(lo) && Number.isFinite(hi)) {
+                return [Math.min(lo, hi), Math.max(lo, hi)];
+              }
+              return null;
+            }
             function drawCrosshairGridLine(lineAxis, fixedA, fixedB, sourceAxis) {
-              if (
-                snapState.hiddenAxisIndex === lineAxis ||
-                snapState.hiddenAxisIndex === sourceAxis ||
-                projectedSnapState.hiddenAxes[lineAxis] != null ||
-                projectedSnapState.hiddenAxes[sourceAxis] != null
-              ) { return; }
               var lineInfo = axisInfos[lineAxis];
               if (!lineInfo) { return; }
-              var p = target.slice();
+              var extent = cachedVisibleAxisExtent(lineAxis);
+              if (!extent || !(extent[1] > extent[0])) { return; }
               var axes = [0, 1, 2].filter(function (axisIndex) { return axisIndex !== lineAxis; });
-              p[axes[0]] = fixedA;
-              p[axes[1]] = fixedB;
-              var pGrid = projectWorldToPixel(cam, w, h, p);
-              if (!pGrid) { return; }
-              var gridClip = clipPixelLineToRect(
-                [pGrid[0] - lineInfo.ux * reach, pGrid[1] - lineInfo.uy * reach],
-                [pGrid[0] + lineInfo.ux * reach, pGrid[1] + lineInfo.uy * reach],
+              var p0Grid = target.slice();
+              var p1Grid = target.slice();
+              p0Grid[lineAxis] = extent[0];
+              p1Grid[lineAxis] = extent[1];
+              p0Grid[axes[0]] = fixedA;
+              p0Grid[axes[1]] = fixedB;
+              p1Grid[axes[0]] = fixedA;
+              p1Grid[axes[1]] = fixedB;
+              var pixel0 = projectWorldToPixel(cam, w, h, p0Grid);
+              var pixel1 = projectWorldToPixel(cam, w, h, p1Grid);
+              if (!pixel0 || !pixel1) { return; }
+              var gridClip = clipPixelSegmentToRect(
+                pixel0,
+                pixel1,
                 0,
                 0,
                 w,
@@ -7779,8 +8178,37 @@
             var text = String(value);
             return text && text !== "true" ? text : "";
           }
+          function axis3DCollapsedLabelSpec(snappedOrientation) {
+            if (!snappedOrientation) { return null; }
+            var axisIndex = Number(snappedOrientation.axisIndex);
+            var labelText = axis3DNameLabelText(axisIndex);
+            if (!labelText) { return null; }
+            var labelPad = Math.max(12, Number(cfg.label_axis_pad) || 28);
+            var dir = axisIndex === 0
+              ? [1, -1]
+              : axisIndex === 1
+                ? [-1, -1]
+                : [1, 1];
+            if (Number(snappedOrientation.sign) > 0) {
+              dir = [-dir[0], -dir[1]];
+            }
+            var dx = dir[0] * labelPad;
+            var dy = dir[1] * labelPad;
+            var anchor = axisTextAnchorFromAxisOffset(dx, dy);
+            return {
+              pixel: true,
+              keep_horizontal: true,
+              x: p0[0] + dx,
+              y: p0[1] + dy,
+              text: labelText,
+              font_size: Number(cfg.label_font_size) || 13,
+              ha: anchor.ha,
+              va: anchor.va,
+              color: cfg.color || "white"
+            };
+          }
           function axis3DNameLabelSpec(axisIndex) {
-            if (snapState.hiddenAxisIndex === axisIndex || projectedSnapState.hiddenAxes[axisIndex] != null) { return null; }
+            if (snapState.snapped && Number(snapState.snapped.axisIndex) === Number(axisIndex)) { return null; }
             var labelText = axis3DNameLabelText(axisIndex);
             if (!labelText) { return null; }
             var info = axisInfos[axisIndex];
@@ -7792,6 +8220,7 @@
             var align = String(cfg[alignKey] || "negative").toLowerCase();
             var side = align === "positive" ? 1 : align === "center" || align === "centre" ? 0 : -1;
             if (side === 0) { side = -1; }
+            side = axis3DProjectedAxisSideSign(projectedSnapState, axisIndex, side);
             var normalDx = -info.uy * side * labelAxisPad;
             var normalDy = info.ux * side * labelAxisPad;
             var boundaryInfo = axis2DBoundaryAnchorInfo(axisBoundaryPoint[0], axisBoundaryPoint[1], p0[0], p0[1], labelFramePad, w, h);
@@ -7832,6 +8261,8 @@
             var axisNameLabel = axis3DNameLabelSpec(axisLabelIndex);
             if (axisNameLabel) { axisNameLabelSpecs.push(axisNameLabel); }
           }
+          var collapsedAxisLabel = axis3DCollapsedLabelSpec(snapState.snapped);
+          if (collapsedAxisLabel) { axisNameLabelSpecs.push(collapsedAxisLabel); }
           for (var crosshairMeshIndex = 0; crosshairMeshIndex < meshes.length; crosshairMeshIndex += 1) {
             if (meshes[crosshairMeshIndex] && meshes[crosshairMeshIndex].axis_plot3d) {
               strokeAxis3DPlotMeshProjected(meshes[crosshairMeshIndex], function (p) { return projectWorldToPixel(cam, w, h, p); });
@@ -7849,7 +8280,6 @@
           }
           ctx.beginPath();
           for (var ti = 0; ti < axisInfos.length; ti += 1) {
-            if (snapState.hiddenAxisIndex === ti || projectedSnapState.hiddenAxes[ti] != null) { continue; }
             var tickInfo = axisInfos[ti];
             var tickAxis = rec3.axis3DHelperTickCache && rec3.axis3DHelperTickCache.axes ? rec3.axis3DHelperTickCache.axes[ti] : null;
             if (!tickInfo || !tickAxis || !(Number(tickAxis.step) > 0)) { continue; }
@@ -7869,6 +8299,7 @@
             var alignKey = ti === 0 ? "x_tick_alignment" : ti === 1 ? "y_tick_alignment" : "z_tick_alignment";
             var align = String(cfg[alignKey] || "negative").toLowerCase();
             var side = align === "positive" ? 1 : align === "center" || align === "centre" ? 0 : -1;
+            side = axis3DProjectedAxisSideSign(projectedSnapState, ti, side);
             for (var vi = 0; vi < tickValues.length; vi += 1) {
               var rawTick = tickValues[vi];
               var coord = rawTick && typeof rawTick === "object" ? Number(rawTick.coord) : Number(rawTick);
@@ -8485,6 +8916,9 @@
   }
 
   function updateGeomFrame(fid, geomSpec) {
+    if (!_vfHostInputReadyPosted) {
+      scheduleHostInputReady();
+    }
     var frameEl = findFrameEl(geomTargetFrameId(fid));
     if (!frameEl) {
       vlog("warn", "updateGeomFrame [" + fid + "]: no DOM element .vf-frame[data-vf-frame-id=" + fid + "] found — frame not placed yet?");
@@ -9483,13 +9917,20 @@ fn fsMain(in : VOut) -> @location(0) vec4<f32> {
       var sz = syncCanvasSize(sc);
       if (sz) {
         drawOpList(get2d(sc), sz.w, sz.h, data.screen);
-        _setDisplayHitRegions(buildScreenHitRegions(data.screen, sz.w, sz.h));
+        var screenHitRegions = buildScreenHitRegions(data.screen, sz.w, sz.h);
+        _setDisplayHitRegions(screenHitRegions);
+        _setStandaloneDisplayContentPresent(
+          (Array.isArray(data.screen) && data.screen.length > 0) ||
+          (Array.isArray(screenHitRegions) && screenHitRegions.length > 0)
+        );
         schedulePostGeomLayout();
       } else {
         _setDisplayHitRegions([]);
+        _setStandaloneDisplayContentPresent(false);
       }
     } else {
       _setDisplayHitRegions([]);
+      _setStandaloneDisplayContentPresent(false);
     }
 
     // 2-D per-frame canvases
@@ -9528,6 +9969,10 @@ fn fsMain(in : VOut) -> @location(0) vec4<f32> {
         if (!Object.prototype.hasOwnProperty.call(geom, gid)) { continue; }
         updateGeomFrame(gid, geom[gid]);
       }
+    }
+
+    if (!_vfHostInputReadyPosted) {
+      scheduleHostInputReady();
     }
   }
 

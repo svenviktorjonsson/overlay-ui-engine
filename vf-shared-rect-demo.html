@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VF Shared Rect Demo</title>
+    <style>
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: #0d1321;
+      }
+      .vf-shared-demo-shell {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+      }
+      .vf-shared-demo-canvas {
+        width: min(960px, 100vw);
+        height: min(540px, 100vh);
+        display: block;
+        background:
+          radial-gradient(circle at top left, rgba(59,130,246,0.16), transparent 38%),
+          linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
+      }
+    </style>
+  </head>
+  <body>
+    <div class="vf-shared-demo-shell">
+      <canvas class="vf-shared-demo-canvas"></canvas>
+    </div>
+    <script src="vf-shared-runtime.js"></script>
+    <script src="vf-gpu-runtime.js"></script>
+    <script src="vf-wasm-demo-contract.js"></script>
+    <script src="vf-shared-rect-demo.js"></script>
+  </body>
+  </html>

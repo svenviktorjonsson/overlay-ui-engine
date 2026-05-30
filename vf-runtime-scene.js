@@ -26,6 +26,7 @@
     var getLayer = options.getLayer || function() { return null; };
     var displayRefresh = options.displayRefresh || function() {};
     var isLegacyFallbackActive = options.isLegacyFallbackActive || function() { return false; };
+    var livePanelsById = Object.create(null);
 
     function runtimeFail(message) {
       var text = String(message || "runtime scene failure");
@@ -155,8 +156,29 @@
 
   function runtimeAllowsHostExit() {
     try {
-      if (typeof document === "undefined" || !document || !document.body) { return false; }
-      return document.body.getAttribute("data-vf-allow-host-exit") === "true";
+      if (typeof document === "undefined" || !document || !document.body) {
+        return !!(global.chrome && global.chrome.webview);
+      }
+      var attr = document.body.getAttribute("data-vf-allow-host-exit");
+      if (attr === "false") { return false; }
+      if (attr === "true") { return true; }
+      return !!(global.chrome && global.chrome.webview);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function runtimeHasStandaloneDisplayContent() {
+    try {
+      return !!global.__vfHasStandaloneDisplayContent;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function runtimeSceneDeclaresFrames() {
+    try {
+      return Number(global.__vfSceneDeclaredFrameCount || 0) > 0;
     } catch (_) {
       return false;
     }
@@ -194,12 +216,15 @@
       var upsertCount = data.filter(function(c) { return c && c.kind === "frame_upsert"; }).length;
       runtimeLog("info", "applySceneCommands: " + data.length + " commands, " + upsertCount + " frame_upserts");
 
-      layer.innerHTML = "";
       var upserts = data.filter(function(c) {
         return c && c.kind === "frame_upsert" && c.payload && c.payload.spec;
       });
+      try {
+        global.__vfSceneDeclaredFrameCount = upserts.length;
+      } catch (_) {}
       var mounted = [];
       var panelById = Object.create(null);
+      var nextPanelIds = Object.create(null);
       var pending = upserts.slice();
       var pass = 0;
       while (pending.length > 0) {
@@ -227,42 +252,89 @@
           var rawDock = spec.dock_loc != null ? spec.dock_loc : spec.dock_location != null ? spec.dock_location : spec.minimized_dock;
           var dockLocation = frame.normalizeDockLocationKey(rawDock != null ? String(rawDock) : "bl");
           var dockable = flags.dockable !== false && flags.minimizable !== false;
-          var panel = frame.mount(mountLayer, {
-            id: id,
-            title: title,
-            titleAlign: titleAlign,
-            aspect: spec.aspect != null ? String(spec.aspect) : null,
-            inLayerDrag: true,
-            draggable: flags.draggable !== false,
-            dockable: dockable,
-            resizable: flags.resizable !== false,
-            closable: flags.closable !== false,
-            alpha: alpha,
-            bodyTransparent: spec.body_transparent === true,
-            master: isMaster,
-            frameless: spec.frameless === true,
-            dockLocation: dockLocation,
-            zIndexBase: 1000 + i * 2,
-            onBeforeDestroy: function(frameId) {
-              return function() {
-                if (widgets && widgets.onFrameClose) {
-                  widgets.onFrameClose(frameId);
+          var panel = livePanelsById[id] || null;
+          var needsRemount = false;
+          if (panel && panel.root && panel.root.parentElement !== mountLayer) {
+            needsRemount = true;
+          }
+          if (needsRemount && panel && typeof panel.destroy === "function") {
+            try { panel.destroy(); } catch (_) {}
+            delete livePanelsById[id];
+            panel = null;
+          }
+          if (!panel) {
+            panel = frame.mount(mountLayer, {
+              id: id,
+              title: title,
+              titleAlign: titleAlign,
+              aspect: spec.aspect != null ? String(spec.aspect) : null,
+              inLayerDrag: true,
+              draggable: flags.draggable !== false,
+              dockable: dockable,
+              resizable: flags.resizable !== false,
+              closable: flags.closable !== false,
+              alpha: alpha,
+              bodyTransparent: spec.body_transparent === true,
+              master: isMaster,
+              frameless: spec.frameless === true,
+              dockLocation: dockLocation,
+              zIndexBase: 1000 + i * 2,
+              onBeforeDestroy: function(frameId) {
+                return function() {
+                  if (widgets && widgets.onFrameClose) {
+                    widgets.onFrameClose(frameId);
+                  }
+                };
+              }(id),
+              onFrameRemoved: function() {
+                if (layer._vfMasterTeardown) { return; }
+                if (runtimeAllowsHostExit() &&
+                    countExitTrackedFrames(layer) === 0 &&
+                    (!runtimeHasStandaloneDisplayContent() || runtimeSceneDeclaresFrames())) {
+                  postExitToHost();
                 }
-              };
-            }(id),
-            onFrameRemoved: function() {
-              if (layer._vfMasterTeardown) { return; }
-              if (runtimeAllowsHostExit() && countExitTrackedFrames(layer) === 0) {
-                postExitToHost();
               }
-            }
-          });
+            });
+            panel.root.style.opacity = "0";
+            mounted.push({ panel: panel, spec: spec });
+          }
+          livePanelsById[id] = panel;
+          nextPanelIds[id] = true;
           panel.root.dataset.vfExitCounted = spec.exit_counted === false ? "false" : "true";
           panelById[id] = panel;
           applySpecRectToPanel(panel, spec);
-          mounted.push({ panel: panel, spec: spec });
-          if (spec.body && Array.isArray(spec.body) && spec.body.length && widgets && widgets.mount) {
+          var bodySignature = "";
+          try {
+            bodySignature = JSON.stringify({
+              body: Array.isArray(spec.body) ? spec.body : [],
+              body_layout: spec.body_layout || null
+            });
+          } catch (_) {
+            bodySignature = "";
+          }
+          if (spec.body && Array.isArray(spec.body) && spec.body.length && widgets && widgets.mount &&
+              panel.root.__vfBodySignature !== bodySignature) {
             widgets.mount(panel, id, spec.body, spec.body_layout);
+            panel.root.__vfBodySignature = bodySignature;
+            applySpecRectToPanel(panel, spec);
+          } else if ((!spec.body || !Array.isArray(spec.body) || spec.body.length === 0) &&
+                     panel.root.__vfBodySignature !== bodySignature) {
+            if (widgets && typeof widgets.clearFrame === "function") {
+              widgets.clearFrame(id);
+            }
+            if (panel.body) {
+              var body = panel.body;
+              var ch = body.firstChild;
+              while (ch) {
+                var next = ch.nextSibling;
+                if (!ch.classList || !ch.classList.contains("vf-frame__draw-canvas")) {
+                  body.removeChild(ch);
+                }
+                ch = next;
+              }
+            }
+            panel.root.__vfBodySignature = bodySignature;
+            applySpecRectToPanel(panel, spec);
           }
           advanced = true;
         }
@@ -287,18 +359,19 @@
       if (isLegacyFallbackActive()) {
         displayRefresh();
       }
-      global.requestAnimationFrame(function() {
-        for (var m = 0; m < mounted.length; m++) {
-          reapplySpecRect(mounted[m].panel, mounted[m].spec, "post-mount frame");
-        }
-        if (widgets && typeof widgets.refreshButtonGroups === "function") {
-          widgets.refreshButtonGroups();
+      Object.keys(livePanelsById).forEach(function(existingId) {
+        if (nextPanelIds[existingId]) { return; }
+        var stalePanel = livePanelsById[existingId];
+        delete livePanelsById[existingId];
+        if (stalePanel && typeof stalePanel.destroy === "function") {
+          try { stalePanel.destroy(); } catch (_) {}
         }
       });
       global.requestAnimationFrame(function() {
         global.requestAnimationFrame(function() {
           for (var m = 0; m < mounted.length; m++) {
             reapplySpecRect(mounted[m].panel, mounted[m].spec, "settled frame");
+            mounted[m].panel.root.style.opacity = "";
           }
           if (widgets && typeof widgets.refreshButtonGroups === "function") {
             widgets.refreshButtonGroups();

@@ -153,6 +153,7 @@
       state.inFlight = false;
       state.latestReq = null;
       state.lastPositiveHit = null;
+      state.lastEmittedHitKey = "";
       state.emptySeq = 0;
       state.latestPointerReq = null;
       state.pointerRaf = 0;
@@ -210,14 +211,43 @@
         if (state.lastPositiveHit) {
           state.emptySeq += 1;
         }
-        if (state.lastPositiveHit && state.emptySeq < 2) {
+      if (state.lastPositiveHit && state.emptySeq < 2) {
           return { action: "confirm-empty", hit: hit };
         }
         state.lastPositiveHit = null;
         state.emptySeq = 0;
+        if (samePointerHit(state, req, hit)) {
+          return { action: "drop", hit: hit };
+        }
+        rememberPointerHit(state, req, hit);
         return { action: "emit", hit: hit };
       }
+      if (isPointerStream && samePointerHit(state, req, finalHit)) {
+        return { action: "drop", hit: finalHit };
+      }
+      if (isPointerStream) {
+        rememberPointerHit(state, req, finalHit);
+      }
       return { action: "emit", hit: finalHit };
+    }
+
+    function pointerHitKey(req, hit) {
+      return [
+        String(req && req.evtType || ""),
+        String(hit && hit.frame_id || ""),
+        String(Number(hit && hit.object_id || 0)),
+        String(Number(hit && hit.simplex_id || 0)),
+        String(Number(hit && hit.pick_id || 0))
+      ].join("|");
+    }
+
+    function samePointerHit(state, req, hit) {
+      return !!state && state.lastEmittedHitKey === pointerHitKey(req, hit);
+    }
+
+    function rememberPointerHit(state, req, hit) {
+      if (!state) { return; }
+      state.lastEmittedHitKey = pointerHitKey(req, hit);
     }
 
     return {
